@@ -118,7 +118,7 @@ namespace BARS_Client_V2
             ApplySearch(SearchAirportsTextBox.Text);
         }
 
-        private async void InitializeAirportsAsync()
+        private async Task InitializeAirportsAsync()
         {
             await AirportService.Instance.InitializeAirportDatabaseAsync();
         }
