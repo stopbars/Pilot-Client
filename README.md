@@ -8,7 +8,7 @@
 ![GitHub License](https://img.shields.io/github/license/stopbars/Pilot-Client)
 [![Discord](https://img.shields.io/discord/1323993176318414889.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://stopbars.com/discord)
 
-The Pilot Client manages airport lighting operations in simulators, processing lighting state requests from controlling clients and applying them, enables user selection of airport profiles based on scenery preferences. Updating lighting positions in sim, based off selected preference, additionally providing information on stopbar modal status, and nearest airport detection.
+The Pilot Client updates airport lighting in simulators by processing lighting state requests, enabling airport profile selection based on scenery preferences, updating lighting positions, and providing stopbar modal status and nearest airport detection.
 
 <br>
 
