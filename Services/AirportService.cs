@@ -216,6 +216,4 @@ namespace BARS_Client_V2.Services
             }
         }
     }
-
-    // TEST
 }
