@@ -12,6 +12,7 @@ namespace BARS_Client_V2.Services
     {
         public string Icao { get; set; } = string.Empty;
         public double Latitude { get; set; }
+        public string hi = "hi";
         public double Longitude { get; set; }
         public string Name { get; set; } = string.Empty;
         public string Continent { get; set; } = string.Empty;
