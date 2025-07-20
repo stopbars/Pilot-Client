@@ -16,7 +16,7 @@ The Pilot Client updates airport lighting in simulators by processing lighting s
 
 We encourage and appreciate contributions from the community! To get started, please review our [CONTRIBUTING.md](CONTRIBUTING.md) guide, which covers the following:
 
-- How to set up your development environment
+- How to set up your development environment.
 - Code style guidelines and best practices
 - Instructions for submitting pull requests
 - Testing and verification procedures
