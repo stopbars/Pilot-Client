@@ -19,7 +19,6 @@ internal sealed class JsonSettingsStore : ISettingsStore
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    // Additional entropy for DPAPI to slightly harden against trivial copy (still tied to user/machine scope)
     private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("BARS.Client.V2|ApiToken|v1");
 
     private sealed class Persisted
@@ -47,7 +46,6 @@ internal sealed class JsonSettingsStore : ISettingsStore
 
             string? token = null;
 
-            // Prefer encrypted token if present
             if (!string.IsNullOrWhiteSpace(p.ApiToken))
             {
                 try
@@ -58,13 +56,11 @@ internal sealed class JsonSettingsStore : ISettingsStore
                 }
                 catch
                 {
-                    // If decryption fails, fall back to legacy plaintext if available
                     token = p.ApiToken;
                 }
             }
             else
             {
-                // Legacy plaintext migration path
                 token = p.ApiToken;
             }
 
@@ -93,7 +89,6 @@ internal sealed class JsonSettingsStore : ISettingsStore
             }
             catch
             {
-                // Fallback: if encryption fails for some reason, we persist nothing rather than plaintext.
                 p.ApiToken = null;
             }
         }

@@ -9,10 +9,6 @@ using Microsoft.Extensions.Logging;
 
 namespace BARS_Client_V2.Application;
 
-/// <summary>
-/// Manages available simulator connectors and maintains current flight state.
-/// Runs as background hosted service streaming state.
-/// </summary>
 public sealed class SimulatorManager : BackgroundService
 {
     private readonly IEnumerable<ISimulatorConnector> _connectors;
@@ -52,7 +48,6 @@ public sealed class SimulatorManager : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Auto select first connector for now
         var first = _connectors.FirstOrDefault();
         if (first != null)
         {

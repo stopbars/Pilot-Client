@@ -8,9 +8,6 @@ using BARS_Client_V2.Domain;
 
 namespace BARS_Client_V2.Infrastructure.InMemory;
 
-/// <summary>
-/// Temporary in-memory airport repository until real backend integration.
-/// </summary>
 internal sealed class InMemoryAirportRepository : IAirportRepository
 {
     private readonly List<Airport> _airports;

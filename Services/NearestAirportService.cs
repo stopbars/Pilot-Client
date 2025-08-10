@@ -21,7 +21,7 @@ internal sealed class NearestAirportService : INearestAirportService
     private string? _lastIcao;
     private DateTime _lastFetchUtc = DateTime.MinValue;
 
-    private const double MinDistanceNmForRefresh = 2.0; // refresh if moved more than 2nm
+    private const double MinDistanceNmForRefresh = 2.0;
     private static readonly TimeSpan MaxAge = TimeSpan.FromSeconds(45);
 
     public NearestAirportService(HttpClient httpClient)

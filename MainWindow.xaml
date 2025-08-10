@@ -553,62 +553,63 @@
 
                     <!-- Left side: simulator status + simulator name -->
                     <StackPanel Grid.Column="0"
-                            Grid.Row="0"
-                            Orientation="Horizontal"
-                            Margin="0,0,0,4">
+                                Grid.Row="0"
+                                Orientation="Horizontal"
+                                Margin="0,0,0,4">
                         <TextBlock Text="Sim Status:"
-                                FontWeight="SemiBold"
-                                Margin="0,0,5,0"/>
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,5,0"/>
                         <Ellipse Width="10"
-                                Height="10"
-                                Margin="0,0,5,0"
-                                VerticalAlignment="Center">
+                                 Height="10"
+                                 Margin="0,0,5,0"
+                                 VerticalAlignment="Center">
                             <Ellipse.Fill>
                                 <SolidColorBrush Color="{Binding SimulatorStatusColor}"/>
                             </Ellipse.Fill>
                         </Ellipse>
                         <TextBlock Text="{Binding SimulatorConnectionText}"
-                                Foreground="{Binding SimulatorStatusColor}"/>
+                                   Foreground="{Binding SimulatorStatusColor}"/>
                     </StackPanel>
                     <StackPanel Grid.Column="0"
-                            Grid.Row="1"
-                            Orientation="Horizontal">
+                                Grid.Row="1"
+                                Orientation="Horizontal">
                         <TextBlock Text="Simulator:"
-                                FontWeight="SemiBold"
-                                Margin="0,0,5,0"/>
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,5,0"/>
                         <TextBlock Text="{Binding SimulatorName}"
-                                FontWeight="Bold"/>
+                                   FontWeight="Bold"/>
                     </StackPanel>
 
                     <!-- Right side: nearest airport + server status -->
+                    <!-- Swapped: Server Status now on top row, Nearest Airport below -->
                     <StackPanel Grid.Column="1"
-                            Grid.Row="0"
-                            Orientation="Horizontal"
-                            HorizontalAlignment="Right"
-                            Margin="0,0,0,4">
-                        <TextBlock Text="Nearest Airport:"
-                                FontWeight="SemiBold"
-                                Margin="0,0,5,0"/>
-                        <TextBlock Text="{Binding ClosestAirport}"
-                                FontWeight="Bold"/>
-                    </StackPanel>
-                    <StackPanel Grid.Column="1"
-                            Grid.Row="1"
-                            Orientation="Horizontal"
-                            HorizontalAlignment="Right">
+                                Grid.Row="0"
+                                Orientation="Horizontal"
+                                HorizontalAlignment="Right"
+                                Margin="0,0,0,4">
                         <TextBlock Text="Server Status:"
-                                FontWeight="SemiBold"
-                                Margin="0,0,5,0"/>
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,5,0"/>
                         <Ellipse Width="10"
-                                Height="10"
-                                Margin="0,0,5,0"
-                                VerticalAlignment="Center">
+                                 Height="10"
+                                 Margin="0,0,5,0"
+                                 VerticalAlignment="Center">
                             <Ellipse.Fill>
                                 <SolidColorBrush Color="{Binding ServerStatusColor}"/>
                             </Ellipse.Fill>
                         </Ellipse>
                         <TextBlock Text="{Binding ServerStatusText}"
-                                Foreground="{Binding ServerStatusColor}"/>
+                                   Foreground="{Binding ServerStatusColor}"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1"
+                                Grid.Row="1"
+                                Orientation="Horizontal"
+                                HorizontalAlignment="Right">
+                        <TextBlock Text="Nearest Airport:"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,5,0"/>
+                        <TextBlock Text="{Binding ClosestAirport}"
+                                   FontWeight="Bold"/>
                     </StackPanel>
                 </Grid>
             </StackPanel>

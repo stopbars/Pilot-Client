@@ -10,15 +10,6 @@ using BARS_Client_V2.Services;
 
 namespace BARS_Client_V2.Infrastructure.Networking;
 
-/// <summary>
-/// Maintains a WebSocket connection to the backend airport stream endpoint when conditions are met.
-/// Conditions:
-///  - Simulator connected
-///  - Aircraft on ground
-///  - Nearby airport resolved (ICAO length 4)
-///  - Valid API token (starts with BARS_)
-/// Disconnects when any condition no longer holds or airport changes.
-/// </summary>
 internal sealed class AirportWebSocketManager : BackgroundService
 {
     private readonly SimulatorManager _simManager;
@@ -42,6 +33,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
     public event Action<string>? MessageReceived;
     public event Action? Connected;
     public event Action<int>? ConnectionError; // status code (e.g. 401, 403)
+    public event Action<string>? Disconnected; // reason
 
     public AirportWebSocketManager(
         SimulatorManager simManager,
@@ -295,6 +287,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
             catch { }
             finally { ws.Dispose(); }
         }
+        try { Disconnected?.Invoke(reason); } catch { }
     }
 
     private async Task HeartbeatLoopAsync(CancellationToken ct)

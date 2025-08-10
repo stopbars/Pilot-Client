@@ -10,9 +10,6 @@ using BARS_Client_V2.Services;
 
 namespace BARS_Client_V2
 {
-    /// <summary>
-    /// Interaction logic for App.xaml
-    /// </summary>
     public partial class App : System.Windows.Application
     {
         private IHost? _host;
@@ -24,28 +21,19 @@ namespace BARS_Client_V2
                 .ConfigureLogging(lb => lb.AddConsole())
                 .ConfigureServices(services =>
                 {
-                    // Register simulator connectors (order: real MSFS then mock fallback)
                     services.AddSingleton<ISimulatorConnector, Infrastructure.Simulators.Msfs.MsfsSimulatorConnector>();
-                    // Repositories / stores
                     services.AddSingleton<IAirportRepository, Infrastructure.InMemory.InMemoryAirportRepository>();
                     services.AddSingleton<ISettingsStore, Infrastructure.Settings.JsonSettingsStore>();
-                    // Core manager
                     services.AddSingleton<SimulatorManager>();
                     services.AddHostedService(sp => sp.GetRequiredService<SimulatorManager>()); // background stream
-                    // HTTP + nearest airport service
                     services.AddHttpClient();
                     services.AddSingleton<INearestAirportService, NearestAirportService>();
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>();
                     services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>());
-                    services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.AirportStreamMessageProcessor>();
-                    services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.PointStateDispatcher>();
-                    // Point state listeners (add MsfsPointController which also runs background loop)
-                    services.AddSingleton<Infrastructure.Simulators.Msfs.MsfsPointController>();
-                    services.AddSingleton<Domain.IPointStateListener>(sp => sp.GetRequiredService<Infrastructure.Simulators.Msfs.MsfsPointController>());
-                    services.AddHostedService(sp => sp.GetRequiredService<Infrastructure.Simulators.Msfs.MsfsPointController>());
-                    // ViewModels
+                    services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
+                    services.AddSingleton<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>();
+                    services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>());
                     services.AddSingleton<MainWindowViewModel>();
-                    // Windows
                     services.AddTransient<MainWindow>();
                 })
                 .Build();
@@ -55,14 +43,13 @@ namespace BARS_Client_V2
             var mainWindow = _host.Services.GetRequiredService<MainWindow>();
             var vm = _host.Services.GetRequiredService<MainWindowViewModel>();
             mainWindow.DataContext = vm;
-            // Wire server connection events
             var wsMgr = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>();
-            var processor = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportStreamMessageProcessor>();
-            // Force creation of dispatcher so it subscribes before messages arrive
-            _ = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.PointStateDispatcher>();
+            var hub = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
             wsMgr.Connected += () => vm.NotifyServerConnected();
             wsMgr.ConnectionError += code => vm.NotifyServerError(code);
-            wsMgr.MessageReceived += msg => { vm.NotifyServerMessage(); _ = processor.ProcessAsync(msg); };
+            wsMgr.MessageReceived += msg => { vm.NotifyServerMessage(); _ = hub.ProcessAsync(msg); };
+            var pointController = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>();
+            wsMgr.Disconnected += reason => { _ = pointController.DespawnAllAsync(); };
             mainWindow.Show();
         }
 
