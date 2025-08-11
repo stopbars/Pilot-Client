@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using System.Xml.Linq;
 using BARS_Client_V2.Domain;
 using Microsoft.Extensions.Logging;
+using BARS_Client_V2.Services;
 
 namespace BARS_Client_V2.Infrastructure.Networking;
 
@@ -192,12 +193,41 @@ internal sealed class AirportStateHub
             if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return;
             _metadata.Clear();
             _layouts.Clear();
-            var url = $"https://v2.stopbars.com/maps/{airport}/latest";
-            _logger.LogInformation("Fetching airport XML map {url}", url);
+            // Determine currently selected scenery package for this airport (if any). If none selected yet, auto-select first available.
+            string package = string.Empty;
+            try
+            {
+                package = SceneryService.Instance.GetSelectedPackage(airport);
+                if (string.IsNullOrWhiteSpace(package))
+                {
+                    // Fetch contributions (packages) and choose first for this airport.
+                    var all = await SceneryService.Instance.GetAvailablePackagesAsync();
+                    if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
+                    {
+                        package = pkgList.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).First();
+                        // Persist selection so UI stays consistent.
+                        SceneryService.Instance.SetSelectedPackage(airport, package);
+                        _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt}", package, airport);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("No packages found for airport {apt} when attempting to auto-select; aborting map load", airport);
+                        return; // Without a package the server cannot return a map.
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed determining package for airport {apt}", airport);
+                return; // Can't proceed without a valid package.
+            }
+            var safePkg = Uri.EscapeDataString(package);
+            var url = $"https://v2.stopbars.com/maps/{airport}/packages/{safePkg}/latest";
+            _logger.LogInformation("Fetching airport XML map {apt} package={pkg} url={url}", airport, package, url);
             using var resp = await _httpClient.GetAsync(url, ct);
             if (!resp.IsSuccessStatusCode)
             {
-                _logger.LogWarning("Airport map fetch failed {status}", resp.StatusCode);
+                _logger.LogWarning("Airport map fetch failed {status} apt={apt} package={pkg}", resp.StatusCode, airport, package);
                 return;
             }
             var xml = await resp.Content.ReadAsStringAsync(ct);
@@ -210,7 +240,7 @@ internal sealed class AirportStateHub
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Error parsing airport map {apt}", airport);
+                _logger.LogWarning(ex, "Error parsing airport map {apt} package={pkg}", airport, package);
             }
         }
         finally

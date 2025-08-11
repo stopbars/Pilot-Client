@@ -166,6 +166,18 @@ public class MainWindowViewModel : INotifyPropertyChanged
                     var match = a.SceneryPackages.FirstOrDefault(p => p.Name == pkgName);
                     if (match != null) row.SelectedPackage = match;
                 }
+                // Auto-select first package if none stored/selected (always at least one per requirements)
+                if (row.SelectedPackage == null && a.SceneryPackages.Count > 0)
+                {
+                    row.SelectedPackage = a.SceneryPackages.First();
+                    if (!_savedPackages.ContainsKey(a.ICAO))
+                    {
+                        _savedPackages[a.ICAO] = row.SelectedPackage.Name;
+                        // Fire and forget save (debounced vs per-change not critical given infrequent list rebuild)
+                        _ = _settingsStore.SaveAsync(new ClientSettings(ApiToken, _savedPackages));
+                    }
+                    // AirportRowOnPropertyChanged handler will persist selection via PropertyChanged event
+                }
                 row.PropertyChanged += AirportRowOnPropertyChanged;
                 Airports.Add(row);
             }
