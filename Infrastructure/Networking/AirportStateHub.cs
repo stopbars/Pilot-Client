@@ -21,15 +21,24 @@ internal sealed class AirportStateHub
     private readonly ConcurrentDictionary<string, List<LightLayout>> _layouts = new(); // pointId -> lights
     private readonly SemaphoreSlim _mapLock = new(1, 1);
     private string? _mapAirport; // airport code currently loaded
+    private DateTime _lastSnapshotUtc = DateTime.MinValue;
+    private readonly TimeSpan _snapshotStaleAfter = TimeSpan.FromSeconds(25); // if no snapshot / updates for this long, re-request
+    private DateTime _lastUpdateUtc = DateTime.MinValue;
+    private readonly Timer _reconcileTimer;
+    private volatile bool _requestInFlight;
+    private DateTime _lastSnapshotRequestUtc = DateTime.MinValue;
+    private readonly TimeSpan _snapshotRequestMinInterval = TimeSpan.FromSeconds(20);
 
     public AirportStateHub(IHttpClientFactory httpFactory, ILogger<AirportStateHub> logger)
     {
         _httpClient = httpFactory.CreateClient();
         _logger = logger;
+        _reconcileTimer = new Timer(_ => ReconcileLoop(), null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
     }
 
     public event Action<string>? MapLoaded; // airport
     public event Action<PointState>? PointStateChanged; // fired for initial + updates
+    public event Action<string, string>? OutboundPacketRequested; // (airport, rawJson)
 
     public bool TryGetPoint(string id, out PointState state) => _states.TryGetValue(id, out state!);
     public bool TryGetLightLayout(string id, out IReadOnlyList<LightLayout> lights)
@@ -53,6 +62,9 @@ internal sealed class AirportStateHub
                 case "INITIAL_STATE":
                     await HandleInitialStateAsync(root, ct);
                     break;
+                case "STATE_SNAPSHOT":
+                    await HandleSnapshotAsync(root, ct);
+                    break;
                 case "STATE_UPDATE":
                     HandleStateUpdate(root);
                     break;
@@ -69,6 +81,52 @@ internal sealed class AirportStateHub
         }
     }
 
+    private async Task HandleSnapshotAsync(JsonElement root, CancellationToken ct)
+    {
+        if (!root.TryGetProperty("airport", out var aProp) || aProp.ValueKind != JsonValueKind.String) return;
+        var airport = aProp.GetString();
+        if (string.IsNullOrWhiteSpace(airport)) return;
+        await EnsureMapLoadedAsync(airport!, ct);
+        if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
+        if (!data.TryGetProperty("objects", out var objects) || objects.ValueKind != JsonValueKind.Array) return;
+        int applied = 0;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var obj in objects.EnumerateArray())
+        {
+            if (obj.ValueKind != JsonValueKind.Object) continue;
+            var id = obj.TryGetProperty("id", out var idProp) ? idProp.GetString() : null;
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            seen.Add(id!);
+            var on = obj.TryGetProperty("state", out var stp) && stp.ValueKind == JsonValueKind.True;
+            var ts = obj.TryGetProperty("timestamp", out var tsp) && tsp.TryGetInt64(out var lts) ? lts : 0L;
+            if (!_metadata.TryGetValue(id!, out var meta))
+            {
+                meta = new PointMetadata(id!, airport!, "", id!, 0, 0, null, null, null, false, false);
+                _metadata[id!] = meta;
+            }
+            var ps = new PointState(meta, on, ts);
+            _states[id!] = ps;
+            applied++;
+            try { PointStateChanged?.Invoke(ps); } catch { }
+        }
+        _lastSnapshotUtc = DateTime.UtcNow;
+        _lastUpdateUtc = _lastSnapshotUtc;
+        // Remove orphan states not present in snapshot (object deleted server-side)
+        var removed = 0;
+        foreach (var existing in _states.Keys.ToList())
+        {
+            if (!seen.Contains(existing))
+            {
+                if (_states.TryRemove(existing, out _)) removed++;
+            }
+        }
+        if (removed > 0)
+        {
+            _logger.LogInformation("Snapshot removed {removed} stale objects for {apt}", removed, airport);
+        }
+        _logger.LogInformation("STATE_SNAPSHOT applied objects={applied} removed={removed} airport={apt}", applied, removed, airport);
+    }
+
     private async Task HandleInitialStateAsync(JsonElement root, CancellationToken ct)
     {
         if (!root.TryGetProperty("airport", out var aProp) || aProp.ValueKind != JsonValueKind.String) return;
@@ -78,6 +136,7 @@ internal sealed class AirportStateHub
         if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
         if (!data.TryGetProperty("objects", out var objects) || objects.ValueKind != JsonValueKind.Array) return;
         int count = 0;
+        int ignoredUnknown = 0;
         foreach (var obj in objects.EnumerateArray())
         {
             if (obj.ValueKind != JsonValueKind.Object) continue;
@@ -87,16 +146,22 @@ internal sealed class AirportStateHub
             var ts = obj.TryGetProperty("timestamp", out var tsp) && tsp.TryGetInt64(out var lts) ? lts : 0L;
             if (!_metadata.TryGetValue(id!, out var meta))
             {
-                // Create placeholder if not in map (should be rare)
-                meta = new PointMetadata(id!, airport!, "", id!, 0, 0, null, null, null, false, false);
-                _metadata[id!] = meta;
+                // Ignore objects not present in map to avoid spawning at (0,0). We'll request a snapshot soon if map is outdated.
+                ignoredUnknown++;
+                continue;
             }
             var ps = new PointState(meta, on, ts);
             _states[id!] = ps;
             count++;
             try { PointStateChanged?.Invoke(ps); } catch { }
         }
-        _logger.LogInformation("INITIAL_STATE processed {count} points for {apt}", count, airport);
+        _lastUpdateUtc = DateTime.UtcNow;
+        _logger.LogInformation("INITIAL_STATE processed {count} points (ignoredUnknown={ignored}) for {apt}", count, ignoredUnknown, airport);
+        if (ignoredUnknown > 0)
+        {
+            // Force snapshot sooner (maybe map changed). Bump lastSnapshot to trigger reconcile check.
+            _lastSnapshotUtc = DateTime.MinValue;
+        }
     }
 
     private void HandleStateUpdate(JsonElement root)
@@ -108,11 +173,13 @@ internal sealed class AirportStateHub
         var ts = root.TryGetProperty("timestamp", out var tsp) && tsp.TryGetInt64(out var lts) ? lts : 0L;
         if (!_metadata.TryGetValue(id!, out var meta))
         {
-            meta = new PointMetadata(id!, _mapAirport ?? string.Empty, "", id!, 0, 0, null, null, null, false, false);
-            _metadata[id!] = meta;
+            // Skip updates for unknown objects rather than creating placeholder at (0,0)
+            _logger.LogTrace("Skipping update for unknown object {id}", id);
+            return;
         }
         var ps = new PointState(meta, on, ts);
         _states[id!] = ps;
+        _lastUpdateUtc = DateTime.UtcNow;
         try { PointStateChanged?.Invoke(ps); } catch { }
     }
 
@@ -203,4 +270,42 @@ internal sealed class AirportStateHub
     }
 
     public sealed record LightLayout(double Latitude, double Longitude, double? Heading, string? Color, int? StateId);
+
+    private void ReconcileLoop()
+    {
+        try
+        {
+            if (_mapAirport == null) return; // not connected yet
+            var now = DateTime.UtcNow;
+            var sinceUpdate = now - _lastUpdateUtc;
+            if (sinceUpdate > _snapshotStaleAfter && !_requestInFlight)
+            {
+                _ = RequestSnapshotAsync(_mapAirport); // fire and forget
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "ReconcileLoop failed");
+        }
+    }
+
+    private Task RequestSnapshotAsync(string airport)
+    {
+        if (_requestInFlight) return Task.CompletedTask;
+        if ((DateTime.UtcNow - _lastSnapshotRequestUtc) < _snapshotRequestMinInterval) return Task.CompletedTask;
+        _requestInFlight = true;
+        try
+        {
+            // The websocket layer should allow sending raw text frames. We'll emit a GET_STATE packet.
+            var packet = $"{{ \"type\": \"GET_STATE\", \"airport\": \"{airport}\", \"timestamp\": {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()} }}";
+            _lastSnapshotRequestUtc = DateTime.UtcNow;
+            _logger.LogInformation("Requesting state snapshot for {apt}", airport);
+            try { OutboundPacketRequested?.Invoke(airport, packet); } catch { }
+        }
+        finally
+        {
+            _requestInFlight = false;
+        }
+        return Task.CompletedTask;
+    }
 }

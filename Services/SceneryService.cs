@@ -13,27 +13,32 @@ namespace BARS_Client_V2.Services
         public string UserId { get; set; } = string.Empty;
         public string UserDisplayName { get; set; } = string.Empty;
         public string AirportIcao { get; set; } = string.Empty;
-        public string PackageName { get; set; } = string.Empty; 
+        public string PackageName { get; set; } = string.Empty;
         public string SubmittedXml { get; set; } = string.Empty;
         public string Notes { get; set; } = string.Empty;
         public DateTime SubmissionDate { get; set; }
         public string Status { get; set; } = string.Empty;
         public string RejectionReason { get; set; } = string.Empty;
         public DateTime? DecisionDate { get; set; }
-    }public class ContributionsResponse
+    }
+
+    public class ContributionsResponse
     {
-        public List<SceneryContribution> contributions { get; set; }
-    }    public class SceneryService
+        // Initialize to empty list to satisfy non-nullable warning
+        public List<SceneryContribution> contributions { get; set; } = new();
+    }
+
+    public class SceneryService
     {
         private const string API_URL = "https://v2.stopbars.com/contributions?status=approved";
         private const string SETTINGS_FILE = "scenerySelections.json";
         private readonly HttpClient _httpClient;
         private Dictionary<string, string> _selectedPackages;
         private static SceneryService? _instance;
-        
-        public static SceneryService Instance 
+
+        public static SceneryService Instance
         {
-            get 
+            get
             {
                 _instance ??= new SceneryService();
                 return _instance;
@@ -49,28 +54,29 @@ namespace BARS_Client_V2.Services
         public async Task<Dictionary<string, List<string>>> GetAvailablePackagesAsync()
         {
             try
-            {                var response = await _httpClient.GetStringAsync(API_URL);
-                
+            {
+                var response = await _httpClient.GetStringAsync(API_URL);
+
                 // Use case-insensitive JSON options
-                var options = new JsonSerializerOptions 
-                { 
-                    PropertyNameCaseInsensitive = true 
+                var options = new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
                 };
-                
+
                 var data = JsonSerializer.Deserialize<ContributionsResponse>(response, options);
-                
+
                 var packages = new Dictionary<string, List<string>>();
-                
+
                 // Print debug info
                 Console.WriteLine($"API Response received, contributions count: {data?.contributions?.Count ?? 0}");
-                
+
                 if (data?.contributions != null && data.contributions.Count > 0)
                 {
                     foreach (var contribution in data.contributions)
                     {
                         if (string.IsNullOrEmpty(contribution.AirportIcao) || string.IsNullOrEmpty(contribution.PackageName))
                             continue;
-                            
+
                         if (!packages.ContainsKey(contribution.AirportIcao))
                         {
                             packages[contribution.AirportIcao] = new List<string>();
@@ -81,13 +87,13 @@ namespace BARS_Client_V2.Services
                             packages[contribution.AirportIcao].Add(contribution.PackageName);
                         }
                     }
-                    
+
                     Console.WriteLine($"Processed contributions into {packages.Count} airports with scenery packages");
-                    
+
                     // No need to add "Default Scenery" - the first item will be selected by default
                     return packages;
                 }
-                
+
                 // If data?.contributions is null or empty, return an empty dictionary
                 Console.WriteLine("No contributions found in API response");
                 return new Dictionary<string, List<string>>();
@@ -98,7 +104,8 @@ namespace BARS_Client_V2.Services
                 Console.WriteLine($"Error fetching scenery packages: {ex.Message}");
                 return new Dictionary<string, List<string>>();
             }
-        }        public string GetSelectedPackage(string icao)
+        }
+        public string GetSelectedPackage(string icao)
         {
             return _selectedPackages.TryGetValue(icao, out string? package) ? package : string.Empty;
         }
@@ -107,7 +114,8 @@ namespace BARS_Client_V2.Services
         {
             _selectedPackages[icao] = packageName;
             SaveSelectedPackages();
-        }        private Dictionary<string, string> LoadSelectedPackages()
+        }
+        private Dictionary<string, string> LoadSelectedPackages()
         {
             try
             {

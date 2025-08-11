@@ -24,6 +24,8 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
     private DateTime _cachedGroundAltAt;
     private static readonly TimeSpan GroundAltCacheDuration = TimeSpan.FromSeconds(5);
     private readonly ConcurrentDictionary<string, bool> _lateAttachedPoints = new();
+    // Track successful creations so late attach logic can correlate
+    private readonly ConcurrentDictionary<string, int> _createdObjectIds = new();
 
     public MsfsSimulatorConnector(ILogger<MsfsSimulatorConnector> logger) => _logger = logger;
 
@@ -191,6 +193,8 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
                 throw; // propagate to outer catch -> late attach fallback
             }
             _logger.LogInformation("[Connector.Spawned] point={pointId} model={model} objectId={obj} stateIdInit={sid} activeCount={count}", pointId, model, simObj.ObjectId, stateId, mgr.ActiveObjectCount);
+            // Record association for late attach correlation / diagnostics
+            _createdObjectIds[pointId] = unchecked((int)simObj.ObjectId);
             return simObj;
         }
         catch (OperationCanceledException oce)
@@ -219,7 +223,7 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
 
     private async Task TryLateAttachAsync(string pointId, double lat, double lon, SimConnectClient client, CancellationToken cancellationToken)
     {
-        if (!_lateAttachedPoints.TryAdd(pointId, false)) return;
+        if (!_lateAttachedPoints.TryAdd(pointId, false)) return; // already attempting
         try
         {
             var mgr = client.AIObjects;
@@ -227,14 +231,33 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             for (int i = 0; i < maxSeconds && !cancellationToken.IsCancellationRequested; i++)
             {
                 await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
-                var candidate = mgr.ManagedObjects.Values
-                    .Where(o => o.IsActive)
-                    .OrderByDescending(o => o.ObjectId)
-                    .FirstOrDefault();
-                if (candidate != null)
+                // If create eventually succeeded normally, association already recorded
+                if (_createdObjectIds.ContainsKey(pointId))
                 {
                     _lateAttachedPoints[pointId] = true;
-                    _logger.LogInformation("[Connector.LateAttach] point={pointId} objectId={obj}", pointId, candidate.ObjectId);
+                    _logger.LogTrace("[Connector.LateAttach.Skip] point={pointId} normalSpawnRecorded", pointId);
+                    return;
+                }
+                // Attempt to locate by userData if library exposes it; fall back to positional proximity heuristic
+                var candidates = mgr.ManagedObjects.Values.Where(o => o.IsActive).ToList();
+                SimObject? match = null;
+                foreach (var c in candidates)
+                {
+                    try
+                    {
+                        if (c.UserData is string ud && string.Equals(ud, pointId, StringComparison.Ordinal))
+                        {
+                            match = c; break;
+                        }
+                    }
+                    catch { }
+                }
+                // (Position-based heuristic removed; SimObject.Position not available in current API)
+                if (match != null)
+                {
+                    _lateAttachedPoints[pointId] = true;
+                    _createdObjectIds[pointId] = unchecked((int)match.ObjectId);
+                    _logger.LogInformation("[Connector.LateAttach] point={pointId} objectId={obj}", pointId, match.ObjectId);
                     return;
                 }
             }
@@ -247,9 +270,12 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
         finally
         {
             // Allow future attempts if we never succeeded
-            _lateAttachedPoints.TryRemove(pointId, out _);
+            if (!_lateAttachedPoints.TryGetValue(pointId, out var success) || !success)
+                _lateAttachedPoints.TryRemove(pointId, out _);
         }
     }
+
+    // (Haversine helper removed – no longer needed after heuristic removal)
 
     private static string ResolveModelVariant(int? stateId)
     {

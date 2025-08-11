@@ -47,6 +47,14 @@ internal sealed class AirportWebSocketManager : BackgroundService
         _logger = logger;
     }
 
+    public void AttachHub(AirportStateHub hub)
+    {
+        hub.OutboundPacketRequested += (airport, rawJson) =>
+        {
+            try { _ = SendRawAsync(rawJson); } catch { }
+        };
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -244,6 +252,15 @@ internal sealed class AirportWebSocketManager : BackgroundService
         {
             await DisconnectAsync("Receive loop ended");
         }
+    }
+
+    private Task SendRawAsync(string raw)
+    {
+        ClientWebSocket? ws;
+        lock (_sync) ws = _ws;
+        if (ws == null || ws.State != WebSocketState.Open) return Task.CompletedTask;
+        var payload = System.Text.Encoding.UTF8.GetBytes(raw);
+        return ws.SendAsync(payload, WebSocketMessageType.Text, true, CancellationToken.None);
     }
 
     private async Task DisconnectAsync(string reason)
