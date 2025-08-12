@@ -90,10 +90,19 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _latestStates[state.Metadata.Id] = state;
         if (_suspended) return; // cache only
         _queue.Enqueue(state);
-        Interlocked.Increment(ref _totalReceived);
-        var m = state.Metadata;
-        _logger.LogInformation("[Recv] {id} on={on} type={type} airport={apt} lat={lat:F6} lon={lon:F6} q={q}",
-            m.Id, state.IsOn, m.Type, m.AirportId, m.Latitude, m.Longitude, _queue.Count);
+        var total = Interlocked.Increment(ref _totalReceived);
+        if (total <= 5 || (total % 500) == 0)
+        {
+            var m = state.Metadata;
+            _logger.LogInformation("[RecvSample] id={id} on={on} type={type} apt={apt} lat={lat:F6} lon={lon:F6} total={tot}",
+                m.Id, state.IsOn, m.Type, m.AirportId, m.Latitude, m.Longitude, total);
+        }
+        else if (_logger.IsEnabled(LogLevel.Trace))
+        {
+            var m = state.Metadata;
+            _logger.LogTrace("[Recv] id={id} on={on} type={type} apt={apt} lat={lat:F6} lon={lon:F6}",
+                m.Id, state.IsOn, m.Type, m.AirportId, m.Latitude, m.Longitude);
+        }
     }
 
     /// <summary>
@@ -128,7 +137,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             {
                 if (!_connector.IsConnected)
                 {
-                    if ((_totalReceived % 25) == 0) _logger.LogDebug("[Loop] Waiting for simulator connection. Queue={q}", _queue.Count);
+                    if ((_totalReceived % 25) == 0) _logger.LogDebug("[Loop] Waiting for simulator connection.");
                     await Task.Delay(_disconnectedDelayMs, stoppingToken);
                     continue;
                 }
@@ -143,9 +152,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 }
                 else
                 {
-                    if (DateTime.UtcNow.Second % 20 == 0)
-
-                        await Task.Delay(_idleDelayMs, stoppingToken);
+                    await Task.Delay(_idleDelayMs, stoppingToken);
                 }
                 if (DateTime.UtcNow >= _nextProximitySweepUtc)
                 {
