@@ -39,6 +39,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     private readonly double _spawnRadiusMeters;
     private readonly TimeSpan _proximitySweepInterval;
     private DateTime _nextProximitySweepUtc = DateTime.UtcNow;
+    private readonly bool _dynamicPruneEnabled;
 
     // Rate tracking
     private DateTime _nextSpawnWindow = DateTime.UtcNow;
@@ -81,6 +82,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _errorBackoffMs = options.ErrorBackoffMs;
         _spawnRadiusMeters = options.SpawnRadiusMeters;
         _proximitySweepInterval = TimeSpan.FromSeconds(options.ProximitySweepSeconds);
+        _dynamicPruneEnabled = options.DynamicPruneEnabled;
     }
 
     public void OnPointStateChanged(PointState state)
@@ -173,16 +175,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         var layouts = GetOrBuildLayouts(ps);
         if (layouts.Count == 0) return;
         var flight = _simManager.LatestState;
-        if (flight != null)
-        {
-            var dist = DistanceMeters(flight.Latitude, flight.Longitude, ps.Metadata.Latitude, ps.Metadata.Longitude);
-            if (ps.IsOn && dist > _spawnRadiusMeters)
-            {
-                await DespawnPointAsync(id, CancellationToken.None);
-                _logger.LogTrace("[ProcessSkip:OutOfRadius] {id} dist={dist:F0}m radius={radius}", id, dist, _spawnRadiusMeters);
-                return;
-            }
-        }
         if (ps.IsOn && _nextAttemptUtc.TryGetValue(id, out var next) && DateTime.UtcNow < next) { if (_latestStates.TryGetValue(id, out var latest) && (next - DateTime.UtcNow).TotalMilliseconds < _idleDelayMs * 4) _queue.Enqueue(latest); return; }
         if (ps.IsOn && _spawnFailures.TryGetValue(id, out var fi)) { var since = DateTime.UtcNow - fi.LastFailureUtc; if (fi.Failures >= FailureThresholdForCooldown && since < _failureCooldown) return; }
         if (ps.IsOn && _hardCooldownUntil.TryGetValue(id, out var hardUntil) && DateTime.UtcNow < hardUntil) return;
@@ -242,9 +234,17 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         {
             if (TotalActiveLightCount() >= _maxObjects)
             {
-                Interlocked.Increment(ref _totalSkippedCap);
-                if (_latestStates.TryGetValue(pointId, out var latestCap)) _queue.Enqueue(latestCap);
-                break;
+                bool freed = false;
+                if (_dynamicPruneEnabled)
+                {
+                    try { freed = await EnsureCapacityForSpawnAsync(pointId, 1, ct); } catch (Exception ex) { _logger.LogDebug(ex, "[PruneError]"); }
+                }
+                if (!freed && TotalActiveLightCount() >= _maxObjects)
+                {
+                    Interlocked.Increment(ref _totalSkippedCap);
+                    if (_latestStates.TryGetValue(pointId, out var latestCap)) _queue.Enqueue(latestCap);
+                    break;
+                }
             }
             if (!CanSpawnNow())
             {
@@ -413,10 +413,10 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     }
 
     // Perform ordering & pruning based on aircraft proximity.
-    private async Task ProximitySweepAsync(CancellationToken ct)
+    private Task ProximitySweepAsync(CancellationToken ct)
     {
         var flight = _simManager.LatestState;
-        if (flight == null) return;
+        if (flight == null) return Task.CompletedTask;
         // Build active point set via manager
         var activePointIds = new HashSet<string>(StringComparer.Ordinal);
         var mgr = GetManager();
@@ -426,17 +426,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 if (o.IsActive && o.UserData is string sid)
                     activePointIds.Add(sid);
         }
-        // Despawn far ones
-        foreach (var pid in activePointIds)
-        {
-            if (!_latestStates.TryGetValue(pid, out var latest)) continue;
-            var dist = DistanceMeters(flight.Latitude, flight.Longitude, latest.Metadata.Latitude, latest.Metadata.Longitude);
-            if (dist > _spawnRadiusMeters * 1.05)
-            {
-                _logger.LogTrace("[ProximityDespawn] {id} dist={dist:F0}m radius={radius}", pid, dist, _spawnRadiusMeters);
-                await DespawnPointAsync(pid, ct);
-            }
-        }
+        // Radius-based despawn removed: keep all previously spawned objects; rely on global caps for safety.
         // Identify spawn candidates
         var candidates = new List<(PointState State, double Dist)>();
         foreach (var kv in _latestStates)
@@ -444,13 +434,13 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             var st = kv.Value;
             if (!st.IsOn) continue;
             var dist = DistanceMeters(flight.Latitude, flight.Longitude, st.Metadata.Latitude, st.Metadata.Longitude);
-            if (dist > _spawnRadiusMeters) continue;
+            // Distance requirement removed; include all ON points (distance retained only for ordering)
             var (objs, _) = GetPointObjects(st.Metadata.Id);
             var layouts = GetOrBuildLayouts(st);
             if (objs.Count >= layouts.Count) continue;
             candidates.Add((st, dist));
         }
-        if (candidates.Count == 0) return;
+        if (candidates.Count == 0) return Task.CompletedTask;
         // Order by distance (closest first)
         foreach (var c in candidates.OrderBy(c => c.Dist))
         {
@@ -459,6 +449,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             _queue.Enqueue(c.State); // enqueue for ProcessAsync which will respect cap & rate
         }
         _logger.LogTrace("[ProximityEnqueue] added={count} queue={q}", candidates.Count, _queue.Count);
+        return Task.CompletedTask;
     }
 
     private static double DistanceMeters(double lat1, double lon1, double lat2, double lon2)
@@ -540,6 +531,47 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         if (!stateId.HasValue) return "BARS_Light_0";
         var s = stateId.Value; if (s < 0) s = 0; return $"BARS_Light_{s}";
     }
+    private async Task<bool> EnsureCapacityForSpawnAsync(string priorityPointId, int requiredSlots, CancellationToken ct)
+    {
+        var flight = _simManager.LatestState;
+        if (flight == null) return false;
+        if (TotalActiveLightCount() + requiredSlots < _maxObjects) return true; // already enough
+        var mgr = GetManager();
+        if (mgr == null) return false;
+
+        // Build distinct active point set with object counts
+        var pointCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var o in mgr.ManagedObjects.Values)
+        {
+            if (!o.IsActive || o.UserData is not string pid) continue;
+            if (!pointCounts.TryAdd(pid, 1)) pointCounts[pid]++;
+        }
+        if (pointCounts.Count == 0) return false;
+        // Build distance list
+        var distances = new List<(string PointId, double Dist, int Count)>();
+        foreach (var kv in pointCounts)
+        {
+            if (!_latestStates.TryGetValue(kv.Key, out var ps)) continue; // stale
+            var d = DistanceMeters(flight.Latitude, flight.Longitude, ps.Metadata.Latitude, ps.Metadata.Longitude);
+            distances.Add((kv.Key, d, kv.Value));
+        }
+        if (distances.Count == 0) return false;
+
+        // Order farthest first, but never prune the priority point
+        foreach (var item in distances.OrderByDescending(d => d.Dist))
+        {
+            if (item.PointId == priorityPointId) continue;
+            if (TotalActiveLightCount() + requiredSlots < _maxObjects) break;
+            _logger.LogTrace("[PruneBegin] freeing point={id} dist={dist:F0}m count={count} active={active}/{cap}", item.PointId, item.Dist, item.Count, TotalActiveLightCount(), _maxObjects);
+            try { await DespawnPointAsync(item.PointId, ct); }
+            catch (Exception ex) { _logger.LogDebug(ex, "[PruneFail] point={id}", item.PointId); }
+        }
+
+        var success = TotalActiveLightCount() + requiredSlots <= _maxObjects;
+        if (success) _logger.LogTrace("[PruneSuccess] priority={prio} needed={need} active={active}/{cap}", priorityPointId, requiredSlots, TotalActiveLightCount(), _maxObjects);
+        else _logger.LogDebug("[PruneInsufficient] priority={prio} needed={need} active={active}/{cap}", priorityPointId, requiredSlots, TotalActiveLightCount(), _maxObjects);
+        return success;
+    }
 
     private void ClassifyPointObjects(string pointId, out List<SimObject> placeholders, out List<SimObject> variants)
     {
@@ -576,4 +608,5 @@ internal sealed class MsfsPointControllerOptions
     public int OverlapDespawnDelayMs { get; init; } = 1000;
     public double SpawnRadiusMeters { get; init; } = 8000;
     public int ProximitySweepSeconds { get; init; } = 5;
+    public bool DynamicPruneEnabled { get; init; } = true;
 }
