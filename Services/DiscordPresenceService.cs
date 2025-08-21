@@ -149,10 +149,12 @@ internal sealed class DiscordPresenceService : BackgroundService
             "403" => "Server: No VATSIM Connection",
             var other => other.StartsWith("4") || other.StartsWith("5") ? $"Server: {other}" : "Server: Reconnecting"
         };
-
-        // Details now only show airport + simulator; server status moved to state line per request
-        string details = $"Airport: {airport}"; // simulator removed (small image already conveys it)
-        string state = serverSegment; // server state shown on second line
+        if (string.IsNullOrWhiteSpace(airport))
+        {
+            airport = "Unknown";
+        }
+        string details = $"Airport: {airport}";
+        string state = serverSegment;
         string largeText = "BARS Pilot Client";
 
         bool changed;

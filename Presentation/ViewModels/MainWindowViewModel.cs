@@ -17,7 +17,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 {
     private readonly SimulatorManager _simManager;
     private readonly Timer _uiPoll;
-    private string _closestAirport = "ZZZZ";
+    private string _closestAirport = "Unknown";
     private bool _onGround;
     private string _simulatorName = "Not Connected";
     private bool _simConnected;

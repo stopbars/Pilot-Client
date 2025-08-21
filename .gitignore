@@ -364,3 +364,6 @@ appsettings.*.json
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Build
+dist/
