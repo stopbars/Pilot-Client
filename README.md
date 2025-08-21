@@ -22,7 +22,7 @@
     <img src="https://img.shields.io/static/v1?label=&message=Open%20Collective&color=297EF2&logo=opencollective&logoColor=white" />
   </a>
   <a href="https://www.gnu.org/licenses/gpl-3.0.en.html">
-    <img src="https://img.shields.io/static/v1?label=Licence&message=GPL%20-3.0&color=000" />
+    <img src="https://img.shields.io/static/v1?label=License&message=GPL%20-3.0&color=000" />
   </a>
   <a href="https://docs.stopbars.com" target="_blank" rel="noopener noreferrer">
     <img src="https://img.shields.io/badge/Documentation-e81919.svg" alt="Documentation">
