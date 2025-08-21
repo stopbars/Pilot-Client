@@ -5,7 +5,7 @@
 	<h1 align="center"><b>stopbars/Pilot-Client</b></h1>
 	<p align="center">
     <br />
-		BARS Pilot Client brings real-time airport lighting updates to simulators, receiving lighting state updates from controllers, to reflect changes in the pilots simulator. The client updates airport lighting positions based on selected scenery packages, provides           status monitoring including simulator detection, nearest airport, server connection, and rich Discord presence integration.
+		BARS Pilot Client brings real-time airport lighting updates to simulators, receiving lighting state updates from controllers, to reflect changes in the pilot's simulator. The client updates airport lighting positions based on selected scenery packages, provides           status monitoring including simulator detection, nearest airport, server connection, and rich Discord presence integration.
     <br />
     <br />
     <a href="https://stopbars.com"><strong>stopbars.com »</strong></a>
