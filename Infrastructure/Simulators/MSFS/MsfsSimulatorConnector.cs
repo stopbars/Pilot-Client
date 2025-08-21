@@ -30,8 +30,22 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
     public MsfsSimulatorConnector(ILogger<MsfsSimulatorConnector> logger) => _logger = logger;
 
     public string SimulatorId => "MSFS";
-    public string DisplayName => "Microsoft Flight Simulator";
+    public string DisplayName
+    {
+        get
+        {
+            var is2024 = IsMsfs2024;
+            if (is2024 == true) return "Microsoft Flight Simulator 2024";
+            if (is2024 == false) return "Microsoft Flight Simulator 2020";
+            return "Microsoft Flight Simulator"; // unknown (not yet connected)
+        }
+    }
     public bool IsConnected => _client?.IsConnected == true;
+    /// <summary>
+    /// Indicates whether the connected MSFS instance is the 2024 version. Null if not connected or undetermined.
+    /// Relies on SimConnectClient.IsMSFS2024 (exposed by SimConnect.NET) as hinted by user.
+    /// </summary>
+    public bool? IsMsfs2024 => _client?.IsMSFS2024;
 
     public async Task<bool> ConnectAsync(CancellationToken ct = default)
     {

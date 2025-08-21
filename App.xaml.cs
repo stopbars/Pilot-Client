@@ -37,6 +37,7 @@ namespace BARS_Client_V2
                     services.AddSingleton<INearestAirportService, NearestAirportService>();
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>();
                     services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>());
+                    services.AddHostedService<BARS_Client_V2.Services.DiscordPresenceService>();
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>(sp =>
                     {

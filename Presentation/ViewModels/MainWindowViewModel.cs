@@ -19,7 +19,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private readonly Timer _uiPoll;
     private string _closestAirport = "ZZZZ";
     private bool _onGround;
-    private string _simulatorName = "(none)";
+    private string _simulatorName = "Not Connected";
     private bool _simConnected;
     private double _latitude;
     private double _longitude;
