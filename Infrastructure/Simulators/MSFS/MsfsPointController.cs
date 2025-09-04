@@ -55,6 +55,13 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
     private volatile bool _suspended;
 
+    // Stopbar crossing detection
+    private double? _prevLat;
+    private double? _prevLon;
+    private readonly ConcurrentDictionary<string, (double LatA, double LonA, double LatB, double LonB)> _stopbarSegments = new();
+    private readonly ConcurrentDictionary<string, DateTime> _crossDebounceUntil = new();
+    private readonly TimeSpan _crossDebounceWindow = TimeSpan.FromSeconds(5);
+
     // Failure/backoff
     private readonly ConcurrentDictionary<string, (int Failures, DateTime LastFailureUtc)> _spawnFailures = new();
     private readonly TimeSpan _failureCooldown = TimeSpan.FromSeconds(10);
@@ -74,7 +81,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _hub = hub;
         _simManager = simManager;
         _hub.PointStateChanged += OnPointStateChanged;
-        _hub.MapLoaded += _ => ResyncActivePointsAfterLayout();
+        _hub.MapLoaded += _ => { _stopbarSegments.Clear(); ResyncActivePointsAfterLayout(); };
         _maxObjects = options.MaxObjects;
         _spawnPerSecond = options.SpawnPerSecond;
         _idleDelayMs = options.IdleDelayMs;
@@ -146,6 +153,9 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                     await Task.Delay(_idleDelayMs * 5, stoppingToken);
                     continue;
                 }
+                // Stopbar crossing detection based on latest aircraft movement
+                var flightForCross = _simManager.LatestState;
+                if (flightForCross != null) { try { DetectStopbarCrossings(flightForCross); } catch (Exception ex) { _logger.LogDebug(ex, "DetectStopbarCrossings failed"); } }
                 if (_queue.TryDequeue(out var ps))
                 {
                     await ProcessAsync(ps, stoppingToken);
@@ -173,6 +183,123 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 try { await Task.Delay(_errorBackoffMs, stoppingToken); } catch { }
             }
         }
+    }
+
+    private void DetectStopbarCrossings(FlightState flight)
+    {
+        var currLat = flight.Latitude;
+        var currLon = flight.Longitude;
+        if (!_prevLat.HasValue || !_prevLon.HasValue)
+        {
+            _prevLat = currLat; _prevLon = currLon; return;
+        }
+        var prevLat = _prevLat!.Value; var prevLon = _prevLon!.Value;
+        // If aircraft barely moved, skip
+        if (DistanceMeters(prevLat, prevLon, currLat, currLon) < 1.0) { _prevLat = currLat; _prevLon = currLon; return; }
+
+        // Consider only nearby stopbars whose state is OFF (dropped)
+        foreach (var kv in _latestStates)
+        {
+            var ps = kv.Value;
+            if (ps.IsOn) continue; // we only report when dropped
+            var type = ps.Metadata.Type ?? string.Empty;
+            if (!type.Contains("STOP", StringComparison.OrdinalIgnoreCase) || !type.Contains("BAR", StringComparison.OrdinalIgnoreCase)) continue;
+            // Debounce this object id if recently reported
+            if (_crossDebounceUntil.TryGetValue(ps.Metadata.Id, out var until) && DateTime.UtcNow < until) continue;
+
+            // Quick distance gate to avoid scanning far objects
+            var dCurr = DistanceMeters(currLat, currLon, ps.Metadata.Latitude, ps.Metadata.Longitude);
+            if (dCurr > 200) continue; // 200m radius heuristic
+
+            var seg = GetOrBuildStopbarSegment(ps.Metadata.Id, ps);
+            if (seg == null) continue;
+            var (aLat, aLon, bLat, bLon) = seg.Value;
+            if (Crosses(prevLat, prevLon, currLat, currLon, aLat, aLon, bLat, bLon))
+            {
+                _crossDebounceUntil[ps.Metadata.Id] = DateTime.UtcNow + _crossDebounceWindow;
+                _hub.SendStopbarCrossing(ps.Metadata.Id);
+                _logger.LogInformation("[StopbarCrossing] objectId={id} pos=({lat:F6},{lon:F6})", ps.Metadata.Id, currLat, currLon);
+            }
+        }
+
+        _prevLat = currLat; _prevLon = currLon;
+    }
+
+    private (double LatA, double LonA, double LatB, double LonB)? GetOrBuildStopbarSegment(string pointId, PointState ps)
+    {
+        if (_stopbarSegments.TryGetValue(pointId, out var seg)) return seg;
+        if (!_hub.TryGetLightLayout(pointId, out var lights) || lights.Count < 2) return null;
+        // Choose the two lights with maximum separation as segment endpoints
+        double best = -1; (double la, double lo, double lb, double lob) bestPair = default;
+        for (int i = 0; i < lights.Count; i++)
+        {
+            for (int j = i + 1; j < lights.Count; j++)
+            {
+                var di = DistanceMeters(lights[i].Latitude, lights[i].Longitude, lights[j].Latitude, lights[j].Longitude);
+                if (di > best)
+                {
+                    best = di; bestPair = (lights[i].Latitude, lights[i].Longitude, lights[j].Latitude, lights[j].Longitude);
+                }
+            }
+        }
+        if (best <= 0) return null;
+        var result = (bestPair.la, bestPair.lo, bestPair.lb, bestPair.lob);
+        _stopbarSegments[pointId] = result;
+        return result;
+    }
+
+    private static bool Crosses(double pLat0, double pLon0, double pLat1, double pLon1, double aLat, double aLon, double bLat, double bLon)
+    {
+        // Project to a local flat plane using simple equirectangular approximation around the stopbar midpoint for small distances.
+        var midLat = (aLat + bLat) * 0.5;
+        (double x, double y) P(double lat, double lon)
+        {
+            double x = (lon - aLon) * Math.Cos(midLat * Math.PI / 180.0) * 111320.0; // meters per deg lon
+            double y = (lat - aLat) * 110540.0; // meters per deg lat
+            return (x, y);
+        }
+        var p0 = P(pLat0, pLon0);
+        var p1 = P(pLat1, pLon1);
+        var a = (0.0, 0.0);
+        var b = P(bLat, bLon);
+
+        // Orientation signs relative to AB
+        static double Orient((double x, double y) a, (double x, double y) b, (double x, double y) p)
+            => (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+
+        var s0 = Orient(a, b, p0);
+        var s1 = Orient(a, b, p1);
+
+        // If signs are same or either is extremely close to zero, consider near-miss. We'll require sign flip and proximity.
+        if (s0 == 0 || s1 == 0) return false;
+        if (Math.Sign(s0) == Math.Sign(s1)) return false;
+
+        // Ensure the perpendicular projection falls within segment extents and distance within tolerance
+        static double Dot((double x, double y) u, (double x, double y) v) => u.x * v.x + u.y * v.y;
+        static (double x, double y) Sub((double x, double y) u, (double x, double y) v) => (u.x - v.x, u.y - v.y);
+        var ab = Sub(b, a);
+        var ap0 = Sub(p0, a);
+        var ap1 = Sub(p1, a);
+        double abLen2 = Dot(ab, ab);
+        if (abLen2 < 1) return false;
+        // Closest approach from movement segment to AB
+        // Compute intersection t on AB using average of projections from both endpoints (heuristic)
+        var t0 = Math.Clamp(Dot(ap0, ab) / abLen2, 0, 1);
+        var t1 = Math.Clamp(Dot(ap1, ab) / abLen2, 0, 1);
+        var t = 0.5 * (t0 + t1);
+        var closest = (x: a.Item1 + ab.x * t, y: a.Item2 + ab.y * t);
+        // Distance from movement segment to closest point
+        double DistPointToSeg((double x, double y) p, (double x, double y) u, (double x, double y) v)
+        {
+            var uv = Sub(v, u);
+            var up = Sub(p, u);
+            var tproj = Math.Clamp(Dot(up, uv) / (Dot(uv, uv) + 1e-6), 0, 1);
+            var proj = (x: u.x + uv.x * tproj, y: u.y + uv.y * tproj);
+            var dx = p.x - proj.x; var dy = p.y - proj.y; return Math.Sqrt(dx * dx + dy * dy);
+        }
+        var dist = DistPointToSeg(closest, p0, p1);
+        const double tolMeters = 12.0; // crossing tolerance
+        return dist <= tolMeters;
     }
 
     private async Task ProcessAsync(PointState ps, CancellationToken ct)

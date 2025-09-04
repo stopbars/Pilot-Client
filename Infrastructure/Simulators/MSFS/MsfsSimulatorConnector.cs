@@ -17,7 +17,7 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
 {
     private readonly ILogger<MsfsSimulatorConnector> _logger;
     private SimConnectClient? _client;
-    private const int PollDelayMs = 15_000;
+    private const int PollDelayMs = 500; // faster polling for precise stopbar crossing detection
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(20);
     private readonly SemaphoreSlim _connectGate = new(1, 1);
     private double? _cachedGroundAltFeet;

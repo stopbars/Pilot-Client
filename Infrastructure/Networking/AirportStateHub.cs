@@ -82,6 +82,19 @@ internal sealed class AirportStateHub
         }
     }
 
+    /// <summary>
+    /// Sends a STOPBAR_CROSSING packet over the airport websocket for the currently loaded airport.
+    /// Server expects the objectId (BarsId) of the stopbar line being crossed.
+    /// </summary>
+    /// <param name="objectId">Bars object id of the stopbar line that was crossed.</param>
+    public void SendStopbarCrossing(string objectId)
+    {
+        if (string.IsNullOrWhiteSpace(objectId)) return;
+        var packet = JsonSerializer.Serialize(new { type = "STOPBAR_CROSSING", data = new { objectId = objectId } });
+        try { OutboundPacketRequested?.Invoke(_mapAirport ?? string.Empty, packet); } catch { }
+        _logger.LogInformation("Sent STOPBAR_CROSSING objectId={id}", objectId);
+    }
+
     private async Task HandleSnapshotAsync(JsonElement root, CancellationToken ct)
     {
         if (!root.TryGetProperty("airport", out var aProp) || aProp.ValueKind != JsonValueKind.String) return;
