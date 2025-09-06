@@ -35,6 +35,8 @@ internal sealed class AirportStateHub
         _httpClient = httpFactory.CreateClient();
         _logger = logger;
         _reconcileTimer = new Timer(_ => ReconcileLoop(), null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+        // React to scenery package changes while connected so users don't need to restart the client.
+        try { SceneryService.Instance.PackageChanged += OnSceneryPackageChanged; } catch { }
     }
 
     public event Action<string>? MapLoaded; // airport
@@ -204,61 +206,109 @@ internal sealed class AirportStateHub
         try
         {
             if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return;
-            _metadata.Clear();
-            _layouts.Clear();
-            // Determine currently selected scenery package for this airport (if any). If none selected yet, auto-select first available.
-            string package = string.Empty;
-            try
-            {
-                package = SceneryService.Instance.GetSelectedPackage(airport);
-                if (string.IsNullOrWhiteSpace(package))
-                {
-                    // Fetch contributions (packages) and choose first for this airport.
-                    var all = await SceneryService.Instance.GetAvailablePackagesAsync();
-                    if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
-                    {
-                        package = pkgList.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).First();
-                        // Persist selection so UI stays consistent.
-                        SceneryService.Instance.SetSelectedPackage(airport, package);
-                        _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt}", package, airport);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("No packages found for airport {apt} when attempting to auto-select; aborting map load", airport);
-                        return; // Without a package the server cannot return a map.
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed determining package for airport {apt}", airport);
-                return; // Can't proceed without a valid package.
-            }
-            var safePkg = Uri.EscapeDataString(package);
-            var url = $"https://v2.stopbars.com/maps/{airport}/packages/{safePkg}/latest";
-            _logger.LogInformation("Fetching airport XML map {apt} package={pkg} url={url}", airport, package, url);
-            using var resp = await _httpClient.GetAsync(url, ct);
-            if (!resp.IsSuccessStatusCode)
-            {
-                _logger.LogWarning("Airport map fetch failed {status} apt={apt} package={pkg}", resp.StatusCode, airport, package);
-                return;
-            }
-            var xml = await resp.Content.ReadAsStringAsync(ct);
-            try
-            {
-                var doc = XDocument.Parse(xml);
-                ParseMap(doc, airport);
-                _mapAirport = airport;
-                try { MapLoaded?.Invoke(airport); } catch { }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Error parsing airport map {apt} package={pkg}", airport, package);
-            }
+            await LoadMapInternalAsync(airport, ct);
         }
         finally
         {
             _mapLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Force reload current airport map after scenery package change.
+    /// </summary>
+    private async void OnSceneryPackageChanged(string icao, string newPackage)
+    {
+        try
+        {
+            // Only reload if we're currently on that airport
+            if (!string.Equals(_mapAirport, icao, StringComparison.OrdinalIgnoreCase)) return;
+            _logger.LogInformation("Scenery package changed for {apt} -> {pkg}; reloading map", icao, newPackage);
+            await _mapLock.WaitAsync();
+            try
+            {
+                // Clear current map caches and state, then load again using the new selection
+                _metadata.Clear();
+                _layouts.Clear();
+                _states.Clear();
+                _lastSnapshotUtc = DateTime.MinValue;
+                _lastUpdateUtc = DateTime.MinValue;
+                await LoadMapInternalAsync(icao, CancellationToken.None);
+                // Immediately request a fresh snapshot so clients rebuild using the new layout
+                _ = RequestSnapshotAsync(icao);
+            }
+            finally { _mapLock.Release(); }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to hot-reload map for {apt} after package change", icao);
+        }
+    }
+
+    private async Task LoadMapInternalAsync(string airport, CancellationToken ct)
+    {
+        // Determine currently selected scenery package for this airport (if any). If none selected yet, auto-select first available.
+        string package = string.Empty;
+        try
+        {
+            package = SceneryService.Instance.GetSelectedPackage(airport);
+            var all = await SceneryService.Instance.GetAvailablePackagesAsync();
+            if (string.IsNullOrWhiteSpace(package))
+            {
+                if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
+                {
+                    package = pkgList.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).First();
+                    SceneryService.Instance.SetSelectedPackage(airport, package);
+                    _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt}", package, airport);
+                }
+                else
+                {
+                    _logger.LogWarning("No packages found for airport {apt} when attempting to auto-select; aborting map load", airport);
+                    return;
+                }
+            }
+            else
+            {
+                // Resolve selection to one of the available package names (case-insensitive, supports substring like "2024").
+                if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
+                {
+                    var exact = pkgList.FirstOrDefault(p => string.Equals(p, package, StringComparison.OrdinalIgnoreCase));
+                    if (!string.IsNullOrEmpty(exact)) package = exact;
+                    else
+                    {
+                        var partial = pkgList.FirstOrDefault(p => p.IndexOf(package, StringComparison.OrdinalIgnoreCase) >= 0);
+                        if (!string.IsNullOrEmpty(partial)) package = partial;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed determining package for airport {apt}", airport);
+            return;
+        }
+
+        var safePkg = Uri.EscapeDataString(package);
+        var url = $"https://v2.stopbars.com/maps/{airport}/packages/{safePkg}/latest";
+        _logger.LogInformation("Fetching airport XML map {apt} package={pkg} url={url}", airport, package, url);
+        using var resp = await _httpClient.GetAsync(url, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            _logger.LogWarning("Airport map fetch failed {status} apt={apt} package={pkg}", resp.StatusCode, airport, package);
+            return;
+        }
+        var xml = await resp.Content.ReadAsStringAsync(ct);
+        try
+        {
+            var doc = XDocument.Parse(xml);
+            ParseMap(doc, airport);
+            _mapAirport = airport;
+            _lastSnapshotUtc = DateTime.MinValue; // force fresh snapshot soon
+            try { MapLoaded?.Invoke(airport); } catch { }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error parsing airport map {apt} package={pkg}", airport, package);
         }
     }
 
@@ -288,7 +338,10 @@ internal sealed class AirportStateHub
                 int? stateId = null;
                 var stateAttr = le.Attribute("stateId")?.Value;
                 if (int.TryParse(stateAttr, out var sidVal)) stateId = sidVal;
-                lightList.Add(new LightLayout(lat, lon, hdg, lColor, stateId));
+                int? offStateId = null;
+                var offStateAttr = le.Attribute("offStateId")?.Value;
+                if (int.TryParse(offStateAttr, out var offSidVal)) offStateId = offSidVal;
+                lightList.Add(new LightLayout(lat, lon, hdg, lColor, stateId, offStateId));
                 sumLat += lat; sumLon += lon; cnt++; lightCount++;
             }
             double repLat = 0, repLon = 0;
@@ -312,7 +365,7 @@ internal sealed class AirportStateHub
         return ok1 && ok2;
     }
 
-    public sealed record LightLayout(double Latitude, double Longitude, double? Heading, string? Color, int? StateId);
+    public sealed record LightLayout(double Latitude, double Longitude, double? Heading, string? Color, int? StateId, int? OffStateId);
 
     private void ReconcileLoop()
     {

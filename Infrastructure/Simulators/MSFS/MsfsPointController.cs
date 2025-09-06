@@ -81,7 +81,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _hub = hub;
         _simManager = simManager;
         _hub.PointStateChanged += OnPointStateChanged;
-        _hub.MapLoaded += _ => { _stopbarSegments.Clear(); ResyncActivePointsAfterLayout(); };
+        _hub.MapLoaded += OnMapLoaded;
         _maxObjects = options.MaxObjects;
         _spawnPerSecond = options.SpawnPerSecond;
         _idleDelayMs = options.IdleDelayMs;
@@ -327,37 +327,13 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
         if (!ps.IsOn)
         {
-            // OFF: Build full placeholder set, then remove ALL variants.
-            if (placeholders.Count < layouts.Count)
-            {
-                int need = layouts.Count - placeholders.Count;
-                await SpawnBatchAsync(id, layouts, need, isPlaceholder: true, ct);
-                if (_latestStates.TryGetValue(id, out var latestOff)) _queue.Enqueue(latestOff); // re-evaluate later
-                _logger.LogTrace("[OverlapPending] {id} placeholders={ph}/{need}", id, placeholders.Count, layouts.Count);
-                return;
-            }
-            if (variants.Count > 0)
-            {
-                await RemoveObjectsAsync(variants, id, ct, "[OverlapRemove:Variants]");
-                _logger.LogTrace("[OverlapRemovedVariants] {id}", id);
-            }
+            // OFF: Ensure per-light off variant (offStateId) if provided; otherwise fallback to placeholder (stateId=0).
+            await EnsureOffStateAsync(id, layouts, variants, placeholders, ct);
             return;
         }
 
-        // ON path: Build variants first then remove placeholders.
-        if (variants.Count < layouts.Count)
-        {
-            int need = layouts.Count - variants.Count;
-            await SpawnBatchAsync(id, layouts, need, isPlaceholder: false, ct);
-            if (_latestStates.TryGetValue(id, out var latestOn)) _queue.Enqueue(latestOn);
-            _logger.LogTrace("[OverlapPendingVariants] {id} variants={var}/{need}", id, variants.Count, layouts.Count);
-            return;
-        }
-        if (placeholders.Count > 0)
-        {
-            await RemoveObjectsAsync(placeholders, id, ct, "[OverlapRemove:Placeholders]");
-            _logger.LogTrace("[OverlapRemovedPlaceholders] {id}", id);
-        }
+        // ON: spawn ON variants first, then remove OFF variants/placeholders once desired counts are satisfied.
+        await EnsureOnStateAsync(id, layouts, ct);
     }
 
     private async Task SpawnBatchAsync(string pointId, IReadOnlyList<LightLayout> layouts, int maxToSpawn, bool isPlaceholder, CancellationToken ct)
@@ -426,6 +402,26 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
     private void TryCompleteOverlap(string pointId) { }
 
+    private async void OnMapLoaded(string _)
+    {
+        // Scenery package or map layout changed for the current airport.
+        // Clear caches and all active sim objects. Do NOT re-enqueue old states here; a fresh snapshot will arrive.
+        try
+        {
+            _stopbarSegments.Clear();
+            _layoutCache.Clear();
+            await DespawnAllAsync();
+            // Drop cached point states to avoid respawning with old package
+            _latestStates.Clear();
+            while (_queue.TryDequeue(out var __)) { }
+            _logger.LogInformation("[MapReload] Cleared caches, states, and all spawned lights; awaiting fresh snapshot");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[MapReload] Failed to hot-reload after map change");
+        }
+    }
+
     private bool CanSpawnNow()
     {
         var now = DateTime.UtcNow;
@@ -464,6 +460,275 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         finally { _spawnConcurrency.Release(); }
     }
 
+    // Overload that tags the UserData with a specific slot index for per-slot handover: "{pointId}|{slotIndex}"
+    private async Task<SimObject?> SpawnLightAsync(string pointId, LightLayout layout, int slotIndex, CancellationToken ct)
+    {
+        if (slotIndex < 0) return await SpawnLightAsync(pointId, layout, ct);
+        if (_connector is not MsfsSimulatorConnector msfs || !msfs.IsConnected) return null;
+        var clientField = typeof(MsfsSimulatorConnector).GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var client = clientField?.GetValue(msfs) as SimConnect.NET.SimConnectClient;
+        var mgr = client?.AIObjects;
+        if (mgr == null) return null;
+        await _spawnConcurrency.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var tag = $"{pointId}|{slotIndex}";
+            return await mgr.CreateObjectAsync(ResolveModel(layout.StateId), new SimConnect.NET.SimConnectDataInitPosition
+            {
+                Latitude = layout.Latitude,
+                Longitude = layout.Longitude,
+                Altitude = 50,
+                Heading = layout.Heading ?? 0,
+                Pitch = 0,
+                Bank = 0,
+                OnGround = 1,
+                Airspeed = 0
+            }, userData: tag, cancellationToken: ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Connector.Spawn.Fail] point={pointId} stateId={sid}", pointId, layout.StateId);
+            throw;
+        }
+        finally { _spawnConcurrency.Release(); }
+    }
+
+    private static bool TryGetUserPointAndSlot(SimObject o, out string? pointId, out int? slotIndex)
+    {
+        pointId = null; slotIndex = null;
+        if (o.UserData is string s && !string.IsNullOrEmpty(s))
+        {
+            var sep = s.IndexOf('|');
+            if (sep < 0)
+            {
+                pointId = s; return true;
+            }
+            else
+            {
+                pointId = s.Substring(0, sep);
+                if (int.TryParse(s.Substring(sep + 1), out var idx)) slotIndex = idx;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private async Task RemoveWrongForSlotAsync(string pointId, int desiredState, int slotIndex, CancellationToken ct, string contextTag)
+    {
+        var mgr = GetManager(); if (mgr == null) return;
+        var toRemove = new List<SimObject>();
+        foreach (var o in mgr.ManagedObjects.Values)
+        {
+            if (!o.IsActive) continue;
+            if (!TryGetUserPointAndSlot(o, out var pid, out var idx)) continue;
+            if (!string.Equals(pid, pointId, StringComparison.Ordinal)) continue;
+            if (!idx.HasValue || idx.Value != slotIndex) continue; // act only on the specific slot
+            var sid = ResolveObjectState(o);
+            if (sid != desiredState) toRemove.Add(o);
+        }
+        if (toRemove.Count > 0)
+        {
+            await RemoveObjectsAsync(toRemove, pointId, ct, contextTag);
+        }
+    }
+
+    private async Task EnsureOffStateAsync(string pointId, IReadOnlyList<LightLayout> layouts, List<SimObject> variants, List<SimObject> placeholders, CancellationToken ct)
+    {
+        // Determine desired off-state ids per layout
+        var desiredByIndex = layouts.Select(l => l.OffStateId ?? 0).ToList();
+        var desiredSet = new HashSet<int>(desiredByIndex);
+
+        // Build current list of objects for this point with resolved stateIds
+        var mgr = GetManager();
+        var current = mgr == null ? new List<(SimObject Obj, int State)>()
+                                  : mgr.ManagedObjects.Values
+                                      .Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal))
+                                      .Select(o => (Obj: o, State: ResolveObjectState(o)))
+                                      .ToList();
+
+        // Count current per-state
+        var counts = new Dictionary<int, int>();
+        foreach (var c in current) { if (!counts.TryAdd(c.State, 1)) counts[c.State]++; }
+
+        // Determine desired counts per state
+        var desiredCounts = new Dictionary<int, int>();
+        foreach (var s in desiredByIndex) { var v = s; if (!desiredCounts.TryAdd(v, 1)) desiredCounts[v]++; }
+
+        // Spawn missing OFF objects iterating layouts for positions and states (spawn-first ordering)
+        for (int i = 0; i < layouts.Count; i++)
+        {
+            var desiredState = desiredByIndex[i];
+            var haveCount = counts.TryGetValue(desiredState, out var cv) ? cv : 0;
+            var wantCount = desiredCounts[desiredState];
+            if (haveCount >= wantCount) continue; // enough of this variant exists overall
+
+            // Capacity and rate checks
+            if (TotalActiveLightCount() >= _maxObjects)
+            {
+                bool freed = false;
+                if (_dynamicPruneEnabled)
+                {
+                    try { freed = await EnsureCapacityForSpawnAsync(pointId, 1, ct); } catch (Exception ex) { _logger.LogDebug(ex, "[PruneError]"); }
+                }
+                if (!freed && TotalActiveLightCount() >= _maxObjects)
+                {
+                    Interlocked.Increment(ref _totalSkippedCap);
+                    if (_latestStates.TryGetValue(pointId, out var latestCap)) _queue.Enqueue(latestCap);
+                    break;
+                }
+            }
+            if (!CanSpawnNow())
+            {
+                Interlocked.Increment(ref _totalDeferredRate);
+                if (_latestStates.TryGetValue(pointId, out var latestRate)) _queue.Enqueue(latestRate);
+                break;
+            }
+
+            var layout = layouts[i] with { StateId = desiredState };
+            try
+            {
+                var handle = await SpawnLightAsync(pointId, layout, i, ct);
+                Interlocked.Increment(ref _totalSpawnAttempts);
+                if (handle == null) { RegisterSpawnFailure(pointId); break; }
+                _spawnFailures.TryRemove(pointId, out _);
+                _objectStateIds[handle.ObjectId] = desiredState;
+                if (!counts.TryAdd(desiredState, 1)) counts[desiredState]++;
+                _logger.LogTrace("[OffSync:Spawned] {id} stateId={sid} obj={obj}", pointId, desiredState, handle.ObjectId);
+                // Immediately hand over this slot to prevent z-fighting
+                await RemoveWrongForSlotAsync(pointId, desiredState, i, ct, "[OffSync:Swap]");
+            }
+            catch (Exception ex)
+            {
+                RegisterSpawnFailure(pointId);
+                _logger.LogDebug(ex, "[OffSync:SpawnError] {id}", pointId);
+                break;
+            }
+        }
+
+        // If we now have all desired OFF objects, remove any wrong-state remnants (ON variants etc.)
+        bool satisfied = desiredCounts.All(kv => counts.TryGetValue(kv.Key, out var cv) && cv >= kv.Value);
+        if (satisfied)
+        {
+            var mgr2 = GetManager();
+            if (mgr2 != null)
+            {
+                var removeWrong = mgr2.ManagedObjects.Values
+                    .Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal))
+                    .Where(o => { var sid = _objectStateIds.TryGetValue(o.ObjectId, out var sidv) ? sidv : ResolveObjectState(o); return !desiredSet.Contains(sid); })
+                    .ToList();
+                if (removeWrong.Count > 0)
+                {
+                    await RemoveObjectsAsync(removeWrong, pointId, ct, "[OffSync:RemoveWrong]");
+                }
+            }
+        }
+        else
+        {
+            if (_latestStates.TryGetValue(pointId, out var latestOff)) _queue.Enqueue(latestOff);
+        }
+    }
+
+    private async Task EnsureOnStateAsync(string pointId, IReadOnlyList<LightLayout> layouts, CancellationToken ct)
+    {
+        // Determine desired ON-state ids per layout (fallback to 1 if missing/zero)
+        var desiredByIndex = layouts.Select(l =>
+        {
+            var s = l.StateId.HasValue && l.StateId.Value != 0 ? l.StateId.Value : 1;
+            return s;
+        }).ToList();
+        var desiredSet = new HashSet<int>(desiredByIndex);
+
+        // Build current list of objects for this point with resolved stateIds
+        var mgr = GetManager();
+        var current = mgr == null ? new List<(SimObject Obj, int State)>()
+                                  : mgr.ManagedObjects.Values
+                                      .Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal))
+                                      .Select(o => (Obj: o, State: ResolveObjectState(o)))
+                                      .ToList();
+
+        // Count current per-state
+        var counts = new Dictionary<int, int>();
+        foreach (var c in current) { if (!counts.TryAdd(c.State, 1)) counts[c.State]++; }
+
+        // Determine desired counts per state
+        var desiredCounts = new Dictionary<int, int>();
+        foreach (var s in desiredByIndex) { if (!desiredCounts.TryAdd(s, 1)) desiredCounts[s]++; }
+
+        // Spawn missing ON objects iterating layouts for positions and states (spawn-first ordering)
+        for (int i = 0; i < layouts.Count; i++)
+        {
+            var desiredState = desiredByIndex[i];
+            var haveCount = counts.TryGetValue(desiredState, out var cv) ? cv : 0;
+            var wantCount = desiredCounts[desiredState];
+            if (haveCount >= wantCount) continue; // enough of this variant exists overall
+
+            // Capacity and rate checks
+            if (TotalActiveLightCount() >= _maxObjects)
+            {
+                bool freed = false;
+                if (_dynamicPruneEnabled)
+                {
+                    try { freed = await EnsureCapacityForSpawnAsync(pointId, 1, ct); } catch (Exception ex) { _logger.LogDebug(ex, "[PruneError]"); }
+                }
+                if (!freed && TotalActiveLightCount() >= _maxObjects)
+                {
+                    Interlocked.Increment(ref _totalSkippedCap);
+                    if (_latestStates.TryGetValue(pointId, out var latestCap)) _queue.Enqueue(latestCap);
+                    break;
+                }
+            }
+            if (!CanSpawnNow())
+            {
+                Interlocked.Increment(ref _totalDeferredRate);
+                if (_latestStates.TryGetValue(pointId, out var latestRate)) _queue.Enqueue(latestRate);
+                break;
+            }
+
+            var layout = layouts[i];
+            var spawnLayout = layout with { StateId = desiredState };
+            try
+            {
+                var handle = await SpawnLightAsync(pointId, spawnLayout, i, ct);
+                Interlocked.Increment(ref _totalSpawnAttempts);
+                if (handle == null) { RegisterSpawnFailure(pointId); break; }
+                _spawnFailures.TryRemove(pointId, out _);
+                _objectStateIds[handle.ObjectId] = desiredState;
+                if (!counts.TryAdd(desiredState, 1)) counts[desiredState]++;
+                _logger.LogTrace("[OnSync:Spawned] {id} stateId={sid} obj={obj}", pointId, desiredState, handle.ObjectId);
+                // Immediately hand over this slot to prevent z-fighting
+                await RemoveWrongForSlotAsync(pointId, desiredState, i, ct, "[OnSync:Swap]");
+            }
+            catch (Exception ex)
+            {
+                RegisterSpawnFailure(pointId);
+                _logger.LogDebug(ex, "[OnSync:SpawnError] {id}", pointId);
+                break;
+            }
+        }
+
+        // If we now have all desired ON objects, remove any wrong-state remnants (OFF variants/placeholders)
+        bool satisfied = desiredCounts.All(kv => counts.TryGetValue(kv.Key, out var cv) && cv >= kv.Value);
+        if (satisfied)
+        {
+            var mgr2 = GetManager();
+            if (mgr2 != null)
+            {
+                var removeWrong = mgr2.ManagedObjects.Values
+                    .Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal))
+                    .Where(o => { var sid = _objectStateIds.TryGetValue(o.ObjectId, out var sidv) ? sidv : ResolveObjectState(o); return !desiredSet.Contains(sid); })
+                    .ToList();
+                if (removeWrong.Count > 0)
+                {
+                    await RemoveObjectsAsync(removeWrong, pointId, ct, "[OnSync:RemoveWrong]");
+                }
+            }
+        }
+        else
+        {
+            if (_latestStates.TryGetValue(pointId, out var latestOn)) _queue.Enqueue(latestOn);
+        }
+    }
+
     private Task DespawnLightAsync(SimObject simObject, CancellationToken ct)
     {
         if (_connector is not MsfsSimulatorConnector msfs) return Task.CompletedTask;
@@ -482,15 +747,15 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         return mgr.ManagedObjects.Values.Count(o => o.IsActive && o.ContainerTitle.StartsWith("BARS_Light_", StringComparison.OrdinalIgnoreCase));
     }
 
-    private sealed record LightLayout(double Latitude, double Longitude, double? Heading, string? Color, int? StateId);
+    private sealed record LightLayout(double Latitude, double Longitude, double? Heading, string? Color, int? StateId, int? OffStateId);
 
     private IReadOnlyList<LightLayout> GetOrBuildLayouts(PointState ps) => _layoutCache.GetOrAdd(ps.Metadata.Id, _ =>
     {
         IReadOnlyList<AirportStateHub.LightLayout> raw;
         if (!_hub.TryGetLightLayout(ps.Metadata.Id, out var hubLights) || hubLights.Count == 0)
-            raw = new List<AirportStateHub.LightLayout> { new AirportStateHub.LightLayout(ps.Metadata.Latitude, ps.Metadata.Longitude, null, ps.Metadata.Color, null) };
+            raw = new List<AirportStateHub.LightLayout> { new AirportStateHub.LightLayout(ps.Metadata.Latitude, ps.Metadata.Longitude, null, ps.Metadata.Color, null, null) };
         else raw = hubLights;
-        return (IReadOnlyList<LightLayout>)raw.Select(l => new LightLayout(l.Latitude, l.Longitude, l.Heading, l.Color, l.StateId)).ToList();
+        return (IReadOnlyList<LightLayout>)raw.Select(l => new LightLayout(l.Latitude, l.Longitude, l.Heading, l.Color, l.StateId, l.OffStateId)).ToList();
     });
 
     // group spawning logic removed in manager-driven mode
@@ -535,7 +800,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     {
         var mgr = GetManager();
         if (mgr == null) return;
-        var list = mgr.ManagedObjects.Values.Where(o => o.IsActive && o.UserData is string s && s == pointId).ToList();
+        var list = mgr.ManagedObjects.Values.Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal)).ToList();
         if (list.Count == 0) return;
         _logger.LogDebug("[DespawnPointStart] {id} count={count}", pointId, list.Count);
         foreach (var obj in list)
@@ -557,8 +822,11 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         if (mgr != null)
         {
             foreach (var o in mgr.ManagedObjects.Values)
-                if (o.IsActive && o.UserData is string sid)
-                    activePointIds.Add(sid);
+            {
+                if (!o.IsActive) continue;
+                if (TryGetUserPointAndSlot(o, out var pid, out var _slot) && pid != null)
+                    activePointIds.Add(pid);
+            }
         }
         // Radius-based despawn removed: keep all previously spawned objects; rely on global caps for safety.
         // Identify spawn candidates
@@ -648,7 +916,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     {
         var mgr = GetManager();
         if (mgr == null) return (new List<SimObject>(), 0);
-        var list = mgr.ManagedObjects.Values.Where(o => o.IsActive && o.UserData is string s && s == pointId).ToList();
+        var list = mgr.ManagedObjects.Values.Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal)).ToList();
         return (list, list.Count);
     }
 
@@ -658,6 +926,20 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         var clientField = typeof(MsfsSimulatorConnector).GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         var client = clientField?.GetValue(msfs) as SimConnect.NET.SimConnectClient;
         return client?.AIObjects;
+    }
+
+    private int ResolveObjectState(SimObject o)
+    {
+        if (_objectStateIds.TryGetValue(o.ObjectId, out var sid)) return sid;
+        // Fallback: attempt parse from title tail e.g. BARS_Light_21
+        try
+        {
+            var title = o.ContainerTitle ?? string.Empty;
+            var tail = title.Split('_').LastOrDefault();
+            if (int.TryParse(tail, out var parsed)) return parsed;
+        }
+        catch { }
+        return 0; // default placeholder assumption
     }
 
     private static string ResolveModel(int? stateId)
@@ -677,7 +959,8 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         var pointCounts = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var o in mgr.ManagedObjects.Values)
         {
-            if (!o.IsActive || o.UserData is not string pid) continue;
+            if (!o.IsActive) continue;
+            if (!TryGetUserPointAndSlot(o, out var pid, out var _slot) || pid == null) continue;
             if (!pointCounts.TryAdd(pid, 1)) pointCounts[pid]++;
         }
         if (pointCounts.Count == 0) return false;
