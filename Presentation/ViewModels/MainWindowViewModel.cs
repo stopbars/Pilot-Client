@@ -234,6 +234,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
             _savedPackages[row.ICAO] = row.SelectedPackage.Name;
             // Fire and forget save to persist selection quickly without blocking UI
             _ = _settingsStore.SaveAsync(new ClientSettings(ApiToken, _savedPackages));
+            // Also notify SceneryService so the running session hot-reloads the map for this airport (if connected)
+            try { SceneryService.Instance.SetSelectedPackage(row.ICAO, row.SelectedPackage.Name); } catch { }
         }
     }
 
