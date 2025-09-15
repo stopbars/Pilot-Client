@@ -26,7 +26,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     private readonly ConcurrentQueue<PointState> _queue = new();
     private readonly ConcurrentDictionary<string, PointState> _latestStates = new();
     private readonly ConcurrentDictionary<string, IReadOnlyList<LightLayout>> _layoutCache = new();
-    private readonly System.Threading.SemaphoreSlim _spawnConcurrency = new(4, 4);
+    private readonly System.Threading.SemaphoreSlim _spawnConcurrency = new(1, 1);
     // Track stateId for each spawned SimObject (objectId -> stateId) so we don't rely on ContainerTitle which proved unreliable.
     private readonly ConcurrentDictionary<uint, int> _objectStateIds = new();
 
@@ -42,8 +42,9 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     private readonly bool _dynamicPruneEnabled;
 
     // Rate tracking
-    private DateTime _nextSpawnWindow = DateTime.UtcNow;
-    private int _spawnedThisWindow;
+    private readonly object _rateLock = new();
+    private TimeSpan _perSpawnInterval = TimeSpan.FromMilliseconds(100);
+    private DateTime _nextAllowedSpawnUtc = DateTime.MinValue;
 
     // Stats
     private long _totalReceived;
@@ -90,6 +91,17 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _spawnRadiusMeters = options.SpawnRadiusMeters;
         _proximitySweepInterval = TimeSpan.FromSeconds(options.ProximitySweepSeconds);
         _dynamicPruneEnabled = options.DynamicPruneEnabled;
+        // Initialize smooth per-spawn pacing (avoid bursty spawns that can overwhelm SimConnect)
+        if (options.SpawnPerSecond <= 0)
+        {
+            // Treat <=0 as unlimited; keep a very small interval to avoid tight loops
+            _perSpawnInterval = TimeSpan.Zero;
+        }
+        else
+        {
+            // Space spawns evenly: e.g., 10/s -> 100ms between spawns
+            _perSpawnInterval = TimeSpan.FromSeconds(1.0 / Math.Max(1, options.SpawnPerSecond));
+        }
     }
 
     public void OnPointStateChanged(PointState state)
@@ -356,12 +368,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                     break;
                 }
             }
-            if (!CanSpawnNow())
-            {
-                Interlocked.Increment(ref _totalDeferredRate);
-                if (_latestStates.TryGetValue(pointId, out var latestRate)) _queue.Enqueue(latestRate);
-                break;
-            }
+            await WaitForSpawnSlotAsync(ct);
             var layout = layouts[i];
             int? variantState = layout.StateId;
             if (!isPlaceholder)
@@ -422,12 +429,24 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         }
     }
 
-    private bool CanSpawnNow()
+    private async Task WaitForSpawnSlotAsync(CancellationToken ct)
     {
+        if (_spawnPerSecond <= 0 || _perSpawnInterval <= TimeSpan.Zero) return;
         var now = DateTime.UtcNow;
-        if (now > _nextSpawnWindow) { _nextSpawnWindow = now.AddSeconds(1); _spawnedThisWindow = 0; }
-        if (_spawnedThisWindow < _spawnPerSecond) { _spawnedThisWindow++; return true; }
-        return false;
+        TimeSpan delay;
+        lock (_rateLock)
+        {
+            if (_nextAllowedSpawnUtc < now)
+            {
+                _nextAllowedSpawnUtc = now;
+            }
+            delay = _nextAllowedSpawnUtc - now;
+            _nextAllowedSpawnUtc = _nextAllowedSpawnUtc + _perSpawnInterval;
+        }
+        if (delay > TimeSpan.Zero)
+        {
+            try { await Task.Delay(delay, ct).ConfigureAwait(false); } catch (TaskCanceledException) { }
+        }
     }
 
     private async Task<SimObject?> SpawnLightAsync(string pointId, LightLayout layout, CancellationToken ct)
@@ -577,12 +596,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                     break;
                 }
             }
-            if (!CanSpawnNow())
-            {
-                Interlocked.Increment(ref _totalDeferredRate);
-                if (_latestStates.TryGetValue(pointId, out var latestRate)) _queue.Enqueue(latestRate);
-                break;
-            }
+            await WaitForSpawnSlotAsync(ct);
 
             var layout = layouts[i] with { StateId = desiredState };
             try
@@ -677,12 +691,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                     break;
                 }
             }
-            if (!CanSpawnNow())
-            {
-                Interlocked.Increment(ref _totalDeferredRate);
-                if (_latestStates.TryGetValue(pointId, out var latestRate)) _queue.Enqueue(latestRate);
-                break;
-            }
+            await WaitForSpawnSlotAsync(ct);
 
             var layout = layouts[i];
             var spawnLayout = layout with { StateId = desiredState };
@@ -1018,7 +1027,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 internal sealed class MsfsPointControllerOptions
 {
     public int MaxObjects { get; init; } = 900;
-    public int SpawnPerSecond { get; init; } = 20;
+    public int SpawnPerSecond { get; init; } = 10;
     public int IdleDelayMs { get; init; } = 10;
     public int DisconnectedDelayMs { get; init; } = 500;
     public int ErrorBackoffMs { get; init; } = 200;
