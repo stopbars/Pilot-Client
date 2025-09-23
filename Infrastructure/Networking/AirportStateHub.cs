@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
@@ -249,35 +250,49 @@ internal sealed class AirportStateHub
     {
         // Determine currently selected scenery package for this airport (if any). If none selected yet, auto-select first available.
         string package = string.Empty;
+        List<string>? airportPackages = null; // cache list for fallback retry
         try
         {
             package = SceneryService.Instance.GetSelectedPackage(airport);
             var all = await SceneryService.Instance.GetAvailablePackagesAsync();
+            if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
+            {
+                airportPackages = pkgList.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList();
+            }
             if (string.IsNullOrWhiteSpace(package))
             {
-                if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
-                {
-                    package = pkgList.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).First();
-                    SceneryService.Instance.SetSelectedPackage(airport, package);
-                    _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt}", package, airport);
-                }
-                else
+                if (airportPackages == null || airportPackages.Count == 0)
                 {
                     _logger.LogWarning("No packages found for airport {apt} when attempting to auto-select; aborting map load", airport);
                     return;
                 }
+                package = airportPackages.First();
+                SceneryService.Instance.SetSelectedPackage(airport, package);
+                _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt}", package, airport);
             }
             else
             {
                 // Resolve selection to one of the available package names (case-insensitive, supports substring like "2024").
-                if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
+                if (airportPackages != null && airportPackages.Count > 0)
                 {
-                    var exact = pkgList.FirstOrDefault(p => string.Equals(p, package, StringComparison.OrdinalIgnoreCase));
-                    if (!string.IsNullOrEmpty(exact)) package = exact;
+                    var originalSelection = package;
+                    var exact = airportPackages.FirstOrDefault(p => string.Equals(p, originalSelection, StringComparison.OrdinalIgnoreCase));
+                    if (!string.IsNullOrEmpty(exact))
+                    {
+                        package = exact; // normalize casing
+                    }
                     else
                     {
-                        var partial = pkgList.FirstOrDefault(p => p.IndexOf(package, StringComparison.OrdinalIgnoreCase) >= 0);
+                        var partial = airportPackages.FirstOrDefault(p => p.IndexOf(originalSelection, StringComparison.OrdinalIgnoreCase) >= 0);
                         if (!string.IsNullOrEmpty(partial)) package = partial;
+                    }
+                    // If still not matched, fall back to first available.
+                    if (!airportPackages.Contains(package, StringComparer.OrdinalIgnoreCase))
+                    {
+                        var fallback = airportPackages.First();
+                        _logger.LogWarning("Previously selected package '{old}' for {apt} no longer available; falling back to '{fb}'", originalSelection, airport, fallback);
+                        package = fallback;
+                        try { SceneryService.Instance.SetSelectedPackage(airport, package); } catch { }
                     }
                 }
             }
@@ -288,45 +303,69 @@ internal sealed class AirportStateHub
             return;
         }
 
-        var safePkg = Uri.EscapeDataString(package);
-        var url = $"https://v2.stopbars.com/maps/{airport}/packages/{safePkg}/latest";
-        _logger.LogInformation("Fetching airport XML map {apt} package={pkg} url={url}", airport, package, url);
-        using var resp = await _httpClient.GetAsync(url, ct);
-        if (!resp.IsSuccessStatusCode)
+        async Task<bool> TryFetchAsync(string pkg, bool isRetry)
         {
-            _logger.LogWarning("Airport map fetch failed {status} apt={apt} package={pkg}", resp.StatusCode, airport, package);
-            return;
+            var safePkgInner = Uri.EscapeDataString(pkg);
+            var urlInner = $"https://v2.stopbars.com/maps/{airport}/packages/{safePkgInner}/latest";
+            _logger.LogInformation("Fetching airport XML map {apt} package={pkg} url={url} retry={retry}", airport, pkg, urlInner, isRetry);
+            using var respInner = await _httpClient.GetAsync(urlInner, ct);
+            if (!respInner.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Airport map fetch failed {status} apt={apt} package={pkg} retry={retry}", respInner.StatusCode, airport, pkg, isRetry);
+                if (!isRetry && respInner.StatusCode == HttpStatusCode.NotFound && airportPackages != null && airportPackages.Count > 0)
+                {
+                    var first = airportPackages.First();
+                    if (!string.Equals(first, pkg, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogInformation("Retrying map fetch with fallback first package '{fb}' for {apt}", first, airport);
+                        try { SceneryService.Instance.SetSelectedPackage(airport, first); } catch { }
+                        package = first;
+                        return await TryFetchAsync(first, true);
+                    }
+                }
+                return false;
+            }
+            var xmlInner = await respInner.Content.ReadAsStringAsync(ct);
+            try
+            {
+                var docInner = XDocument.Parse(xmlInner);
+                ParseMap(docInner, airport);
+                _mapAirport = airport;
+                _lastSnapshotUtc = DateTime.MinValue; // force fresh snapshot soon
+                try { MapLoaded?.Invoke(airport); } catch { }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error parsing airport map {apt} package={pkg}", airport, pkg);
+                return false;
+            }
         }
-        var xml = await resp.Content.ReadAsStringAsync(ct);
-        try
-        {
-            var doc = XDocument.Parse(xml);
-            ParseMap(doc, airport);
-            _mapAirport = airport;
-            _lastSnapshotUtc = DateTime.MinValue; // force fresh snapshot soon
-            try { MapLoaded?.Invoke(airport); } catch { }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Error parsing airport map {apt} package={pkg}", airport, package);
-        }
+
+        await TryFetchAsync(package, false);
     }
 
     private void ParseMap(XDocument doc, string airport)
     {
         var root = doc.Root;
         if (root == null || root.Name.LocalName != "BarsLights") return;
-        int pointCount = 0, lightCount = 0;
+        int barsObjectElements = 0; // raw BarsObject element count (including duplicates)
+        int uniquePointIds = 0;     // unique ids encountered
+        int duplicateMerged = 0;    // number of BarsObject elements that were merged into an existing id
+        int lightCount = 0;         // total lights (after merge, counting every <Light> processed)
+
         foreach (var obj in root.Elements("BarsObject"))
         {
+            barsObjectElements++;
             var id = obj.Attribute("id")?.Value;
             if (string.IsNullOrWhiteSpace(id)) continue;
             var type = obj.Attribute("type")?.Value ?? string.Empty;
             var objProps = obj.Element("Properties");
             var color = objProps?.Element("Color")?.Value;
             var orientation = objProps?.Element("Orientation")?.Value;
-            var lightList = new List<LightLayout>();
-            double sumLat = 0, sumLon = 0; int cnt = 0;
+
+            // Parse lights for this element
+            var newLights = new List<LightLayout>();
             foreach (var le in obj.Elements("Light"))
             {
                 var posText = le.Element("Position")?.Value;
@@ -335,23 +374,50 @@ internal sealed class AirportStateHub
                 var headingStr = le.Element("Heading")?.Value;
                 if (double.TryParse(headingStr, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var hdgVal)) hdg = hdgVal;
                 var lColor = le.Element("Properties")?.Element("Color")?.Value ?? color;
-                int? stateId = null;
-                var stateAttr = le.Attribute("stateId")?.Value;
-                if (int.TryParse(stateAttr, out var sidVal)) stateId = sidVal;
-                int? offStateId = null;
-                var offStateAttr = le.Attribute("offStateId")?.Value;
-                if (int.TryParse(offStateAttr, out var offSidVal)) offStateId = offSidVal;
-                lightList.Add(new LightLayout(lat, lon, hdg, lColor, stateId, offStateId));
-                sumLat += lat; sumLon += lon; cnt++; lightCount++;
+                int? stateId = null; if (int.TryParse(le.Attribute("stateId")?.Value, out var sidVal)) stateId = sidVal;
+                int? offStateId = null; if (int.TryParse(le.Attribute("offStateId")?.Value, out var offSidVal)) offStateId = offSidVal;
+                newLights.Add(new LightLayout(lat, lon, hdg, lColor, stateId, offStateId));
             }
-            double repLat = 0, repLon = 0;
-            if (cnt > 0) { repLat = sumLat / cnt; repLon = sumLon / cnt; }
-            var meta = new PointMetadata(id!, airport, type, id!, repLat, repLon, null, orientation, color, false, false);
-            _metadata[id!] = meta;
-            if (lightList.Count > 0) _layouts[id!] = lightList;
-            pointCount++;
+
+            if (_layouts.TryGetValue(id!, out var existingLights))
+            {
+                // Merge duplicate definition: append lights
+                existingLights.AddRange(newLights);
+                duplicateMerged++;
+                // Recompute representative lat/lon across ALL lights now associated with this id
+                if (existingLights.Count > 0)
+                {
+                    var avgLat = existingLights.Average(l => l.Latitude);
+                    var avgLon = existingLights.Average(l => l.Longitude);
+                    if (_metadata.TryGetValue(id!, out var existingMeta))
+                    {
+                        _metadata[id!] = existingMeta with { Latitude = avgLat, Longitude = avgLon, Type = type, Orientation = orientation, Color = color };
+                    }
+                }
+                _logger.LogDebug("Merged duplicate BarsObject id={id} totalLights={cnt}", id, existingLights.Count);
+            }
+            else
+            {
+                // First time we see this id
+                uniquePointIds++;
+                if (newLights.Count > 0)
+                {
+                    _layouts[id!] = newLights;
+                }
+                double repLat = 0, repLon = 0;
+                if (newLights.Count > 0)
+                {
+                    repLat = newLights.Average(l => l.Latitude);
+                    repLon = newLights.Average(l => l.Longitude);
+                }
+                var meta = new PointMetadata(id!, airport, type, id!, repLat, repLon, null, orientation, color, false, false);
+                _metadata[id!] = meta;
+            }
+
+            lightCount += newLights.Count;
         }
-        _logger.LogInformation("Parsed map {apt} points={pts} lights={lights}", airport, pointCount, lightCount);
+
+        _logger.LogInformation("Parsed map {apt} BarsObjects={raw} uniquePoints={uniq} duplicatesMerged={dups} lights={lights}", airport, barsObjectElements, uniquePointIds, duplicateMerged, lightCount);
     }
 
     private bool TryParseLatLon(string? csv, out double lat, out double lon)
