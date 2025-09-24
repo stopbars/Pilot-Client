@@ -5,103 +5,129 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:BARS_Client_V2"
         mc:Ignorable="d"
-        Title="BARS Client" Height="650" Width="600"
+        Title="BARS Client"
+        Height="674"
+        Width="600"
         Background="#1E1E1E"
         FontFamily="Segoe UI"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize">
-    
+
     <Window.Resources>
         <!-- Converters -->
         <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter"/>
-        
+        <local:NullOrEmptyToVisibilityConverter x:Key="NullOrEmptyToVisibilityConverter"/>
+
         <!-- Animation Resources -->
         <Storyboard x:Key="FadeIn">
             <DoubleAnimation Storyboard.TargetProperty="Opacity"
-                             From="0.0" To="1.0" Duration="0:0:0.3">
+                             From="0.0"
+                             To="1.0"
+                             Duration="0:0:0.3">
                 <DoubleAnimation.EasingFunction>
-                    <CubicEase EasingMode="EaseOut" />
+                    <CubicEase EasingMode="EaseOut"/>
                 </DoubleAnimation.EasingFunction>
             </DoubleAnimation>
         </Storyboard>
-        
+
         <Storyboard x:Key="SlideUp">
             <ThicknessAnimation Storyboard.TargetProperty="Margin"
-                               From="0,20,0,0" To="0,0,0,0" Duration="0:0:0.3">
+                                From="0,20,0,0"
+                                To="0,0,0,0"
+                                Duration="0:0:0.3">
                 <ThicknessAnimation.EasingFunction>
-                    <CubicEase EasingMode="EaseOut" />
+                    <CubicEase EasingMode="EaseOut"/>
                 </ThicknessAnimation.EasingFunction>
             </ThicknessAnimation>
         </Storyboard>
-        
+
         <Style TargetType="Button">
-            <Setter Property="Background" Value="#2D2D30"/>
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="Padding" Value="10,5"/>
-            <Setter Property="BorderBrush" Value="#3E3E42"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Background"
+                    Value="#2D2D30"/>
+            <Setter Property="Foreground"
+                    Value="White"/>
+            <Setter Property="Padding"
+                    Value="10,5"/>
+            <Setter Property="BorderBrush"
+                    Value="#3E3E42"/>
+            <Setter Property="BorderThickness"
+                    Value="1"/>
+            <Setter Property="Cursor"
+                    Value="Hand"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Border x:Name="border" Background="{TemplateBinding Background}"
+                        <Border x:Name="border"
+                                Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
                                 CornerRadius="3">
-                            <ContentPresenter x:Name="contentPresenter" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <ContentPresenter x:Name="contentPresenter"
+                                              HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"/>
                         </Border>
                         <ControlTemplate.Triggers>
                             <EventTrigger RoutedEvent="MouseEnter">
                                 <BeginStoryboard>
                                     <Storyboard>
-                                        <ColorAnimation Storyboard.TargetName="border" 
-                                                      Storyboard.TargetProperty="(Border.Background).(SolidColorBrush.Color)"
-                                                      To="White" Duration="0:0:0.15"/>
-                                        <ColorAnimation Storyboard.TargetName="contentPresenter" 
-                                                      Storyboard.TargetProperty="(TextBlock.Foreground).(SolidColorBrush.Color)"
-                                                      To="#2D2D30" Duration="0:0:0.15"/>
+                                        <ColorAnimation Storyboard.TargetName="border"
+                                                        Storyboard.TargetProperty="(Border.Background).(SolidColorBrush.Color)"
+                                                        To="White"
+                                                        Duration="0:0:0.15"/>
+                                        <ColorAnimation Storyboard.TargetName="contentPresenter"
+                                                        Storyboard.TargetProperty="(TextBlock.Foreground).(SolidColorBrush.Color)"
+                                                        To="#2D2D30"
+                                                        Duration="0:0:0.15"/>
                                     </Storyboard>
                                 </BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="MouseLeave">
                                 <BeginStoryboard>
                                     <Storyboard>
-                                        <ColorAnimation Storyboard.TargetName="border" 
-                                                      Storyboard.TargetProperty="(Border.Background).(SolidColorBrush.Color)"
-                                                      To="#2D2D30" Duration="0:0:0.15"/>
-                                        <ColorAnimation Storyboard.TargetName="contentPresenter" 
-                                                      Storyboard.TargetProperty="(TextBlock.Foreground).(SolidColorBrush.Color)"
-                                                      To="White" Duration="0:0:0.15"/>
+                                        <ColorAnimation Storyboard.TargetName="border"
+                                                        Storyboard.TargetProperty="(Border.Background).(SolidColorBrush.Color)"
+                                                        To="#2D2D30"
+                                                        Duration="0:0:0.15"/>
+                                        <ColorAnimation Storyboard.TargetName="contentPresenter"
+                                                        Storyboard.TargetProperty="(TextBlock.Foreground).(SolidColorBrush.Color)"
+                                                        To="White"
+                                                        Duration="0:0:0.15"/>
                                     </Storyboard>
                                 </BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="PreviewMouseDown">
                                 <BeginStoryboard>
                                     <Storyboard>
-                                        <DoubleAnimation Storyboard.TargetName="border" 
-                                                       Storyboard.TargetProperty="Opacity"
-                                                       To="0.8" Duration="0:0:0.05"/>
-                                        <DoubleAnimation Storyboard.TargetName="border" 
-                                                       Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
-                                                       To="0.98" Duration="0:0:0.05"/>
-                                        <DoubleAnimation Storyboard.TargetName="border" 
-                                                       Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
-                                                       To="0.98" Duration="0:0:0.05"/>
+                                        <DoubleAnimation Storyboard.TargetName="border"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         To="0.8"
+                                                         Duration="0:0:0.05"/>
+                                        <DoubleAnimation Storyboard.TargetName="border"
+                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
+                                                         To="0.98"
+                                                         Duration="0:0:0.05"/>
+                                        <DoubleAnimation Storyboard.TargetName="border"
+                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
+                                                         To="0.98"
+                                                         Duration="0:0:0.05"/>
                                     </Storyboard>
                                 </BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="PreviewMouseUp">
                                 <BeginStoryboard>
                                     <Storyboard>
-                                        <DoubleAnimation Storyboard.TargetName="border" 
-                                                       Storyboard.TargetProperty="Opacity"
-                                                       To="1" Duration="0:0:0.05"/>
-                                        <DoubleAnimation Storyboard.TargetName="border" 
-                                                       Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
-                                                       To="1" Duration="0:0:0.05"/>
-                                        <DoubleAnimation Storyboard.TargetName="border" 
-                                                       Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
-                                                       To="1" Duration="0:0:0.05"/>
+                                        <DoubleAnimation Storyboard.TargetName="border"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         To="1"
+                                                         Duration="0:0:0.05"/>
+                                        <DoubleAnimation Storyboard.TargetName="border"
+                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
+                                                         To="1"
+                                                         Duration="0:0:0.05"/>
+                                        <DoubleAnimation Storyboard.TargetName="border"
+                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
+                                                         To="1"
+                                                         Duration="0:0:0.05"/>
                                     </Storyboard>
                                 </BeginStoryboard>
                             </EventTrigger>
@@ -109,140 +135,188 @@
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
-            <Setter Property="RenderTransformOrigin" Value="0.5,0.5"/>
+            <Setter Property="RenderTransformOrigin"
+                    Value="0.5,0.5"/>
             <Setter Property="RenderTransform">
                 <Setter.Value>
-                    <ScaleTransform ScaleX="1" ScaleY="1"/>
+                    <ScaleTransform ScaleX="1"
+                                    ScaleY="1"/>
                 </Setter.Value>
             </Setter>
         </Style>
 
         <Style TargetType="TextBox">
-            <Setter Property="Background" Value="#333337"/>
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="BorderBrush" Value="#3E3E42"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="5"/>
-            <Setter Property="Height" Value="30"/>
-            <Setter Property="Cursor" Value="IBeam"/>
+            <Setter Property="Background"
+                    Value="#333337"/>
+            <Setter Property="Foreground"
+                    Value="White"/>
+            <Setter Property="BorderBrush"
+                    Value="#3E3E42"/>
+            <Setter Property="BorderThickness"
+                    Value="1"/>
+            <Setter Property="Padding"
+                    Value="5"/>
+            <Setter Property="Height"
+                    Value="30"/>
+            <Setter Property="Cursor"
+                    Value="IBeam"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="TextBox">
-                        <Border x:Name="border" Background="{TemplateBinding Background}"
+                        <Border x:Name="border"
+                                Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}">
-                            <ScrollViewer x:Name="PART_ContentHost" Focusable="false" />
+                            <ScrollViewer x:Name="PART_ContentHost"
+                                          Focusable="false"/>
                         </Border>
                         <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="BorderBrush" Value="#007ACC" TargetName="border"/>
+                            <Trigger Property="IsMouseOver"
+                                     Value="True">
+                                <Setter Property="BorderBrush"
+                                        Value="#007ACC"
+                                        TargetName="border"/>
                             </Trigger>
-                            <Trigger Property="IsFocused" Value="True">
-                                <Setter Property="BorderBrush" Value="#66BCFF" TargetName="border"/>
-                                <Setter Property="BorderThickness" Value="2" TargetName="border"/>
+                            <Trigger Property="IsFocused"
+                                     Value="True">
+                                <Setter Property="BorderBrush"
+                                        Value="#66BCFF"
+                                        TargetName="border"/>
+                                <Setter Property="BorderThickness"
+                                        Value="2"
+                                        TargetName="border"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
         </Style>
-        
+
         <!-- Custom style for PasswordBox to match TextBox style -->
         <Style TargetType="PasswordBox">
-            <Setter Property="Background" Value="#333337"/>
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="BorderBrush" Value="#3E3E42"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="5"/>
-            <Setter Property="Height" Value="30"/>
+            <Setter Property="Background"
+                    Value="#333337"/>
+            <Setter Property="Foreground"
+                    Value="White"/>
+            <Setter Property="BorderBrush"
+                    Value="#3E3E42"/>
+            <Setter Property="BorderThickness"
+                    Value="1"/>
+            <Setter Property="Padding"
+                    Value="5"/>
+            <Setter Property="Height"
+                    Value="30"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="PasswordBox">
-                        <Border x:Name="border" Background="{TemplateBinding Background}"
+                        <Border x:Name="border"
+                                Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}">
-                            <ScrollViewer x:Name="PART_ContentHost" Focusable="false" />
+                            <ScrollViewer x:Name="PART_ContentHost"
+                                          Focusable="false"/>
                         </Border>
                         <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="BorderBrush" Value="#007ACC" TargetName="border"/>
+                            <Trigger Property="IsMouseOver"
+                                     Value="True">
+                                <Setter Property="BorderBrush"
+                                        Value="#007ACC"
+                                        TargetName="border"/>
                             </Trigger>
-                            <Trigger Property="IsFocused" Value="True">
-                                <Setter Property="BorderBrush" Value="#66BCFF" TargetName="border"/>
-                                <Setter Property="BorderThickness" Value="2" TargetName="border"/>
+                            <Trigger Property="IsFocused"
+                                     Value="True">
+                                <Setter Property="BorderBrush"
+                                        Value="#66BCFF"
+                                        TargetName="border"/>
+                                <Setter Property="BorderThickness"
+                                        Value="2"
+                                        TargetName="border"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
         </Style>
-        
+
         <Style TargetType="ComboBox">
-            <Setter Property="Background" Value="#333337"/>
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="BorderBrush" Value="#3E3E42"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Height" Value="30"/>
-            <Setter Property="Padding" Value="5,3"/>
-            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="Background"
+                    Value="#333337"/>
+            <Setter Property="Foreground"
+                    Value="White"/>
+            <Setter Property="BorderBrush"
+                    Value="#3E3E42"/>
+            <Setter Property="BorderThickness"
+                    Value="1"/>
+            <Setter Property="Height"
+                    Value="30"/>
+            <Setter Property="Padding"
+                    Value="5,3"/>
+            <Setter Property="VerticalContentAlignment"
+                    Value="Center"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="ComboBox">
                         <Grid>
                             <ToggleButton x:Name="ToggleButton"
-                                      BorderBrush="{TemplateBinding BorderBrush}"
-                                      Background="{TemplateBinding Background}"
-                                      Foreground="{TemplateBinding Foreground}"
-                                      IsChecked="{Binding Path=IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
-                                      ClickMode="Press">
+                                          BorderBrush="{TemplateBinding BorderBrush}"
+                                          Background="{TemplateBinding Background}"
+                                          Foreground="{TemplateBinding Foreground}"
+                                          IsChecked="{Binding Path=IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          ClickMode="Press">
                                 <ToggleButton.Template>
                                     <ControlTemplate TargetType="ToggleButton">
-                                        <Border x:Name="Border" 
-                                            BorderBrush="{TemplateBinding BorderBrush}"
-                                            BorderThickness="1"
-                                            Background="{TemplateBinding Background}">
+                                        <Border x:Name="Border"
+                                                BorderBrush="{TemplateBinding BorderBrush}"
+                                                BorderThickness="1"
+                                                Background="{TemplateBinding Background}">
                                             <Grid>
                                                 <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="20" />
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="20"/>
                                                 </Grid.ColumnDefinitions>
                                                 <ContentPresenter Grid.Column="0"
-                                                             ContentTemplate="{TemplateBinding ContentTemplate}"
-                                                             Content="{TemplateBinding Content}"
-                                                             HorizontalAlignment="Left"
-                                                             Margin="4,0,0,0"
-                                                             VerticalAlignment="Center" />
-                                                <Path x:Name="Arrow" Grid.Column="1"
-                                                  Fill="White"
-                                                  HorizontalAlignment="Center"
-                                                  VerticalAlignment="Center"
-                                                  Data="M0,0 L5,5 L10,0 Z" />
+                                                                  ContentTemplate="{TemplateBinding ContentTemplate}"
+                                                                  Content="{TemplateBinding Content}"
+                                                                  HorizontalAlignment="Left"
+                                                                  Margin="4,0,0,0"
+                                                                  VerticalAlignment="Center"/>
+                                                <Path x:Name="Arrow"
+                                                      Grid.Column="1"
+                                                      Fill="White"
+                                                      HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center"
+                                                      Data="M0,0 L5,5 L10,0 Z"/>
                                             </Grid>
                                         </Border>
                                         <ControlTemplate.Triggers>
-                                            <Trigger Property="IsMouseOver" Value="True">
-                                                <Setter Property="Background" Value="#444446" TargetName="Border"/>
-                                                <Setter Property="BorderBrush" Value="#007ACC" TargetName="Border"/>
+                                            <Trigger Property="IsMouseOver"
+                                                     Value="True">
+                                                <Setter Property="Background"
+                                                        Value="#444446"
+                                                        TargetName="Border"/>
+                                                <Setter Property="BorderBrush"
+                                                        Value="#007ACC"
+                                                        TargetName="Border"/>
                                             </Trigger>
                                         </ControlTemplate.Triggers>
                                     </ControlTemplate>
                                 </ToggleButton.Template>
                             </ToggleButton>
                             <Popup x:Name="Popup"
-                               AllowsTransparency="True"
-                               Placement="Bottom"
-                               IsOpen="{TemplateBinding IsDropDownOpen}"
-                               PopupAnimation="Slide">
+                                   AllowsTransparency="True"
+                                   Placement="Bottom"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   PopupAnimation="Slide">
                                 <Grid x:Name="DropDown"
-                                  SnapsToDevicePixels="True"
-                                  MinWidth="{TemplateBinding ActualWidth}"
-                                  MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                      SnapsToDevicePixels="True"
+                                      MinWidth="{TemplateBinding ActualWidth}"
+                                      MaxHeight="{TemplateBinding MaxDropDownHeight}">
                                     <Border x:Name="DropDownBorder"
-                                        Background="#252526"
-                                        BorderBrush="#3E3E42"
-                                        BorderThickness="1" />
+                                            Background="#252526"
+                                            BorderBrush="#3E3E42"
+                                            BorderThickness="1"/>
                                     <ScrollViewer SnapsToDevicePixels="True">
-                                        <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained" />
+                                        <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
                                     </ScrollViewer>
                                 </Grid>
                             </Popup>
@@ -251,85 +325,118 @@
                 </Setter.Value>
             </Setter>
         </Style>
-        
+
         <Style TargetType="TextBlock">
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Foreground"
+                    Value="White"/>
+            <Setter Property="VerticalAlignment"
+                    Value="Center"/>
         </Style>
-        
+
         <Style TargetType="ListView">
-            <Setter Property="Background" Value="#252526"/>
-            <Setter Property="BorderBrush" Value="#3E3E42"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="2"/>
-            <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
-            <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto"/>
+            <Setter Property="Background"
+                    Value="#252526"/>
+            <Setter Property="BorderBrush"
+                    Value="#3E3E42"/>
+            <Setter Property="BorderThickness"
+                    Value="1"/>
+            <Setter Property="Padding"
+                    Value="2"/>
+            <Setter Property="ScrollViewer.HorizontalScrollBarVisibility"
+                    Value="Disabled"/>
+            <Setter Property="ScrollViewer.VerticalScrollBarVisibility"
+                    Value="Auto"/>
         </Style>
 
         <Style TargetType="GridViewColumnHeader">
-            <Setter Property="Background" Value="#2D2D30"/>
-            <Setter Property="Foreground" Value="#FFFFFF"/>
-            <Setter Property="BorderBrush" Value="#3E3E42"/>
-            <Setter Property="BorderThickness" Value="0,0,1,1"/>
-            <Setter Property="Padding" Value="8,5"/>
-            <Setter Property="Height" Value="32"/>
-            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="Background"
+                    Value="#2D2D30"/>
+            <Setter Property="Foreground"
+                    Value="#FFFFFF"/>
+            <Setter Property="BorderBrush"
+                    Value="#3E3E42"/>
+            <Setter Property="BorderThickness"
+                    Value="0,0,1,1"/>
+            <Setter Property="Padding"
+                    Value="8,5"/>
+            <Setter Property="Height"
+                    Value="32"/>
+            <Setter Property="HorizontalContentAlignment"
+                    Value="Left"/>
             <!-- Prevent column resizing -->
-            <Setter Property="IsEnabled" Value="False"/>
+            <Setter Property="IsEnabled"
+                    Value="False"/>
             <!-- Remove hover trigger to prevent any background change when mouse hovers -->
         </Style>
 
         <!-- Style for TextBlock within ListView to ensure text is white -->
-        <Style x:Key="ListViewTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="FontWeight" Value="Bold"/>
-            <Setter Property="VerticalAlignment" Value="Center"/>
+        <Style x:Key="ListViewTextBlockStyle"
+               TargetType="TextBlock"
+               BasedOn="{StaticResource {x:Type TextBlock}}">
+            <Setter Property="Foreground"
+                    Value="White"/>
+            <Setter Property="FontWeight"
+                    Value="Bold"/>
+            <Setter Property="VerticalAlignment"
+                    Value="Center"/>
         </Style>
-        
+
         <!-- Style for ComboBox items in ListView -->
-        <Style x:Key="ListViewComboBoxStyle" TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
-            <Setter Property="Background" Value="#333337"/>
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Style x:Key="ListViewComboBoxStyle"
+               TargetType="ComboBox"
+               BasedOn="{StaticResource {x:Type ComboBox}}">
+            <Setter Property="Background"
+                    Value="#333337"/>
+            <Setter Property="Foreground"
+                    Value="White"/>
+            <Setter Property="BorderThickness"
+                    Value="1"/>
+            <Setter Property="VerticalContentAlignment"
+                    Value="Center"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="ComboBox">
                         <Grid>
                             <ToggleButton x:Name="ToggleButton"
-                                      BorderBrush="{TemplateBinding BorderBrush}"
-                                      Background="{TemplateBinding Background}"
-                                      Foreground="{TemplateBinding Foreground}"
-                                      IsChecked="{Binding Path=IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
-                                      ClickMode="Press">
+                                          BorderBrush="{TemplateBinding BorderBrush}"
+                                          Background="{TemplateBinding Background}"
+                                          Foreground="{TemplateBinding Foreground}"
+                                          IsChecked="{Binding Path=IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          ClickMode="Press">
                                 <ToggleButton.Template>
                                     <ControlTemplate TargetType="ToggleButton">
-                                        <Border x:Name="Border" 
-                                            BorderBrush="{TemplateBinding BorderBrush}"
-                                            BorderThickness="1"
-                                            Background="{TemplateBinding Background}">
+                                        <Border x:Name="Border"
+                                                BorderBrush="{TemplateBinding BorderBrush}"
+                                                BorderThickness="1"
+                                                Background="{TemplateBinding Background}">
                                             <Grid>
                                                 <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="20" />
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="20"/>
                                                 </Grid.ColumnDefinitions>
                                                 <ContentPresenter Grid.Column="0"
-                                                             ContentTemplate="{TemplateBinding ContentTemplate}"
-                                                             Content="{TemplateBinding Content}"
-                                                             HorizontalAlignment="Left"
-                                                             Margin="4,0,0,0"
-                                                             VerticalAlignment="Center" />
-                                                <Path x:Name="Arrow" Grid.Column="1"
-                                                  Fill="White"
-                                                  HorizontalAlignment="Center"
-                                                  VerticalAlignment="Center"
-                                                  Data="M0,0 L5,5 L10,0 Z" />
+                                                                  ContentTemplate="{TemplateBinding ContentTemplate}"
+                                                                  Content="{TemplateBinding Content}"
+                                                                  HorizontalAlignment="Left"
+                                                                  Margin="4,0,0,0"
+                                                                  VerticalAlignment="Center"/>
+                                                <Path x:Name="Arrow"
+                                                      Grid.Column="1"
+                                                      Fill="White"
+                                                      HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center"
+                                                      Data="M0,0 L5,5 L10,0 Z"/>
                                             </Grid>
                                         </Border>
                                         <ControlTemplate.Triggers>
-                                            <Trigger Property="IsMouseOver" Value="True">
-                                                <Setter Property="BorderThickness" Value="2" TargetName="Border"/>
-                                                <Setter Property="BorderBrush" Value="#66BCFF" TargetName="Border"/>
+                                            <Trigger Property="IsMouseOver"
+                                                     Value="True">
+                                                <Setter Property="BorderThickness"
+                                                        Value="2"
+                                                        TargetName="Border"/>
+                                                <Setter Property="BorderBrush"
+                                                        Value="#66BCFF"
+                                                        TargetName="Border"/>
                                             </Trigger>
                                         </ControlTemplate.Triggers>
                                     </ControlTemplate>
@@ -345,20 +452,20 @@
                                 VerticalAlignment="Center"
                                 HorizontalAlignment="Left"/>
                             <Popup x:Name="Popup"
-                               AllowsTransparency="True"
-                               Placement="Bottom"
-                               IsOpen="{TemplateBinding IsDropDownOpen}"
-                               PopupAnimation="Slide">
+                                   AllowsTransparency="True"
+                                   Placement="Bottom"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   PopupAnimation="Slide">
                                 <Grid x:Name="DropDown"
-                                  SnapsToDevicePixels="True"
-                                  MinWidth="{TemplateBinding ActualWidth}"
-                                  MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                      SnapsToDevicePixels="True"
+                                      MinWidth="{TemplateBinding ActualWidth}"
+                                      MaxHeight="{TemplateBinding MaxDropDownHeight}">
                                     <Border x:Name="DropDownBorder"
-                                        Background="#252526"
-                                        BorderBrush="#3E3E42"
-                                        BorderThickness="1" />
+                                            Background="#252526"
+                                            BorderBrush="#3E3E42"
+                                            BorderThickness="1"/>
                                     <ScrollViewer SnapsToDevicePixels="True">
-                                        <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained" />
+                                        <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
                                     </ScrollViewer>
                                 </Grid>
                             </Popup>
@@ -367,12 +474,16 @@
                 </Setter.Value>
             </Setter>
         </Style>
-        
+
         <!-- Style for ComboBox items -->
-        <Style x:Key="DarkComboBoxItem" TargetType="ComboBoxItem">
-            <Setter Property="Background" Value="#252526" />
-            <Setter Property="Foreground" Value="White" />
-            <Setter Property="Padding" Value="5,3" />
+        <Style x:Key="DarkComboBoxItem"
+               TargetType="ComboBoxItem">
+            <Setter Property="Background"
+                    Value="#252526"/>
+            <Setter Property="Foreground"
+                    Value="White"/>
+            <Setter Property="Padding"
+                    Value="5,3"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="ComboBoxItem">
@@ -381,15 +492,23 @@
                                 BorderBrush="Transparent"
                                 BorderThickness="1"
                                 Padding="{TemplateBinding Padding}">
-                            <ContentPresenter />
+                            <ContentPresenter/>
                         </Border>
                         <ControlTemplate.Triggers>
-                            <Trigger Property="IsSelected" Value="True">
-                                <Setter Property="Background" Value="#007ACC" TargetName="Border" />
+                            <Trigger Property="IsSelected"
+                                     Value="True">
+                                <Setter Property="Background"
+                                        Value="#007ACC"
+                                        TargetName="Border"/>
                             </Trigger>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="BorderBrush" Value="#66BCFF" TargetName="Border" />
-                                <Setter Property="BorderThickness" Value="1" TargetName="Border" />
+                            <Trigger Property="IsMouseOver"
+                                     Value="True">
+                                <Setter Property="BorderBrush"
+                                        Value="#66BCFF"
+                                        TargetName="Border"/>
+                                <Setter Property="BorderThickness"
+                                        Value="1"
+                                        TargetName="Border"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -397,7 +516,7 @@
             </Setter>
         </Style>
     </Window.Resources>
-    
+
     <Grid Margin="15">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -406,115 +525,175 @@
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        
+
         <!-- Header with Status Indicators -->
-        <Grid Grid.Row="0" Margin="0,0,0,15">
+        <Grid Grid.Row="0"
+              Margin="0,0,0,15">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
-            
+
             <StackPanel Grid.Column="0">
-                <TextBlock Text="BARS Client" FontSize="24" FontWeight="Bold" Margin="0,0,0,10" Foreground="White"/>
-                
+                <TextBlock Text="BARS Client"
+                           FontSize="24"
+                           FontWeight="Bold"
+                           Margin="0,0,0,10"
+                           Foreground="White"/>
+
                 <Grid>
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
-                    
-                    <TextBlock Grid.Column="0" Text="Sim Status:" FontWeight="SemiBold" Margin="0,0,5,0"/>
-                    <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="0,0,15,0">
-                        <Ellipse Width="10" Height="10" Fill="LimeGreen" Margin="0,0,5,0" VerticalAlignment="Center"/>
-                        <TextBlock Text="Connected" Foreground="LimeGreen"/>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Left side: simulator status + simulator name -->
+                    <StackPanel Grid.Column="0"
+                                Grid.Row="0"
+                                Orientation="Horizontal"
+                                Margin="0,0,0,4">
+                        <TextBlock Text="Sim Status:"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,5,0"/>
+                        <Ellipse Width="10"
+                                 Height="10"
+                                 Margin="0,0,5,0"
+                                 VerticalAlignment="Center">
+                            <Ellipse.Fill>
+                                <SolidColorBrush Color="{Binding SimulatorStatusColor}"/>
+                            </Ellipse.Fill>
+                        </Ellipse>
+                        <TextBlock Text="{Binding SimulatorConnectionText}"
+                                   Foreground="{Binding SimulatorStatusColor}"/>
                     </StackPanel>
-                    
-                    <TextBlock Grid.Column="3" Text="Nearest Airport:" FontWeight="SemiBold" Margin="0,0,5,0"/>
-                    <TextBlock Grid.Column="4" Text="EGLL" FontWeight="Bold"/>
+                    <StackPanel Grid.Column="0"
+                                Grid.Row="1"
+                                Orientation="Horizontal">
+                        <TextBlock Text="Simulator:"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,5,0"/>
+                        <TextBlock Text="{Binding SimulatorName}"
+                                   FontWeight="Bold"/>
+                    </StackPanel>
+
+                    <!-- Right side: nearest airport + server status -->
+                    <!-- Swapped: Server Status now on top row, Nearest Airport below -->
+                    <StackPanel Grid.Column="1"
+                                Grid.Row="0"
+                                Orientation="Horizontal"
+                                HorizontalAlignment="Right"
+                                Margin="0,0,0,4">
+                        <TextBlock Text="Server Status:"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,5,0"/>
+                        <Ellipse Width="10"
+                                 Height="10"
+                                 Margin="0,0,5,0"
+                                 VerticalAlignment="Center">
+                            <Ellipse.Fill>
+                                <SolidColorBrush Color="{Binding ServerStatusColor}"/>
+                            </Ellipse.Fill>
+                        </Ellipse>
+                        <TextBlock Text="{Binding ServerStatusText}"
+                                   Foreground="{Binding ServerStatusColor}"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1"
+                                Grid.Row="1"
+                                Orientation="Horizontal"
+                                HorizontalAlignment="Right">
+                        <TextBlock Text="Nearest Airport:"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,5,0"/>
+                        <TextBlock Text="{Binding ClosestAirport}"
+                                   FontWeight="Bold"/>
+                    </StackPanel>
                 </Grid>
             </StackPanel>
         </Grid>
-        
+
         <!-- API Token and Search in vertical layout -->
-        <StackPanel Grid.Row="1" Margin="0,0,0,15">
-            <!-- API Token Entry with Custom TextBox instead of PasswordBox -->
+        <StackPanel Grid.Row="1"
+                    Margin="0,0,0,15">
+            <!-- API Token Entry masked with PasswordBox -->
             <StackPanel Margin="0,0,0,10">
-                <TextBlock Text="API Token" Margin="0,0,0,5"/>
+                <TextBlock Text="API Token"
+                           Margin="0,0,0,5"/>
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
-                    <TextBox x:Name="ApiTokenTextBox" Grid.Column="0"
-                           Tag="Enter BARS API Token Here">
-                        <TextBox.Style>
-                            <Style TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
-                                <Setter Property="Template">
-                                    <Setter.Value>
-                                        <ControlTemplate TargetType="TextBox">
-                                            <Border x:Name="border" Background="{TemplateBinding Background}"
-                                                    BorderBrush="{TemplateBinding BorderBrush}"
-                                                    BorderThickness="{TemplateBinding BorderThickness}">
-                                                <Grid>
-                                                    <ScrollViewer x:Name="PART_ContentHost" Focusable="false" />
-                                                    <TextBlock Text="{TemplateBinding Tag}" Foreground="#858585" 
-                                                               Margin="5,0,0,0" VerticalAlignment="Center"
-                                                               Visibility="{Binding Path=Text.IsEmpty, RelativeSource={RelativeSource AncestorType=TextBox}, Converter={StaticResource BooleanToVisibilityConverter}}"/>
-                                                </Grid>
-                                            </Border>
-                                            <ControlTemplate.Triggers>
-                                                <Trigger Property="IsMouseOver" Value="True">
-                                                    <Setter Property="BorderBrush" Value="#007ACC" TargetName="border"/>
-                                                </Trigger>
-                                                <Trigger Property="IsFocused" Value="True">
-                                                    <Setter Property="BorderBrush" Value="#66BCFF" TargetName="border"/>
-                                                    <Setter Property="BorderThickness" Value="2" TargetName="border"/>
-                                                </Trigger>
-                                            </ControlTemplate.Triggers>
-                                        </ControlTemplate>
-                                    </Setter.Value>
-                                </Setter>
-                            </Style>
-                        </TextBox.Style>
-                    </TextBox>
-                    <Button Grid.Column="1" Content="Save" x:Name="SaveTokenButton" Width="60" Margin="5,0,0,0"/>
+                    <Grid Grid.Column="0">
+                        <PasswordBox x:Name="ApiTokenPasswordBox"
+                                     local:Presentation.Behaviors.PasswordBoxAssistant.BindPassword="True"
+                                     local:Presentation.Behaviors.PasswordBoxAssistant.BoundPassword="{Binding ApiToken, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                        <TextBlock Text="Enter BARS API Token Here"
+                                   Margin="5,0,0,0"
+                                   VerticalAlignment="Center"
+                                   Foreground="#858585"
+                                   IsHitTestVisible="False"
+                                   Visibility="{Binding ApiToken, Converter={StaticResource NullOrEmptyToVisibilityConverter}}"/>
+                    </Grid>
+                    <Button Grid.Column="1"
+                            Content="Save"
+                            x:Name="SaveTokenButton"
+                            Width="60"
+                            Margin="5,0,0,0"
+                            Command="{Binding SaveTokenCommand}"/>
                 </Grid>
             </StackPanel>
-            
+
             <!-- Airport Search -->
             <StackPanel>
-                <TextBlock Text="Search Airports" Margin="0,0,0,5"/>
+                <TextBlock Text="Search Airports"
+                           Margin="0,0,0,5"/>
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
-                    <TextBox x:Name="SearchAirportsTextBox" Grid.Column="0">
+                    <TextBox x:Name="SearchAirportsTextBox"
+                             Grid.Column="0"
+                             Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}">
                         <TextBox.Style>
-                            <Style TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+                            <Style TargetType="TextBox"
+                                   BasedOn="{StaticResource {x:Type TextBox}}">
                                 <Setter Property="Template">
                                     <Setter.Value>
                                         <ControlTemplate TargetType="TextBox">
-                                            <Border x:Name="border" Background="{TemplateBinding Background}"
+                                            <Border x:Name="border"
+                                                    Background="{TemplateBinding Background}"
                                                     BorderBrush="{TemplateBinding BorderBrush}"
                                                     BorderThickness="{TemplateBinding BorderThickness}">
                                                 <Grid>
-                                                    <ScrollViewer x:Name="PART_ContentHost" Focusable="false" />
-                                                    <TextBlock Text="Enter ICAO or scenery package to search" Foreground="#858585" 
-                                                               Margin="5,0,0,0" VerticalAlignment="Center"
+                                                    <ScrollViewer x:Name="PART_ContentHost"
+                                                                  Focusable="false"/>
+                                                    <TextBlock Text="Enter ICAO or scenery package to search"
+                                                               Foreground="#858585"
+                                                               Margin="5,0,0,0"
+                                                               VerticalAlignment="Center"
                                                                Visibility="{Binding Path=Text.IsEmpty, RelativeSource={RelativeSource AncestorType=TextBox}, Converter={StaticResource BooleanToVisibilityConverter}}"/>
                                                 </Grid>
                                             </Border>
                                             <ControlTemplate.Triggers>
-                                                <Trigger Property="IsMouseOver" Value="True">
-                                                    <Setter Property="BorderBrush" Value="#007ACC" TargetName="border"/>
+                                                <Trigger Property="IsMouseOver"
+                                                         Value="True">
+                                                    <Setter Property="BorderBrush"
+                                                            Value="#007ACC"
+                                                            TargetName="border"/>
                                                 </Trigger>
-                                                <Trigger Property="IsFocused" Value="True">
-                                                    <Setter Property="BorderBrush" Value="#66BCFF" TargetName="border"/>
-                                                    <Setter Property="BorderThickness" Value="2" TargetName="border"/>
+                                                <Trigger Property="IsFocused"
+                                                         Value="True">
+                                                    <Setter Property="BorderBrush"
+                                                            Value="#66BCFF"
+                                                            TargetName="border"/>
+                                                    <Setter Property="BorderThickness"
+                                                            Value="2"
+                                                            TargetName="border"/>
                                                 </Trigger>
                                             </ControlTemplate.Triggers>
                                         </ControlTemplate>
@@ -523,44 +702,77 @@
                             </Style>
                         </TextBox.Style>
                     </TextBox>
-                    <Button x:Name="SearchButton" Grid.Column="1" Content="Search" Width="60" Margin="5,0,0,0"/>
+                    <Button x:Name="SearchButton"
+                            Grid.Column="1"
+                            Content="Search"
+                            Width="60"
+                            Margin="5,0,0,0"
+                            Command="{Binding SearchCommand}"/>
                 </Grid>
             </StackPanel>
         </StackPanel>
-        
+
         <!-- Airport List Header -->
-        <TextBlock Grid.Row="2" Text="Airport List" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,5"/>
-        
+        <TextBlock Grid.Row="2"
+                   Text="Airport List"
+                   FontSize="16"
+                   FontWeight="SemiBold"
+                   Margin="0,0,0,5"/>
+
         <!-- Custom Airports Display using ItemsControl instead of ListView -->
-        <Border Grid.Row="3" BorderBrush="#3E3E42" BorderThickness="1" Background="#252526" Margin="0,5">
+        <Border Grid.Row="3"
+                BorderBrush="#3E3E42"
+                BorderThickness="1"
+                Background="#252526"
+                Margin="0,5">
             <DockPanel>
                 <!-- Header -->
-                <Grid DockPanel.Dock="Top" Background="#2D2D30">
+                <Grid DockPanel.Dock="Top"
+                      Background="#2D2D30">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="80"/>
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="0" Text="ICAO" Foreground="White" Padding="8,5" FontWeight="SemiBold"/>
-                    <TextBlock Grid.Column="1" Text="Scenery Package" Foreground="White" Padding="5,5" FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="0"
+                               Text="ICAO"
+                               Foreground="White"
+                               Padding="8,5"
+                               FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="1"
+                               Text="Scenery Package"
+                               Foreground="White"
+                               Padding="5,5"
+                               FontWeight="SemiBold"/>
                 </Grid>
-                
+
                 <!-- Items -->
-                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <ItemsControl x:Name="AirportsItemsControl" Margin="0">
+                <ScrollViewer VerticalScrollBarVisibility="Hidden"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <ItemsControl x:Name="AirportsItemsControl"
+                                  Margin="0"
+                                  ItemsSource="{Binding Airports}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
-                                <Border BorderThickness="0,0,0,1" BorderBrush="#3E3E42" Background="Transparent">
+                                <Border BorderThickness="0,0,0,1"
+                                        BorderBrush="#3E3E42"
+                                        Background="Transparent">
                                     <Grid>
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="80"/>
                                             <ColumnDefinition Width="*"/>
                                         </Grid.ColumnDefinitions>
-                                        <TextBlock Grid.Column="0" Text="{Binding ICAO}" Foreground="White" FontWeight="Bold" 
-                                                   Padding="8,8,5,8" VerticalAlignment="Center"/>
-                                        <Border Grid.Column="1" Padding="5,5">
-                                            <ComboBox Width="440" 
-                                                      ItemsSource="{Binding SceneryPackages}" 
-                                                      SelectedItem="{Binding SelectedPackage}"
+                                        <TextBlock Grid.Column="0"
+                                                   Text="{Binding ICAO}"
+                                                   Foreground="White"
+                                                   FontWeight="Bold"
+                                                   Padding="8,8,5,8"
+                                                   VerticalAlignment="Center"/>
+                                        <Border Grid.Column="1"
+                                                Padding="5,5">
+                                            <ComboBox Width="440"
+                                                      ItemsSource="{Binding SceneryPackages}"
+                                                      SelectedItem="{Binding SelectedPackage, Mode=TwoWay}"
+                                                      DisplayMemberPath="Name"
                                                       Style="{StaticResource ListViewComboBoxStyle}"
                                                       ItemContainerStyle="{StaticResource DarkComboBoxItem}"/>
                                         </Border>
@@ -572,18 +784,32 @@
                 </ScrollViewer>
             </DockPanel>
         </Border>
-        
+
         <!-- Pagination Controls -->
-        <Grid Grid.Row="4" Margin="0,10,0,0">
+        <Grid Grid.Row="4"
+              Margin="0,10,0,0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
-            
-            <Button Grid.Column="0" x:Name="PreviousPageButton" Content="Previous Page" Width="120" Height="24"/>
-            <TextBlock Grid.Column="1" x:Name="PageInfoText" Text="Page 1 of 1" HorizontalAlignment="Center"/>
-            <Button Grid.Column="2" x:Name="NextPageButton" Content="Next Page" Width="120" Height="24"/>
+
+            <Button Grid.Column="0"
+                    x:Name="PreviousPageButton"
+                    Content="Previous Page"
+                    Width="120"
+                    Height="24"
+                    Command="{Binding PrevPageCommand}"/>
+            <TextBlock Grid.Column="1"
+                       x:Name="PageInfoText"
+                       Text="{Binding PageInfo}"
+                       HorizontalAlignment="Center"/>
+            <Button Grid.Column="2"
+                    x:Name="NextPageButton"
+                    Content="Next Page"
+                    Width="120"
+                    Height="24"
+                    Command="{Binding NextPageCommand}"/>
         </Grid>
     </Grid>
 </Window>
