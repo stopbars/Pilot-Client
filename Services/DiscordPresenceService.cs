@@ -58,13 +58,17 @@ internal sealed class DiscordPresenceService : BackgroundService
     {
         try
         {
-            _client = new DiscordRpcClient(DiscordAppId, autoEvents: false)
+            _client = new DiscordRpcClient(DiscordAppId, autoEvents: true)
             {
                 Logger = new ConsoleLogger() { Level = DiscordRPC.Logging.LogLevel.None } // silence library logs (we log ourselves)
             };
+            // Observe connection lifecycle for diagnostics
+            _client.OnReady += (_, e) => _logger.LogInformation("Discord RPC ready: user={User}", e.User.Username);
+            _client.OnClose += (_, e) => _logger.LogWarning("Discord RPC closed: code={Code} message={Message}", e.Code, e.Reason);
+            _client.OnError += (_, e) => _logger.LogWarning("Discord RPC error: code={Code} message={Message}", e.Code, e.Message);
             _client.Initialize();
             _appStartUtc = DateTime.UtcNow;
-            _logger.LogInformation("Discord Rich Presence initialized");
+            _logger.LogInformation("Discord Rich Presence initialized (IsInitialized={Initialized})", _client.IsInitialized);
         }
         catch (Exception ex)
         {
@@ -201,6 +205,7 @@ internal sealed class DiscordPresenceService : BackgroundService
                 }
             };
             client.SetPresence(presence);
+            _logger.LogDebug("Discord presence updated: details='{details}', state='{state}', smallKey='{smallKey}'", details, state, smallKey);
         }
         catch (Exception ex)
         {
