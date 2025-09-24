@@ -67,7 +67,7 @@ if (-not $SkipBuild) {
         --self-contained false `
         -p:PublishReadyToRun=true `
         -p:PublishSingleFile=false `
-        -p:DebugType=none
+        -p:DebugType=portable
 }
 
 $publishDir = Join-Path (Split-Path $projectPath -Parent) "bin\\$Configuration\\net8.0-windows\\$Runtime\\publish"
