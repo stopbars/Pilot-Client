@@ -1,32 +1,41 @@
-<img width="180" height="180" align="left" style="float: left; margin: 0 20px 0 0;" alt="BARS Logo" src="https://avatars.githubusercontent.com/u/214760188?s=200&u=9cbb686fd7b3aa1517ecb66825da5aa0e974954e&v=4" />
+<p align="center">
+  <p align="center">
+   <img width="150" height="150" src="https://stopbars.com/favicon.png" alt="Logo">
+  </p>
+	<h1 align="center"><b>stopbars/Pilot-Client</b></h1>
+	<p align="center">
+    <br />
+		BARS Pilot Client brings real-time airport lighting updates to simulators, receiving lighting state updates from controllers, to reflect changes in the pilot's simulator. The client updates airport lighting positions based on selected scenery packages, provides           status monitoring including simulator detection, nearest airport, server connection, and rich Discord presence integration.
+    <br />
+    <br />
+    <a href="https://stopbars.com"><strong>stopbars.com »</strong></a>
+    <br />
+  </p>
+</p>
 
-<br>
-
-**stopbars/Pilot-Client**
-
-[![Github Issues](https://img.shields.io/github/issues/stopbars/Pilot-Client)](https://github.com/stopbars/Pilot-Client/repo)
-![GitHub License](https://img.shields.io/github/license/stopbars/Pilot-Client)
-[![Discord](https://img.shields.io/discord/1323993176318414889.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://stopbars.com/discord)
-
-The Pilot Client updates airport lighting in simulators by processing lighting state requests, enabling airport profile selection based on scenery preferences, updating lighting positions, and providing stopbar modal status and nearest airport detection.
-
-<br>
+<p align="center">
+  <br />
+  <a href="https://stopbars.com/discord" target="_blank" rel="noopener noreferrer">
+	<img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white" alt="Discord">
+  </a>
+  <a href="https://opencollective.com/stopbars">
+    <img src="https://img.shields.io/static/v1?label=&message=Open%20Collective&color=297EF2&logo=opencollective&logoColor=white" />
+  </a>
+  <a href="https://www.gnu.org/licenses/gpl-3.0.en.html">
+    <img src="https://img.shields.io/static/v1?label=License&message=GPL%20-3.0&color=000" />
+  </a>
+  <a href="https://docs.stopbars.com" target="_blank" rel="noopener noreferrer">
+    <img src="https://img.shields.io/badge/Documentation-e81919.svg" alt="Documentation">
+  </a>
+  <br />
+</p>
 
 ## Contributing
 
-We encourage and appreciate contributions from the community! To get started, please review our [CONTRIBUTING.md](CONTRIBUTING.md) guide, which covers the following:
+We encourage and appreciate contributions from the community! To get started, please review our [CONTRIBUTING.md](CONTRIBUTING.md) guide, which covers how to set up your development environment, code style guidelines and best practices, instructions for submitting pull requests, and testing and verification procedures.
 
-- How to set up your development environment
-- Code style guidelines and best practices
-- Instructions for submitting pull requests
-- Testing and verification procedures
-
-Your contributions directly support the ongoing development and improvement of BARS. By getting involved, you help us build a more robust, and feature-rich product that benefits the entire flight sim community.
-
-## Bug Reports and Feature Requests
-
-If you find a bug or have a feature suggestion, please submit an issue [on our GitHub repository](https://github.com/stopbars/repo/issues/new). Please follow and fill in the issue template to the best of your ability to help us address your feedback efficiently.
+Your contributions directly support the ongoing development and improvement of BARS. By getting involved, you help us build a more robust, and feature-rich product that benefits the entire flight sim community. All contributors are acknowledged on our [credits page](https://stopbars.com/credits).
 
 ## Disclaimer
 
-BARS is an **independent third-party** software project. **We are not affiliated** with, endorsed by, or connected to VATSIM, vatSys, Microsoft Flight Simulator, or any other simulation, controller client supported by our software.
+BARS is an **independent third-party** software project. **We are not affiliated** with, **endorsed by**, or **connected to** VATSIM, vatSys, EuroScope, Microsoft Flight Simulator, or any other simulation, controller client supported by our software.
