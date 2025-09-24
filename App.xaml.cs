@@ -7,6 +7,7 @@ using BARS_Client_V2.Domain;
 using BARS_Client_V2.Application; // Contains SimulatorManager; no conflict if fully qualified below
 using BARS_Client_V2.Presentation.ViewModels;
 using BARS_Client_V2.Services;
+using System.Windows.Threading;
 
 namespace BARS_Client_V2
 {
@@ -53,7 +54,6 @@ namespace BARS_Client_V2
                 })
                 .Build();
 
-            _host.Start();
 
             var mainWindow = _host.Services.GetRequiredService<MainWindow>();
             var vm = _host.Services.GetRequiredService<MainWindowViewModel>();
@@ -68,13 +68,27 @@ namespace BARS_Client_V2
             wsMgr.Disconnected += reason => { pointController.Suspend(); _ = pointController.DespawnAllAsync(); };
             wsMgr.Connected += () => pointController.Resume();
             mainWindow.Show();
+            Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, async () =>
+            {
+                try
+                {
+                    if (_host != null)
+                    {
+                        await _host.StartAsync();
+                    }
+                }
+                catch
+                {
+                    // Swallow to avoid UI crash;
+                }
+            });
         }
 
         protected override async void OnExit(ExitEventArgs e)
         {
             if (_host != null)
             {
-                await _host.StopAsync();
+                try { await _host.StopAsync(); } catch { }
                 _host.Dispose();
             }
             base.OnExit(e);
