@@ -265,13 +265,14 @@ public class MainWindowViewModel : INotifyPropertyChanged
                     });
             }
         }
-        if (connector != null)
+        if (connector != null && connector.IsConnected)
         {
             SimulatorName = connector.DisplayName;
-            SimulatorConnected = connector.IsConnected;
+            SimulatorConnected = true;
         }
         else
         {
+            SimulatorName = "Not Connected";
             SimulatorConnected = false;
         }
     }

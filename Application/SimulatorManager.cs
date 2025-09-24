@@ -59,7 +59,19 @@ public sealed class SimulatorManager : BackgroundService
             var active = ActiveConnector;
             if (active == null || !active.IsConnected)
             {
-                await Task.Delay(1000, stoppingToken);
+                // Attempt reconnect periodically when disconnected
+                if (first != null)
+                {
+                    try
+                    {
+                        await ActivateAsync(first.SimulatorId, stoppingToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Reconnect attempt failed");
+                    }
+                }
+                await Task.Delay(2000, stoppingToken);
                 continue;
             }
             try

@@ -20,9 +20,18 @@ internal sealed class NearestAirportService : INearestAirportService
     private double _lastLon;
     private string? _lastIcao;
     private DateTime _lastFetchUtc = DateTime.MinValue;
+    // Throttling/backoff state
+    private DateTime _nextAllowedAttemptUtc = DateTime.MinValue;
+    private int _consecutiveFailures = 0;
+    private Task<string?>? _inFlight;
+    private double _lastAttemptLat;
+    private double _lastAttemptLon;
 
     private const double MinDistanceNmForRefresh = 2.0;
     private static readonly TimeSpan MaxAge = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan BaseBackoff = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
+    private const double MinDistanceNmForRetryAttempt = 0.1; // ~185m movement to re-attempt sooner than time-based backoff
 
     public NearestAirportService(HttpClient httpClient)
     {
@@ -40,15 +49,48 @@ internal sealed class NearestAirportService : INearestAirportService
         }
     }
 
-    public async Task<string?> ResolveAndCacheAsync(double lat, double lon, CancellationToken ct = default)
+    public Task<string?> ResolveAndCacheAsync(double lat, double lon, CancellationToken ct = default)
+    {
+        Task<string?>? toAwait = null;
+        lock (_lock)
+        {
+            var now = DateTime.UtcNow;
+            var tooSoonByTime = now < _nextAllowedAttemptUtc;
+            var tooSoonByDistance = GreatCircleDistanceNm(lat, lon, _lastAttemptLat, _lastAttemptLon) < MinDistanceNmForRetryAttempt;
+            if ((tooSoonByTime && tooSoonByDistance))
+            {
+                return Task.FromResult<string?>(null);
+            }
+
+            if (_inFlight != null && !_inFlight.IsCompleted)
+            {
+                return _inFlight;
+            }
+
+            _lastAttemptLat = lat;
+            _lastAttemptLon = lon;
+
+            // Start a single in-flight request for de-duplication
+            _inFlight = DoResolveAsync(lat, lon, ct);
+            toAwait = _inFlight;
+        }
+
+        return toAwait!;
+    }
+
+    private async Task<string?> DoResolveAsync(double lat, double lon, CancellationToken ct)
     {
         try
         {
             var url = $"https://v2.stopbars.com/airports/nearest?lat={lat:F6}&lon={lon:F6}";
-            using var resp = await _http.GetAsync(url, ct);
-            if (!resp.IsSuccessStatusCode) return null;
-            var json = await resp.Content.ReadAsStringAsync(ct);
-            var doc = JsonDocument.Parse(json);
+            using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+            {
+                ApplyFailureBackoff();
+                return null;
+            }
+            var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(json);
             string? icao = null;
             if (doc.RootElement.ValueKind == JsonValueKind.Object)
             {
@@ -63,13 +105,37 @@ internal sealed class NearestAirportService : INearestAirportService
                     _lastLat = lat;
                     _lastLon = lon;
                     _lastFetchUtc = DateTime.UtcNow;
+                    _consecutiveFailures = 0;
+                    _nextAllowedAttemptUtc = DateTime.UtcNow; // reset backoff; cache age/distance gates future fetches
                 }
+            }
+            else
+            {
+                ApplyFailureBackoff();
             }
             return icao;
         }
         catch
         {
+            ApplyFailureBackoff();
             return null;
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                _inFlight = null;
+            }
+        }
+    }
+
+    private void ApplyFailureBackoff()
+    {
+        lock (_lock)
+        {
+            _consecutiveFailures = Math.Min(_consecutiveFailures + 1, 10);
+            var backoff = TimeSpan.FromMilliseconds(Math.Min(MaxBackoff.TotalMilliseconds, BaseBackoff.TotalMilliseconds * Math.Pow(2, _consecutiveFailures - 1)));
+            _nextAllowedAttemptUtc = DateTime.UtcNow + backoff;
         }
     }
 

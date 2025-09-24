@@ -26,6 +26,9 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
     private readonly ConcurrentDictionary<string, bool> _lateAttachedPoints = new();
     // Track successful creations so late attach logic can correlate
     private readonly ConcurrentDictionary<string, int> _createdObjectIds = new();
+    // Avoid tearing down the connection on a single transient timeout
+    private int _consecutiveSampleErrors;
+    private const int MaxConsecutiveSampleErrorsBeforeDisconnect = 5;
 
     public MsfsSimulatorConnector(ILogger<MsfsSimulatorConnector> logger) => _logger = logger;
 
@@ -117,8 +120,8 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
         {
             if (!IsConnected)
             {
-                try { await Task.Delay(1000, ct); } catch { yield break; }
-                continue;
+                // Stop streaming so manager can observe disconnect and trigger reconnection.
+                yield break;
             }
 
             var sample = await TryGetSampleAsync(ct);
@@ -135,15 +138,64 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
         {
             var svm = client.SimVars;
             if (svm == null) return null;
-            double lat = await svm.GetAsync<double>("PLANE LATITUDE", "degrees");
-            double lon = await svm.GetAsync<double>("PLANE LONGITUDE", "degrees");
-            bool onGround = (await svm.GetAsync<int>("SIM ON GROUND", "bool")) == 1;
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            // Keep SimVar requests snappy so a slow sim doesn't block the stream loop
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(3));
+            var tkn = timeoutCts.Token;
+
+            var latTask = svm.GetAsync<double>("PLANE LATITUDE", "degrees", cancellationToken: tkn);
+            var lonTask = svm.GetAsync<double>("PLANE LONGITUDE", "degrees", cancellationToken: tkn);
+            var grnTask = svm.GetAsync<int>("SIM ON GROUND", "bool", cancellationToken: tkn);
+
+            await Task.WhenAll(latTask, lonTask, grnTask).ConfigureAwait(false);
+
+            var lat = latTask.Result;
+            var lon = lonTask.Result;
+            var onGround = grnTask.Result == 1;
+
+            // success -> reset error budget
+            _consecutiveSampleErrors = 0;
             return new RawFlightSample(lat, lon, onGround);
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException oce)
+        {
+            if (ct.IsCancellationRequested) throw; // external cancellation – bubble up
+            // Per-request timeout or transient cancellation – treat as soft miss
+            var n = Interlocked.Increment(ref _consecutiveSampleErrors);
+            _logger.LogDebug(oce, "MSFS sample timed out/cancelled (#{count}/{max}) – will retry without disconnect", n, MaxConsecutiveSampleErrorsBeforeDisconnect);
+            if (n >= MaxConsecutiveSampleErrorsBeforeDisconnect)
+            {
+                _logger.LogWarning("MSFS sample repeatedly failing ({count} in a row) – disposing client to recover", n);
+                try { await DisconnectAsync(); } catch { }
+                _consecutiveSampleErrors = 0;
+            }
+            return null;
+        }
+        catch (TimeoutException tex)
+        {
+            // Some SimConnect.NET versions throw TimeoutException directly
+            var n = Interlocked.Increment(ref _consecutiveSampleErrors);
+            _logger.LogDebug(tex, "MSFS sample TimeoutException (#{count}/{max}) – will retry without immediate disconnect", n, MaxConsecutiveSampleErrorsBeforeDisconnect);
+            if (n >= MaxConsecutiveSampleErrorsBeforeDisconnect)
+            {
+                _logger.LogWarning("MSFS sample repeatedly timing out ({count} in a row) – disposing client to recover", n);
+                try { await DisconnectAsync(); } catch { }
+                _consecutiveSampleErrors = 0;
+            }
+            return null;
+        }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "MSFS sample retrieval failed (will retry)");
+            // Treat other exceptions as transient, escalate only after several occurrences
+            var n = Interlocked.Increment(ref _consecutiveSampleErrors);
+            _logger.LogDebug(ex, "MSFS sample retrieval error (#{count}/{max})", n, MaxConsecutiveSampleErrorsBeforeDisconnect);
+            if (n >= MaxConsecutiveSampleErrorsBeforeDisconnect)
+            {
+                _logger.LogWarning(ex, "MSFS sample repeatedly failing – disposing client to recover");
+                try { await DisconnectAsync(); } catch { }
+                _consecutiveSampleErrors = 0;
+            }
             return null;
         }
     }
