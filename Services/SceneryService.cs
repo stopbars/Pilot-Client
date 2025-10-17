@@ -1,9 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
+using System.IO;
 using System.Text.Json;
 using System.Threading.Tasks;
-using System.IO;
+using BARS_Client_V2.Infrastructure.Settings;
 
 namespace BARS_Client_V2.Services
 {
@@ -141,6 +142,7 @@ namespace BARS_Client_V2.Services
         }
         private Dictionary<string, string> LoadSelectedPackages()
         {
+            SettingsFileAccess.Gate.Wait();
             try
             {
                 string appDataPath = Path.Combine(
@@ -181,10 +183,15 @@ namespace BARS_Client_V2.Services
                 Console.WriteLine($"Error loading scenery selections from settings.json: {ex.Message}");
                 return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             }
+            finally
+            {
+                SettingsFileAccess.Gate.Release();
+            }
         }
 
         private void SaveSelectedPackages()
         {
+            SettingsFileAccess.Gate.Wait();
             try
             {
                 string appDataPath = Path.Combine(
@@ -220,6 +227,10 @@ namespace BARS_Client_V2.Services
             catch (Exception ex)
             {
                 Console.WriteLine($"Error saving scenery selections to settings.json: {ex.Message}");
+            }
+            finally
+            {
+                SettingsFileAccess.Gate.Release();
             }
         }
 

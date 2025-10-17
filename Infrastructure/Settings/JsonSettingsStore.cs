@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
 using BARS_Client_V2.Application;
 
@@ -37,9 +38,10 @@ internal sealed class JsonSettingsStore : ISettingsStore
 
     public async Task<ClientSettings> LoadAsync()
     {
-        if (!File.Exists(_path)) return ClientSettings.Empty;
+        await SettingsFileAccess.Gate.WaitAsync().ConfigureAwait(false);
         try
         {
+            if (!File.Exists(_path)) return ClientSettings.Empty;
             var json = await File.ReadAllTextAsync(_path);
             var p = JsonSerializer.Deserialize<Persisted>(json, Options);
             if (p == null) return ClientSettings.Empty;
@@ -70,29 +72,41 @@ internal sealed class JsonSettingsStore : ISettingsStore
         {
             return ClientSettings.Empty;
         }
+        finally
+        {
+            SettingsFileAccess.Gate.Release();
+        }
     }
 
     public async Task SaveAsync(ClientSettings settings)
     {
-        var p = new Persisted
+        await SettingsFileAccess.Gate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            AirportPackages = settings.AirportPackages != null ? new Dictionary<string, string>(settings.AirportPackages) : new()
-        };
+            var p = new Persisted
+            {
+                AirportPackages = settings.AirportPackages != null ? new Dictionary<string, string>(settings.AirportPackages) : new()
+            };
 
-        if (!string.IsNullOrWhiteSpace(settings.ApiToken))
-        {
-            try
+            if (!string.IsNullOrWhiteSpace(settings.ApiToken))
             {
-                var plaintextBytes = Encoding.UTF8.GetBytes(settings.ApiToken);
-                var protectedBytes = ProtectedData.Protect(plaintextBytes, Entropy, DataProtectionScope.CurrentUser);
-                p.ApiToken = Convert.ToBase64String(protectedBytes);
+                try
+                {
+                    var plaintextBytes = Encoding.UTF8.GetBytes(settings.ApiToken);
+                    var protectedBytes = ProtectedData.Protect(plaintextBytes, Entropy, DataProtectionScope.CurrentUser);
+                    p.ApiToken = Convert.ToBase64String(protectedBytes);
+                }
+                catch
+                {
+                    p.ApiToken = null;
+                }
             }
-            catch
-            {
-                p.ApiToken = null;
-            }
+            var json = JsonSerializer.Serialize(p, Options);
+            await File.WriteAllTextAsync(_path, json);
         }
-        var json = JsonSerializer.Serialize(p, Options);
-        await File.WriteAllTextAsync(_path, json);
+        finally
+        {
+            SettingsFileAccess.Gate.Release();
+        }
     }
 }

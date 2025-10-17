@@ -50,7 +50,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     private long _totalReceived;
     private long _totalSpawnAttempts;
     private long _totalDespawned;
-    private long _totalDeferredRate;
     private long _totalSkippedCap;
     private DateTime _lastSummary = DateTime.UtcNow;
 
@@ -184,8 +183,8 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 if ((DateTime.UtcNow - _lastSummary) > TimeSpan.FromSeconds(30))
                 {
                     _lastSummary = DateTime.UtcNow;
-                    _logger.LogInformation("[Summary] received={rec} spawnAttempts={spAtt} activeLights={active} despawned={des} deferredRate={def} skippedCap={cap} queue={q}",
-                        _totalReceived, _totalSpawnAttempts, TotalActiveLightCount(), _totalDespawned, _totalDeferredRate, _totalSkippedCap, _queue.Count);
+                    _logger.LogInformation("[Summary] received={rec} spawnAttempts={spAtt} activeLights={active} despawned={des} skippedCap={cap} queue={q}",
+                        _totalReceived, _totalSpawnAttempts, TotalActiveLightCount(), _totalDespawned, _totalSkippedCap, _queue.Count);
                 }
             }
             catch (OperationCanceledException) { }

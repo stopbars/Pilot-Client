@@ -1,22 +1,24 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
-using System.Timers;
-using Timer = System.Timers.Timer; // Disambiguate from System.Threading.Timer
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Input;
+using System.Windows.Threading;
 using BARS_Client_V2.Application;
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Services;
-using System.Threading.Tasks;
-using System.Windows.Input;
-using System.Linq;
 
 namespace BARS_Client_V2.Presentation.ViewModels;
 
 public class MainWindowViewModel : INotifyPropertyChanged
 {
     private readonly SimulatorManager _simManager;
-    private readonly Timer _uiPoll;
+    private readonly DispatcherTimer _uiPoll;
+    private readonly DispatcherTimer _serverTimer;
     private string _closestAirport = "Unknown";
     private bool _onGround;
     private string _simulatorName = "Not Connected";
@@ -61,6 +63,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     public ObservableCollection<string> LogLines { get; } = new();
 
     private readonly INearestAirportService _nearestService;
+    private readonly SemaphoreSlim _settingsSaveGate = new(1, 1);
 
     public string? SearchText { get => _searchText; set { if (value != _searchText) { _searchText = value; OnPropertyChanged(); } } }
     public string? ApiToken
@@ -95,21 +98,13 @@ public class MainWindowViewModel : INotifyPropertyChanged
         _nearestService = nearestService;
         _airportRepo = airportRepository;
         _settingsStore = settingsStore;
-        _uiPoll = new Timer(1000);
-        _uiPoll.Elapsed += (_, _) => RefreshFromState();
+        _uiPoll = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _uiPoll.Tick += UiPollOnTick;
         _uiPoll.Start();
 
-        // Periodically evaluate server connection staleness (if no messages for 30s, mark disconnected)
-        var serverTimer = new Timer(5000);
-        serverTimer.Elapsed += (_, _) =>
-        {
-            // Heartbeat is every 60s; allow >60s (90s) before marking disconnected to avoid flicker.
-            if (_lastServerMessageUtc != DateTime.MinValue && (DateTime.UtcNow - _lastServerMessageUtc) > TimeSpan.FromSeconds(90))
-            {
-                ServerConnected = false;
-            }
-        };
-        serverTimer.Start();
+        _serverTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _serverTimer.Tick += ServerTimerOnTick;
+        _serverTimer.Start();
 
         SearchCommand = new DelegateCommand(async _ => await RunSearchAsync(resetPage: true));
         NextPageCommand = new DelegateCommand(async _ => { CurrentPage++; await RunSearchAsync(); }, _ => CanChangePage(+1));
@@ -128,11 +123,14 @@ public class MainWindowViewModel : INotifyPropertyChanged
         _apiToken = _originalApiToken; // set backing field directly to avoid redundant raise
         OnPropertyChanged(nameof(ApiToken));
         (SaveTokenCommand as DelegateCommand)?.RaiseCanExecuteChanged();
-        _savedPackages = settings.AirportPackages ?? new Dictionary<string, string>();
+        _savedPackages = settings.AirportPackages != null
+            ? new Dictionary<string, string>(settings.AirportPackages, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        await RefreshFromStateAsync();
         await RunSearchAsync(resetPage: true);
     }
 
-    private IDictionary<string, string> _savedPackages = new Dictionary<string, string>();
+    private IDictionary<string, string> _savedPackages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     private bool CanChangePage(int delta)
     {
@@ -158,6 +156,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             var (items, total) = await _airportRepo.SearchAsync(SearchText, CurrentPage, _pageSize);
             TotalCount = total;
             Airports.Clear();
+            var packagesChanged = false;
             foreach (var a in items)
             {
                 var row = new AirportRowViewModel(a);
@@ -169,14 +168,15 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 // Auto-select first package if none stored/selected (always at least one per requirements)
                 if (row.SelectedPackage == null && a.SceneryPackages.Count > 0)
                 {
-                    row.SelectedPackage = a.SceneryPackages.First();
-                    if (!_savedPackages.ContainsKey(a.ICAO))
+                    var defaultPackage = a.SceneryPackages.First();
+                    row.SelectedPackage = defaultPackage;
+                    var needsUpdate = !_savedPackages.TryGetValue(a.ICAO, out var existing) || !string.Equals(existing, defaultPackage.Name, StringComparison.Ordinal);
+                    if (needsUpdate)
                     {
-                        _savedPackages[a.ICAO] = row.SelectedPackage.Name;
-                        // Fire and forget save (debounced vs per-change not critical given infrequent list rebuild)
-                        _ = _settingsStore.SaveAsync(new ClientSettings(ApiToken, _savedPackages));
+                        _savedPackages[a.ICAO] = defaultPackage.Name;
+                        packagesChanged = true;
+                        try { SceneryService.Instance.SetSelectedPackage(a.ICAO, defaultPackage.Name); } catch { }
                     }
-                    // AirportRowOnPropertyChanged handler will persist selection via PropertyChanged event
                 }
                 row.PropertyChanged += AirportRowOnPropertyChanged;
                 Airports.Add(row);
@@ -184,6 +184,10 @@ public class MainWindowViewModel : INotifyPropertyChanged
             Status = $"Loaded {Airports.Count} airports";
             // Refresh command enable states after data load/page change
             UpdatePagingCommands();
+            if (packagesChanged)
+            {
+                await PersistSettingsAsync();
+            }
         }
         catch (System.Exception ex)
         {
@@ -198,10 +202,6 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async Task SaveSettingsAsync()
     {
-        // Persist current selections (all visible) and last selected (most recently changed or first with a selection)
-        var firstSelected = Airports.FirstOrDefault(a => a.SelectedPackage != null);
-        var icao = firstSelected?.ICAO;
-        var pkg = firstSelected?.SelectedPackage?.Name;
         if (_apiToken != null)
         {
             var resanitized = SanitizeToken(_apiToken);
@@ -220,26 +220,26 @@ public class MainWindowViewModel : INotifyPropertyChanged
             return;
         }
 
-        await _settingsStore.SaveAsync(new ClientSettings(ApiToken, _savedPackages));
+        await PersistSettingsAsync();
         Status = "Settings saved";
         // Update baseline so save button disables until another change
         _originalApiToken = _apiToken;
         (SaveTokenCommand as DelegateCommand)?.RaiseCanExecuteChanged();
     }
 
-    private void AirportRowOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    private async void AirportRowOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(AirportRowViewModel.SelectedPackage) && sender is AirportRowViewModel row && row.SelectedPackage != null)
         {
             _savedPackages[row.ICAO] = row.SelectedPackage.Name;
             // Fire and forget save to persist selection quickly without blocking UI
-            _ = _settingsStore.SaveAsync(new ClientSettings(ApiToken, _savedPackages));
-            // Also notify SceneryService so the running session hot-reloads the map for this airport (if connected)
             try { SceneryService.Instance.SetSelectedPackage(row.ICAO, row.SelectedPackage.Name); } catch { }
+            try { await PersistSettingsAsync(); }
+            catch (Exception ex) { LogLines.Add(ex.Message); }
         }
     }
 
-    private void RefreshFromState()
+    private async Task RefreshFromStateAsync()
     {
         var state = _simManager.LatestState;
         var connector = _simManager.ActiveConnector;
@@ -255,14 +255,15 @@ public class MainWindowViewModel : INotifyPropertyChanged
             }
             else
             {
-                _ = _nearestService.ResolveAndCacheAsync(Latitude, Longitude)
-                    .ContinueWith(t =>
+                try
+                {
+                    var resolved = await _nearestService.ResolveAndCacheAsync(Latitude, Longitude);
+                    if (!string.IsNullOrEmpty(resolved))
                     {
-                        if (t.Status == System.Threading.Tasks.TaskStatus.RanToCompletion && t.Result != null)
-                        {
-                            ClosestAirport = t.Result;
-                        }
-                    });
+                        ClosestAirport = resolved;
+                    }
+                }
+                catch { }
             }
         }
         if (connector != null && connector.IsConnected)
@@ -280,35 +281,48 @@ public class MainWindowViewModel : INotifyPropertyChanged
     // Called externally when a backend websocket message received (wire from AirportWebSocketManager)
     public void NotifyServerMessage()
     {
-        _lastServerMessageUtc = DateTime.UtcNow;
-        if (!ServerConnected)
+        RunOnDispatcher(() =>
         {
-            ServerConnected = true;
-        }
-        if (!string.IsNullOrEmpty(ServerStatusDetail))
-        {
-            ServerStatusDetail = string.Empty; OnPropertyChanged(nameof(ServerStatusDetail)); OnPropertyChanged(nameof(ServerStatusText));
-        }
+            _lastServerMessageUtc = DateTime.UtcNow;
+            if (!ServerConnected)
+            {
+                ServerConnected = true;
+            }
+            if (!string.IsNullOrEmpty(ServerStatusDetail))
+            {
+                ServerStatusDetail = string.Empty;
+                OnPropertyChanged(nameof(ServerStatusDetail));
+                OnPropertyChanged(nameof(ServerStatusText));
+            }
+        });
     }
 
     public void NotifyServerConnected()
     {
-        ServerConnected = true;
-        ServerStatusDetail = string.Empty; OnPropertyChanged(nameof(ServerStatusDetail)); OnPropertyChanged(nameof(ServerStatusText));
-        _lastServerMessageUtc = DateTime.UtcNow;
+        RunOnDispatcher(() =>
+        {
+            ServerConnected = true;
+            ServerStatusDetail = string.Empty;
+            OnPropertyChanged(nameof(ServerStatusDetail));
+            OnPropertyChanged(nameof(ServerStatusText));
+            _lastServerMessageUtc = DateTime.UtcNow;
+        });
     }
 
     public void NotifyServerError(int code)
     {
-        ServerConnected = false;
-        ServerStatusDetail = code switch
+        RunOnDispatcher(() =>
         {
-            401 => "Invalid API token",
-            403 => "Not connected to VATSIM",
-            _ => "Server unavailable"
-        };
-        OnPropertyChanged(nameof(ServerStatusDetail));
-        OnPropertyChanged(nameof(ServerStatusText));
+            ServerConnected = false;
+            ServerStatusDetail = code switch
+            {
+                401 => "Invalid API token",
+                403 => "Not connected to VATSIM",
+                _ => "Server unavailable"
+            };
+            OnPropertyChanged(nameof(ServerStatusDetail));
+            OnPropertyChanged(nameof(ServerStatusText));
+        });
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -336,6 +350,47 @@ public class MainWindowViewModel : INotifyPropertyChanged
         if (!changed) return false;
         // Allow clearing (current null/empty) or valid token format
         return string.IsNullOrWhiteSpace(current) || IsValidToken(current);
+    }
+
+    private async void UiPollOnTick(object? sender, EventArgs e)
+    {
+        try { await RefreshFromStateAsync(); }
+        catch (Exception ex) { LogLines.Add(ex.Message); }
+    }
+
+    private void ServerTimerOnTick(object? sender, EventArgs e)
+    {
+        if (_lastServerMessageUtc == DateTime.MinValue) return;
+        if ((DateTime.UtcNow - _lastServerMessageUtc) > TimeSpan.FromSeconds(90))
+        {
+            ServerConnected = false;
+        }
+    }
+
+    private async Task PersistSettingsAsync()
+    {
+        await _settingsSaveGate.WaitAsync();
+        try
+        {
+            var copy = new Dictionary<string, string>(_savedPackages, StringComparer.OrdinalIgnoreCase);
+            await _settingsStore.SaveAsync(new ClientSettings(ApiToken, copy));
+        }
+        finally
+        {
+            _settingsSaveGate.Release();
+        }
+    }
+
+    private static void RunOnDispatcher(Action action)
+    {
+        if (System.Windows.Application.Current?.Dispatcher is Dispatcher dispatcher && !dispatcher.CheckAccess())
+        {
+            dispatcher.Invoke(action);
+        }
+        else
+        {
+            action();
+        }
     }
 }
 
