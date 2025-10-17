@@ -4,6 +4,7 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:BARS_Client_V2"
+        xmlns:behaviors="clr-namespace:BARS_Client_V2.Presentation.Behaviors"
         mc:Ignorable="d"
         Title="BARS Client"
         Height="674"
@@ -733,8 +734,8 @@
                     </Grid.ColumnDefinitions>
                     <Grid Grid.Column="0">
                         <PasswordBox x:Name="ApiTokenPasswordBox"
-                                     local:Presentation.Behaviors.PasswordBoxAssistant.BindPassword="True"
-                                     local:Presentation.Behaviors.PasswordBoxAssistant.BoundPassword="{Binding ApiToken, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                     behaviors:PasswordBoxAssistant.BindPassword="True"
+                                     behaviors:PasswordBoxAssistant.BoundPassword="{Binding ApiToken, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
                         <TextBlock Text="Enter BARS API Token Here"
                                    Margin="5,0,0,0"
                                    VerticalAlignment="Center"

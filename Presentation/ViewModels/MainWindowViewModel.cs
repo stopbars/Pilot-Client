@@ -11,6 +11,7 @@ using System.Windows.Threading;
 using BARS_Client_V2.Application;
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Services;
+using BARS_Client_V2.Infrastructure.Diagnostics;
 
 namespace BARS_Client_V2.Presentation.ViewModels;
 
@@ -94,6 +95,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     public MainWindowViewModel(SimulatorManager simManager, INearestAirportService nearestService, IAirportRepository airportRepository, ISettingsStore settingsStore)
     {
+        StartupTrace.Write("MainWindowViewModel ctor");
         _simManager = simManager;
         _nearestService = nearestService;
         _airportRepo = airportRepository;
@@ -117,6 +119,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async Task InitializeAsync()
     {
+        StartupTrace.Write("InitializeAsync start");
         var settings = await _settingsStore.LoadAsync();
         // Sanitize and store original token baseline
         _originalApiToken = SanitizeToken(settings.ApiToken);
@@ -126,8 +129,11 @@ public class MainWindowViewModel : INotifyPropertyChanged
         _savedPackages = settings.AirportPackages != null
             ? new Dictionary<string, string>(settings.AirportPackages, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        StartupTrace.Write($"InitializeAsync settings loaded; packages={_savedPackages.Count}");
         await RefreshFromStateAsync();
+        StartupTrace.Write("InitializeAsync state refreshed");
         await RunSearchAsync(resetPage: true);
+        StartupTrace.Write("InitializeAsync completed initial search");
     }
 
     private IDictionary<string, string> _savedPackages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -147,6 +153,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async Task RunSearchAsync(bool resetPage = false)
     {
+        StartupTrace.Write($"RunSearchAsync begin reset={resetPage}");
         if (IsBusy) return;
         try
         {
@@ -154,6 +161,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             Status = "Searching...";
             if (resetPage) CurrentPage = 1;
             var (items, total) = await _airportRepo.SearchAsync(SearchText, CurrentPage, _pageSize);
+            StartupTrace.Write($"RunSearchAsync results items={items.Count} total={total}");
             TotalCount = total;
             Airports.Clear();
             var packagesChanged = false;
@@ -175,7 +183,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
                     {
                         _savedPackages[a.ICAO] = defaultPackage.Name;
                         packagesChanged = true;
-                        try { SceneryService.Instance.SetSelectedPackage(a.ICAO, defaultPackage.Name); } catch { }
+                        try { SceneryService.Instance.SetSelectedPackage(a.ICAO, defaultPackage.Name); } catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
                     }
                 }
                 row.PropertyChanged += AirportRowOnPropertyChanged;
@@ -187,21 +195,25 @@ public class MainWindowViewModel : INotifyPropertyChanged
             if (packagesChanged)
             {
                 await PersistSettingsAsync();
+                StartupTrace.Write("RunSearchAsync persisted package changes");
             }
         }
         catch (System.Exception ex)
         {
             Status = "Error loading airports";
             LogLines.Add(ex.Message);
+            StartupTrace.Write($"RunSearchAsync exception: {ex.Message}");
         }
         finally
         {
             IsBusy = false;
+            StartupTrace.Write("RunSearchAsync end");
         }
     }
 
     private async Task SaveSettingsAsync()
     {
+        StartupTrace.Write("SaveSettingsAsync begin");
         if (_apiToken != null)
         {
             var resanitized = SanitizeToken(_apiToken);
@@ -217,6 +229,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         {
             Status = "API Token must start with 'BARS_'";
             LogLines.Add(Status);
+            StartupTrace.Write("SaveSettingsAsync invalid token");
             return;
         }
 
@@ -225,6 +238,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         // Update baseline so save button disables until another change
         _originalApiToken = _apiToken;
         (SaveTokenCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+        StartupTrace.Write("SaveSettingsAsync complete");
     }
 
     private async void AirportRowOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -234,8 +248,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
             _savedPackages[row.ICAO] = row.SelectedPackage.Name;
             // Fire and forget save to persist selection quickly without blocking UI
             try { SceneryService.Instance.SetSelectedPackage(row.ICAO, row.SelectedPackage.Name); } catch { }
-            try { await PersistSettingsAsync(); }
-            catch (Exception ex) { LogLines.Add(ex.Message); }
+            try { await PersistSettingsAsync(); StartupTrace.Write($"PersistSettingsAsync after selection {row.ICAO}"); }
+            catch (Exception ex) { LogLines.Add(ex.Message); StartupTrace.Write($"PersistSettingsAsync error: {ex.Message}"); }
         }
     }
 
@@ -275,6 +289,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
         {
             SimulatorName = "Not Connected";
             SimulatorConnected = false;
+            // If the simulator is disconnected, reset the displayed nearest airport to Unknown
+            ClosestAirport = "Unknown";
         }
     }
 
@@ -369,15 +385,18 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async Task PersistSettingsAsync()
     {
+        StartupTrace.Write("PersistSettingsAsync begin");
         await _settingsSaveGate.WaitAsync();
         try
         {
             var copy = new Dictionary<string, string>(_savedPackages, StringComparer.OrdinalIgnoreCase);
             await _settingsStore.SaveAsync(new ClientSettings(ApiToken, copy));
+            StartupTrace.Write("PersistSettingsAsync save complete");
         }
         finally
         {
             _settingsSaveGate.Release();
+            StartupTrace.Write("PersistSettingsAsync end");
         }
     }
 

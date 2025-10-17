@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using BARS_Client_V2.Application;
+using BARS_Client_V2.Infrastructure.Diagnostics;
 
 namespace BARS_Client_V2.Infrastructure.Settings;
 
@@ -38,11 +39,13 @@ internal sealed class JsonSettingsStore : ISettingsStore
 
     public async Task<ClientSettings> LoadAsync()
     {
+        StartupTrace.Write("JsonSettingsStore.LoadAsync enter");
         await SettingsFileAccess.Gate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (!File.Exists(_path)) return ClientSettings.Empty;
-            var json = await File.ReadAllTextAsync(_path);
+            StartupTrace.Write("JsonSettingsStore.LoadAsync reading file");
+            var json = await File.ReadAllTextAsync(_path).ConfigureAwait(false);
             var p = JsonSerializer.Deserialize<Persisted>(json, Options);
             if (p == null) return ClientSettings.Empty;
 
@@ -66,20 +69,24 @@ internal sealed class JsonSettingsStore : ISettingsStore
                 token = p.ApiToken;
             }
 
+            StartupTrace.Write("JsonSettingsStore.LoadAsync success");
             return new ClientSettings(token, p.AirportPackages ?? new());
         }
         catch
         {
+            StartupTrace.Write("JsonSettingsStore.LoadAsync exception");
             return ClientSettings.Empty;
         }
         finally
         {
+            StartupTrace.Write("JsonSettingsStore.LoadAsync exit");
             SettingsFileAccess.Gate.Release();
         }
     }
 
     public async Task SaveAsync(ClientSettings settings)
     {
+        StartupTrace.Write("JsonSettingsStore.SaveAsync enter");
         await SettingsFileAccess.Gate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -102,10 +109,12 @@ internal sealed class JsonSettingsStore : ISettingsStore
                 }
             }
             var json = JsonSerializer.Serialize(p, Options);
-            await File.WriteAllTextAsync(_path, json);
+            await File.WriteAllTextAsync(_path, json).ConfigureAwait(false);
+            StartupTrace.Write("JsonSettingsStore.SaveAsync success");
         }
         finally
         {
+            StartupTrace.Write("JsonSettingsStore.SaveAsync exit");
             SettingsFileAccess.Gate.Release();
         }
     }

@@ -1,4 +1,5 @@
-﻿using System.Windows;
+﻿using System;
+using System.Windows;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -7,7 +8,9 @@ using BARS_Client_V2.Domain;
 using BARS_Client_V2.Application; // Contains SimulatorManager; no conflict if fully qualified below
 using BARS_Client_V2.Presentation.ViewModels;
 using BARS_Client_V2.Services;
+using System.Threading.Tasks;
 using System.Windows.Threading;
+using BARS_Client_V2.Infrastructure.Diagnostics;
 
 namespace BARS_Client_V2
 {
@@ -18,6 +21,8 @@ namespace BARS_Client_V2
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
+            StartupTrace.Reset();
+            StartupTrace.Write("OnStartup begin");
             _host = Host.CreateDefaultBuilder()
                 .ConfigureLogging(lb =>
                 {
@@ -55,11 +60,20 @@ namespace BARS_Client_V2
                 .Build();
 
 
+            StartupTrace.Write("Host built");
+            StartupTrace.Write("Resolving MainWindow");
             var mainWindow = _host.Services.GetRequiredService<MainWindow>();
+            StartupTrace.Write("MainWindow resolved");
+            StartupTrace.Write("Resolving MainWindowViewModel");
             var vm = _host.Services.GetRequiredService<MainWindowViewModel>();
+            StartupTrace.Write("MainWindowViewModel resolved");
             mainWindow.DataContext = vm;
+            StartupTrace.Write("Resolving AirportWebSocketManager");
             var wsMgr = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>();
+            StartupTrace.Write("AirportWebSocketManager resolved");
+            StartupTrace.Write("Resolving AirportStateHub");
             var hub = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
+            StartupTrace.Write("Airport services resolved");
             wsMgr.AttachHub(hub);
             wsMgr.Connected += () => vm.NotifyServerConnected();
             wsMgr.ConnectionError += code => vm.NotifyServerError(code);
@@ -67,31 +81,48 @@ namespace BARS_Client_V2
             var pointController = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>();
             wsMgr.Disconnected += reason => { pointController.Suspend(); _ = pointController.DespawnAllAsync(); };
             wsMgr.Connected += () => pointController.Resume();
+            StartupTrace.Write("Event wiring complete");
             mainWindow.Show();
-            Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, async () =>
+            StartupTrace.Write("MainWindow shown");
+
+            if (_host != null)
             {
-                try
+                StartupTrace.Write("Starting host background task");
+                _ = Task.Run(async () =>
                 {
-                    if (_host != null)
+                    try
                     {
-                        await _host.StartAsync();
+                        StartupTrace.Write("Host StartAsync begin");
+                        await _host.StartAsync().ConfigureAwait(false);
+                        StartupTrace.Write("Host StartAsync complete");
                     }
-                }
-                catch
-                {
-                    // Swallow to avoid UI crash;
-                }
-            });
+                    catch (Exception ex)
+                    {
+                        StartupTrace.Write($"Host StartAsync error: {ex.Message}");
+                    }
+                });
+            }
         }
 
         protected override async void OnExit(ExitEventArgs e)
         {
+            StartupTrace.Write("OnExit begin");
             if (_host != null)
             {
-                try { await _host.StopAsync(); } catch { }
+                try
+                {
+                    await _host.StopAsync();
+                    StartupTrace.Write("Host StopAsync complete");
+                }
+                catch (Exception ex)
+                {
+                    StartupTrace.Write($"Host StopAsync error: {ex.Message}");
+                }
                 _host.Dispose();
+                StartupTrace.Write("Host disposed");
             }
             base.OnExit(e);
+            StartupTrace.Write("OnExit complete");
         }
     }
 
