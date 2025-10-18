@@ -9,7 +9,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-Write-Host "=== BARS Client Publish (Framework-Dependent) ===" -ForegroundColor Cyan
+Write-Host "=== BARS Client Publish ===" -ForegroundColor Cyan
 
 # Resolve paths
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -22,11 +22,13 @@ if (-not $distRoot) { New-Item -ItemType Directory -Path $OutRoot | Out-Null; $d
 # Determine version (priority: param -> <Version> -> <FileVersion> -> <AssemblyVersion>)
 if ($Version) {
     $resolvedVersion = $Version
-} else {
+}
+else {
     $raw = Get-Content $projectPath -Raw
     try {
         [xml]$csproj = $raw
-    } catch {
+    }
+    catch {
         Write-Warning "XML parse warning: $($_.Exception.Message)"
     }
     if ($csproj) {
@@ -64,7 +66,7 @@ if (-not $SkipBuild) {
     dotnet publish $projectPath `
         -c $Configuration `
         -r $Runtime `
-        --self-contained false `
+        --self-contained true `
         -p:PublishReadyToRun=true `
         -p:PublishSingleFile=false `
         -p:DebugType=portable
@@ -79,7 +81,7 @@ if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
 Copy-Item $publishDir $stageDir -Recurse
 
 # Remove unwanted files (patterns)
-Get-ChildItem -Path $stageDir -Recurse -Include *.pdb,*.xml | ForEach-Object { Remove-Item $_.FullName -Force }
+Get-ChildItem -Path $stageDir -Recurse -Include *.pdb, *.xml | ForEach-Object { Remove-Item $_.FullName -Force }
 
 # Generate file hash list
 $files = Get-ChildItem -Path $stageDir -File -Recurse | Sort-Object FullName
@@ -92,13 +94,13 @@ foreach ($f in $files) {
 }
 
 $manifest = [PSCustomObject]@{
-    appId = 'com.stopbars.barsclient'
-    name = 'BARS Client'
-    version = $version
-    runtime = $Runtime
+    appId              = 'com.stopbars.barsclient'
+    name               = 'BARS Client'
+    version            = $version
+    runtime            = $Runtime
     frameworkDependent = $true
-    publishedAt = (Get-Date).ToString('o')
-    files = $hashEntries
+    publishedAt        = (Get-Date).ToString('o')
+    files              = $hashEntries
 }
 
 $manifestPath = Join-Path $stageDir 'manifest.json'
@@ -112,11 +114,11 @@ Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -Forc
 
 # latest.json (pointer)
 $latest = [PSCustomObject]@{
-    version = $version
-    runtime = $Runtime
-    zip = $zipName
-    sha256 = (Get-FileHash $zipPath -Algorithm SHA256).Hash
-    manifest = 'manifest.json'
+    version     = $version
+    runtime     = $Runtime
+    zip         = $zipName
+    sha256      = (Get-FileHash $zipPath -Algorithm SHA256).Hash
+    manifest    = 'manifest.json'
     generatedAt = (Get-Date).ToString('o')
 }
 $latest | ConvertTo-Json -Depth 4 | Out-File (Join-Path $distRoot 'latest.json') -Encoding UTF8
