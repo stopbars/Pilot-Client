@@ -37,6 +37,8 @@ public sealed class SimulatorManager : BackgroundService
             try { await _active.DisconnectAsync(ct); } catch (Exception ex) { _logger.LogWarning(ex, "Error disconnecting previous simulator"); }
         }
 
+        ClearLatestState();
+
         if (await connector.ConnectAsync(ct))
         {
             lock (_lock) _active = connector;
@@ -59,6 +61,7 @@ public sealed class SimulatorManager : BackgroundService
             var active = ActiveConnector;
             if (active == null || !active.IsConnected)
             {
+                ClearLatestState();
                 // Attempt reconnect periodically when disconnected
                 if (first != null)
                 {
@@ -88,6 +91,14 @@ public sealed class SimulatorManager : BackgroundService
                 // small backoff
                 await Task.Delay(2000, stoppingToken);
             }
+        }
+    }
+
+    private void ClearLatestState()
+    {
+        lock (_lock)
+        {
+            _latest = null;
         }
     }
 }

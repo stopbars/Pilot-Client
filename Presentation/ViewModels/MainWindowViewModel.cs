@@ -257,11 +257,13 @@ public class MainWindowViewModel : INotifyPropertyChanged
     {
         var state = _simManager.LatestState;
         var connector = _simManager.ActiveConnector;
-        if (state != null)
+
+        if (state is { } sample)
         {
-            OnGround = state.OnGround;
-            Latitude = state.Latitude;
-            Longitude = state.Longitude;
+            OnGround = sample.OnGround;
+            Latitude = sample.Latitude;
+            Longitude = sample.Longitude;
+
             var cached = _nearestService.GetCachedNearest(Latitude, Longitude);
             if (cached != null)
             {
@@ -277,20 +279,30 @@ public class MainWindowViewModel : INotifyPropertyChanged
                         ClosestAirport = resolved;
                     }
                 }
-                catch { }
+                catch
+                {
+                }
             }
         }
-        if (connector != null && connector.IsConnected)
+        else
         {
-            SimulatorName = connector.DisplayName;
+            ClosestAirport = "Unknown";
+        }
+
+        var connectorReady = connector?.IsConnected == true;
+        if (connectorReady && state != null)
+        {
+            SimulatorName = connector!.DisplayName;
             SimulatorConnected = true;
         }
         else
         {
-            SimulatorName = "Not Connected";
             SimulatorConnected = false;
-            // If the simulator is disconnected, reset the displayed nearest airport to Unknown
-            ClosestAirport = "Unknown";
+            SimulatorName = "Not Connected";
+            if (!connectorReady)
+            {
+                ClosestAirport = "Unknown";
+            }
         }
     }
 

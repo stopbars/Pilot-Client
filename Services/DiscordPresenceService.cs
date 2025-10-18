@@ -126,12 +126,14 @@ internal sealed class DiscordPresenceService : BackgroundService
         }
         var connector = _simManager.ActiveConnector;
         string simCode = connector?.SimulatorId ?? "None";
-        bool simConnected = connector?.IsConnected == true;
+        bool connectorConnected = connector?.IsConnected == true;
+        bool hasFlightData = latest != null;
+        bool simConnected = connectorConnected && hasFlightData;
         bool? is2024 = null;
         if (connector is BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsSimulatorConnector msfsConn)
         {
             is2024 = msfsConn.IsMsfs2024;
-            if (simConnected)
+            if (connectorConnected)
             {
                 simCode = is2024 == true ? "MSFS 2024" : (is2024 == false ? "MSFS 2020" : "MSFS");
             }
