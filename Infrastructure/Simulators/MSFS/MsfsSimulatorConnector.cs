@@ -20,6 +20,7 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
     private const int PollDelayMs = 500; // faster polling for precise stopbar crossing detection
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(20);
     private readonly SemaphoreSlim _connectGate = new(1, 1);
+    private readonly SemaphoreSlim _simVarGate = new(1, 1);
     private double? _cachedGroundAltFeet;
     private DateTime _cachedGroundAltAt;
     private static readonly TimeSpan GroundAltCacheDuration = TimeSpan.FromSeconds(5);
@@ -139,24 +140,26 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             var svm = client.SimVars;
             if (svm == null) return null;
 
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            // Keep SimVar requests snappy so a slow sim doesn't block the stream loop
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(3));
-            var tkn = timeoutCts.Token;
+            await _simVarGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                // Keep SimVar requests snappy so a slow sim doesn't block the stream loop
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(3));
+                var tkn = timeoutCts.Token;
 
-            var latTask = svm.GetAsync<double>("PLANE LATITUDE", "degrees", cancellationToken: tkn);
-            var lonTask = svm.GetAsync<double>("PLANE LONGITUDE", "degrees", cancellationToken: tkn);
-            var grnTask = svm.GetAsync<int>("SIM ON GROUND", "bool", cancellationToken: tkn);
+                var lat = await svm.GetAsync<double>("PLANE LATITUDE", "degrees", cancellationToken: tkn).ConfigureAwait(false);
+                var lon = await svm.GetAsync<double>("PLANE LONGITUDE", "degrees", cancellationToken: tkn).ConfigureAwait(false);
+                var onGround = await svm.GetAsync<int>("SIM ON GROUND", "bool", cancellationToken: tkn).ConfigureAwait(false) == 1;
 
-            await Task.WhenAll(latTask, lonTask, grnTask).ConfigureAwait(false);
-
-            var lat = latTask.Result;
-            var lon = lonTask.Result;
-            var onGround = grnTask.Result == 1;
-
-            // success -> reset error budget
-            _consecutiveSampleErrors = 0;
-            return new RawFlightSample(lat, lon, onGround);
+                // success -> reset error budget
+                _consecutiveSampleErrors = 0;
+                return new RawFlightSample(lat, lon, onGround);
+            }
+            finally
+            {
+                _simVarGate.Release();
+            }
         }
         catch (OperationCanceledException oce)
         {
@@ -226,7 +229,15 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             {
                 try
                 {
-                    altitudeFeet = await client.SimVars.GetAsync<double>("PLANE ALTITUDE", "feet", cancellationToken: ct).ConfigureAwait(false);
+                    await _simVarGate.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        altitudeFeet = await client.SimVars.GetAsync<double>("PLANE ALTITUDE", "feet", cancellationToken: ct).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        _simVarGate.Release();
+                    }
                     _cachedGroundAltFeet = altitudeFeet;
                     _cachedGroundAltAt = now;
                 }

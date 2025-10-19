@@ -516,19 +516,37 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         pointId = null; slotIndex = null;
         if (o.UserData is string s && !string.IsNullOrEmpty(s))
         {
+            pointId = ExtractPointId(s);
+            if (pointId == null) return false;
             var sep = s.IndexOf('|');
-            if (sep < 0)
-            {
-                pointId = s; return true;
-            }
-            else
-            {
-                pointId = s.Substring(0, sep);
-                if (int.TryParse(s.Substring(sep + 1), out var idx)) slotIndex = idx;
-                return true;
-            }
+            if (sep >= 0 && int.TryParse(s.Substring(sep + 1), out var idx)) slotIndex = idx;
+            return true;
         }
         return false;
+    }
+
+    private bool IsOwnedObject(SimObject o)
+    {
+        if (o == null || !o.IsActive) return false;
+        if (_objectStateIds.ContainsKey(o.ObjectId)) return true;
+        if (o.UserData is string tag)
+        {
+            var pointId = ExtractPointId(tag);
+            if (!string.IsNullOrEmpty(pointId))
+            {
+                if (_latestStates.ContainsKey(pointId)) return true;
+                if (pointId.StartsWith("BARS_", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+        }
+        var title = o.ContainerTitle;
+        return !string.IsNullOrEmpty(title) && title.StartsWith("BARS_Light_", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? ExtractPointId(string tag)
+    {
+        if (string.IsNullOrWhiteSpace(tag)) return null;
+        var sep = tag.IndexOf('|');
+        return sep >= 0 ? tag[..sep] : tag;
     }
 
     private async Task RemoveWrongForSlotAsync(string pointId, int desiredState, int slotIndex, CancellationToken ct, string contextTag)
@@ -752,7 +770,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     {
         var mgr = GetManager();
         if (mgr == null) return 0;
-        return mgr.ManagedObjects.Values.Count(o => o.IsActive && o.ContainerTitle.StartsWith("BARS_Light_", StringComparison.OrdinalIgnoreCase));
+        return mgr.ManagedObjects.Values.Count(IsOwnedObject);
     }
 
     private sealed record LightLayout(double Latitude, double Longitude, double? Heading, string? Color, int? StateId, int? OffStateId);
@@ -905,7 +923,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             _logger.LogInformation("[DespawnAll] AI manager not available");
             return;
         }
-        var ours = mgr.ManagedObjects.Values.Where(o => o.IsActive && o.ContainerTitle.StartsWith("BARS_Light_", StringComparison.OrdinalIgnoreCase)).ToList();
+        var ours = mgr.ManagedObjects.Values.Where(IsOwnedObject).ToList();
         if (ours.Count == 0)
         {
             _logger.LogInformation("[DespawnAll] No active lights to remove");
