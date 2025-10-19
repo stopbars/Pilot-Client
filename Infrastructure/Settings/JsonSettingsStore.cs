@@ -27,6 +27,7 @@ internal sealed class JsonSettingsStore : ISettingsStore
     {
         public string? ApiToken { get; set; }
         public Dictionary<string, string>? AirportPackages { get; set; }
+        public bool AutoMinimizeOnStart { get; set; }
     }
 
     public JsonSettingsStore()
@@ -70,7 +71,7 @@ internal sealed class JsonSettingsStore : ISettingsStore
             }
 
             StartupTrace.Write("JsonSettingsStore.LoadAsync success");
-            return new ClientSettings(token, p.AirportPackages ?? new());
+            return new ClientSettings(token, p.AirportPackages ?? new(), p.AutoMinimizeOnStart);
         }
         catch
         {
@@ -92,7 +93,8 @@ internal sealed class JsonSettingsStore : ISettingsStore
         {
             var p = new Persisted
             {
-                AirportPackages = settings.AirportPackages != null ? new Dictionary<string, string>(settings.AirportPackages) : new()
+                AirportPackages = settings.AirportPackages != null ? new Dictionary<string, string>(settings.AirportPackages) : new(),
+                AutoMinimizeOnStart = settings.AutoMinimizeOnStart
             };
 
             if (!string.IsNullOrWhiteSpace(settings.ApiToken))

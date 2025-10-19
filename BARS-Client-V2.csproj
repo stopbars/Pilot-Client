@@ -14,7 +14,6 @@
     <FileVersion>2.0.0</FileVersion>
     <AssemblyVersion>2.0.0</AssemblyVersion>
     <PackageId>BARS-Client</PackageId>
-    <!-- Deployment / Publish settings -->
     <SelfContained>false</SelfContained>
     <PublishReadyToRun>true</PublishReadyToRun>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
@@ -26,7 +25,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="appicon.ico" />
+    <Resource Include="appicon.ico" />
   </ItemGroup>
 
   <!-- Exclude PDB files from publish output explicitly (belt & suspenders) -->
@@ -40,6 +39,7 @@
     <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.10" />
     <PackageReference Include="DiscordRichPresence" Version="1.6.1.70" />
     <PackageReference Include="SimConnect.NET" Version="0.1.15-beta" />
+    <PackageReference Include="H.NotifyIcon.Wpf" Version="2.3.1" />
   </ItemGroup>
 
   <ItemGroup>

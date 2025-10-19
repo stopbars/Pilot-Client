@@ -12,7 +12,7 @@
         Background="#1E1E1E"
         FontFamily="Segoe UI"
         WindowStartupLocation="CenterScreen"
-        ResizeMode="NoResize">
+        ResizeMode="CanMinimize">
 
     <Window.Resources>
         <!-- Converters -->

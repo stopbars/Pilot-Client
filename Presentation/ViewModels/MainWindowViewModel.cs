@@ -38,6 +38,9 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private bool _isBusy;
     private bool _serverConnected; // backend websocket
     private DateTime _lastServerMessageUtc;
+    private bool _autoMinimizeOnStart;
+    private ClientSettings? _preloadedSettings;
+    private bool _initializationStarted;
 
     public ObservableCollection<AirportRowViewModel> Airports { get; } = new();
 
@@ -83,6 +86,17 @@ public class MainWindowViewModel : INotifyPropertyChanged
     }
     public string Status { get => _status; private set { if (value != _status) { _status = value; OnPropertyChanged(); } } }
     public bool IsBusy { get => _isBusy; private set { if (value != _isBusy) { _isBusy = value; OnPropertyChanged(); } } }
+    public bool AutoMinimizeOnStart
+    {
+        get => _autoMinimizeOnStart;
+        set
+        {
+            if (value == _autoMinimizeOnStart) return;
+            _autoMinimizeOnStart = value;
+            OnPropertyChanged();
+            _ = PersistSettingsAsync();
+        }
+    }
     public int CurrentPage { get => _currentPage; private set { if (value != _currentPage) { _currentPage = value; OnPropertyChanged(); OnPropertyChanged(nameof(PageInfo)); UpdatePagingCommands(); } } }
     public int TotalCount { get => _totalCount; private set { if (value != _totalCount) { _totalCount = value; OnPropertyChanged(); OnPropertyChanged(nameof(PageInfo)); UpdatePagingCommands(); } } }
     public string PageInfo => $"Page {CurrentPage} of {Math.Max(1, (int)Math.Ceiling(TotalCount / (double)_pageSize))}";
@@ -112,15 +126,38 @@ public class MainWindowViewModel : INotifyPropertyChanged
         NextPageCommand = new DelegateCommand(async _ => { CurrentPage++; await RunSearchAsync(); }, _ => CanChangePage(+1));
         PrevPageCommand = new DelegateCommand(async _ => { CurrentPage--; await RunSearchAsync(); }, _ => CanChangePage(-1));
         SaveTokenCommand = new DelegateCommand(async _ => await SaveSettingsAsync(), _ => CanSaveToken());
-
-        // Kick off async load of settings + initial data
-        _ = InitializeAsync();
     }
 
-    private async Task InitializeAsync()
+    public void SeedSettings(ClientSettings settings)
     {
+        _preloadedSettings = settings;
+        _autoMinimizeOnStart = settings.AutoMinimizeOnStart;
+        OnPropertyChanged(nameof(AutoMinimizeOnStart));
+    }
+
+    public async Task InitializeAsync()
+    {
+        if (_initializationStarted)
+        {
+            return;
+        }
+        _initializationStarted = true;
         StartupTrace.Write("InitializeAsync start");
-        var settings = await _settingsStore.LoadAsync();
+        ClientSettings settings;
+        if (_preloadedSettings is { } preloaded)
+        {
+            settings = preloaded;
+            _preloadedSettings = null;
+        }
+        else
+        {
+            settings = await _settingsStore.LoadAsync();
+        }
+        if (_autoMinimizeOnStart != settings.AutoMinimizeOnStart)
+        {
+            _autoMinimizeOnStart = settings.AutoMinimizeOnStart;
+            OnPropertyChanged(nameof(AutoMinimizeOnStart));
+        }
         // Sanitize and store original token baseline
         _originalApiToken = SanitizeToken(settings.ApiToken);
         _apiToken = _originalApiToken; // set backing field directly to avoid redundant raise
@@ -402,7 +439,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         try
         {
             var copy = new Dictionary<string, string>(_savedPackages, StringComparer.OrdinalIgnoreCase);
-            await _settingsStore.SaveAsync(new ClientSettings(ApiToken, copy));
+            await _settingsStore.SaveAsync(new ClientSettings(ApiToken, copy, _autoMinimizeOnStart));
             StartupTrace.Write("PersistSettingsAsync save complete");
         }
         finally
