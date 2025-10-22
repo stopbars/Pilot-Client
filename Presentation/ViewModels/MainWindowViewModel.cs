@@ -20,6 +20,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private readonly SimulatorManager _simManager;
     private readonly DispatcherTimer _uiPoll;
     private readonly DispatcherTimer _serverTimer;
+    private readonly DispatcherTimer _searchDebounce;
     private string _closestAirport = "Unknown";
     private bool _onGround;
     private string _simulatorName = "Not Connected";
@@ -32,6 +33,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private int _currentPage = 1;
     private int _totalCount;
     private string? _searchText;
+    private bool _resetPageOnNextSearch;
     private string? _apiToken;
     private string? _originalApiToken; // tracks last saved (sanitized) token
     private string _status = "Ready";
@@ -69,7 +71,21 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private readonly INearestAirportService _nearestService;
     private readonly SemaphoreSlim _settingsSaveGate = new(1, 1);
 
-    public string? SearchText { get => _searchText; set { if (value != _searchText) { _searchText = value; OnPropertyChanged(); } } }
+    public string? SearchText
+    {
+        get => _searchText;
+        set
+        {
+            if (value == _searchText)
+            {
+                return;
+            }
+
+            _searchText = value;
+            OnPropertyChanged();
+            ScheduleSearch(resetPage: true);
+        }
+    }
     public string? ApiToken
     {
         get => _apiToken;
@@ -102,7 +118,6 @@ public class MainWindowViewModel : INotifyPropertyChanged
     public string PageInfo => $"Page {CurrentPage} of {Math.Max(1, (int)Math.Ceiling(TotalCount / (double)_pageSize))}";
 
     // Commands (simple DelegateCommand implementation inline)
-    public ICommand SearchCommand { get; }
     public ICommand NextPageCommand { get; }
     public ICommand PrevPageCommand { get; }
     public ICommand SaveTokenCommand { get; }
@@ -122,7 +137,9 @@ public class MainWindowViewModel : INotifyPropertyChanged
         _serverTimer.Tick += ServerTimerOnTick;
         _serverTimer.Start();
 
-        SearchCommand = new DelegateCommand(async _ => await RunSearchAsync(resetPage: true));
+        _searchDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(75) };
+        _searchDebounce.Tick += SearchDebounceOnTick;
+
         NextPageCommand = new DelegateCommand(async _ => { CurrentPage++; await RunSearchAsync(); }, _ => CanChangePage(+1));
         PrevPageCommand = new DelegateCommand(async _ => { CurrentPage--; await RunSearchAsync(); }, _ => CanChangePage(-1));
         SaveTokenCommand = new DelegateCommand(async _ => await SaveSettingsAsync(), _ => CanSaveToken());
@@ -174,6 +191,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     }
 
     private IDictionary<string, string> _savedPackages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private bool _suppressSelectionNotifications;
 
     private bool CanChangePage(int delta)
     {
@@ -190,45 +208,88 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async Task RunSearchAsync(bool resetPage = false)
     {
+        _searchDebounce.Stop();
         StartupTrace.Write($"RunSearchAsync begin reset={resetPage}");
-        if (IsBusy) return;
+        if (IsBusy)
+        {
+            ScheduleSearch(resetPage);
+            return;
+        }
+
         try
         {
             IsBusy = true;
             Status = "Searching...";
             if (resetPage) CurrentPage = 1;
+
             var (items, total) = await _airportRepo.SearchAsync(SearchText, CurrentPage, _pageSize);
             StartupTrace.Write($"RunSearchAsync results items={items.Count} total={total}");
             TotalCount = total;
-            Airports.Clear();
-            var packagesChanged = false;
-            foreach (var a in items)
+
+            if (IsContentUnchanged(items))
             {
-                var row = new AirportRowViewModel(a);
-                if (_savedPackages.TryGetValue(a.ICAO, out var pkgName))
-                {
-                    var match = a.SceneryPackages.FirstOrDefault(p => p.Name == pkgName);
-                    if (match != null) row.SelectedPackage = match;
-                }
-                // Auto-select first package if none stored/selected (always at least one per requirements)
-                if (row.SelectedPackage == null && a.SceneryPackages.Count > 0)
-                {
-                    var defaultPackage = a.SceneryPackages.First();
-                    row.SelectedPackage = defaultPackage;
-                    var needsUpdate = !_savedPackages.TryGetValue(a.ICAO, out var existing) || !string.Equals(existing, defaultPackage.Name, StringComparison.Ordinal);
-                    if (needsUpdate)
-                    {
-                        _savedPackages[a.ICAO] = defaultPackage.Name;
-                        packagesChanged = true;
-                        try { SceneryService.Instance.SetSelectedPackage(a.ICAO, defaultPackage.Name); } catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
-                    }
-                }
-                row.PropertyChanged += AirportRowOnPropertyChanged;
-                Airports.Add(row);
+                Status = $"Loaded {Airports.Count} airports";
+                UpdatePagingCommands();
+                return;
             }
+
+            var packagesChanged = false;
+            var existingByIcao = Airports.ToDictionary(r => r.ICAO, StringComparer.OrdinalIgnoreCase);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            for (var i = 0; i < items.Count; i++)
+            {
+                var airport = items[i];
+                seen.Add(airport.ICAO);
+
+                if (i < Airports.Count && string.Equals(Airports[i].ICAO, airport.ICAO, StringComparison.OrdinalIgnoreCase))
+                {
+                    var row = Airports[i];
+                    row.UpdateSource(airport);
+                    packagesChanged |= SyncPackageSelection(row, airport);
+                    continue;
+                }
+
+                if (existingByIcao.TryGetValue(airport.ICAO, out var existingRow))
+                {
+                    var currentIndex = Airports.IndexOf(existingRow);
+                    if (currentIndex != i)
+                    {
+                        Airports.Move(currentIndex, i);
+                    }
+                    existingRow.UpdateSource(airport);
+                    packagesChanged |= SyncPackageSelection(existingRow, airport);
+                    continue;
+                }
+
+                var newRow = new AirportRowViewModel(airport);
+                newRow.PropertyChanged += AirportRowOnPropertyChanged;
+                if (i <= Airports.Count)
+                {
+                    Airports.Insert(i, newRow);
+                }
+                else
+                {
+                    Airports.Add(newRow);
+                }
+                packagesChanged |= SyncPackageSelection(newRow, airport);
+            }
+
+            for (var index = Airports.Count - 1; index >= 0; index--)
+            {
+                var row = Airports[index];
+                if (seen.Contains(row.ICAO))
+                {
+                    continue;
+                }
+
+                row.PropertyChanged -= AirportRowOnPropertyChanged;
+                Airports.RemoveAt(index);
+            }
+
             Status = $"Loaded {Airports.Count} airports";
-            // Refresh command enable states after data load/page change
             UpdatePagingCommands();
+
             if (packagesChanged)
             {
                 await PersistSettingsAsync();
@@ -246,6 +307,102 @@ public class MainWindowViewModel : INotifyPropertyChanged
             IsBusy = false;
             StartupTrace.Write("RunSearchAsync end");
         }
+    }
+
+    private bool IsContentUnchanged(IReadOnlyList<BARS_Client_V2.Domain.Airport> items)
+    {
+        if (Airports.Count != items.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < items.Count; i++)
+        {
+            if (!Airports[i].IsEquivalentTo(items[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private bool SyncPackageSelection(AirportRowViewModel row, BARS_Client_V2.Domain.Airport airport)
+    {
+        var changed = false;
+        var selectionChanged = false;
+
+        if (_savedPackages.TryGetValue(airport.ICAO, out var savedPackage))
+        {
+            var match = airport.SceneryPackages.FirstOrDefault(p => string.Equals(p.Name, savedPackage, StringComparison.Ordinal));
+            if (match != null)
+            {
+                selectionChanged = !string.Equals(row.SelectedPackage?.Name, match.Name, StringComparison.Ordinal);
+                if (selectionChanged || !ReferenceEquals(row.SelectedPackage, match))
+                {
+                    _suppressSelectionNotifications = true;
+                    try { row.SelectedPackage = match; }
+                    finally { _suppressSelectionNotifications = false; }
+                }
+
+                if (selectionChanged)
+                {
+                    try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, match.Name); }
+                    catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
+                }
+
+                return changed;
+            }
+
+            _savedPackages.Remove(airport.ICAO);
+            changed = true;
+        }
+
+        if (airport.SceneryPackages.Count > 0)
+        {
+            var defaultPackage = airport.SceneryPackages[0];
+            selectionChanged = !string.Equals(row.SelectedPackage?.Name, defaultPackage.Name, StringComparison.Ordinal);
+
+            if (selectionChanged || !ReferenceEquals(row.SelectedPackage, defaultPackage))
+            {
+                _suppressSelectionNotifications = true;
+                try { row.SelectedPackage = defaultPackage; }
+                finally { _suppressSelectionNotifications = false; }
+            }
+
+            if (!_savedPackages.TryGetValue(airport.ICAO, out var existing) || !string.Equals(existing, defaultPackage.Name, StringComparison.Ordinal))
+            {
+                _savedPackages[airport.ICAO] = defaultPackage.Name;
+                changed = true;
+            }
+
+            if (selectionChanged)
+            {
+                try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, defaultPackage.Name); }
+                catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
+            }
+        }
+
+        return changed;
+    }
+
+    private void ScheduleSearch(bool resetPage)
+    {
+        if (resetPage)
+        {
+            _resetPageOnNextSearch = true;
+        }
+
+        _searchDebounce.Stop();
+        _searchDebounce.Start();
+    }
+
+    private async void SearchDebounceOnTick(object? sender, EventArgs e)
+    {
+        _searchDebounce.Stop();
+        var reset = _resetPageOnNextSearch;
+        _resetPageOnNextSearch = false;
+        await RunSearchAsync(reset);
     }
 
     private async Task SaveSettingsAsync()
@@ -280,11 +437,17 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async void AirportRowOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (_suppressSelectionNotifications)
+        {
+            return;
+        }
+
         if (e.PropertyName == nameof(AirportRowViewModel.SelectedPackage) && sender is AirportRowViewModel row && row.SelectedPackage != null)
         {
             _savedPackages[row.ICAO] = row.SelectedPackage.Name;
             // Fire and forget save to persist selection quickly without blocking UI
-            try { SceneryService.Instance.SetSelectedPackage(row.ICAO, row.SelectedPackage.Name); } catch { }
+            try { SceneryService.Instance.SetSelectedPackage(row.ICAO, row.SelectedPackage.Name); }
+            catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
             try { await PersistSettingsAsync(); StartupTrace.Write($"PersistSettingsAsync after selection {row.ICAO}"); }
             catch (Exception ex) { LogLines.Add(ex.Message); StartupTrace.Write($"PersistSettingsAsync error: {ex.Message}"); }
         }
@@ -464,14 +627,37 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
 public sealed class AirportRowViewModel : INotifyPropertyChanged
 {
-    private readonly BARS_Client_V2.Domain.Airport _airport;
+    private BARS_Client_V2.Domain.Airport _airport;
     private BARS_Client_V2.Domain.SceneryPackage? _selected;
     public string ICAO => _airport.ICAO;
     public IReadOnlyList<BARS_Client_V2.Domain.SceneryPackage> SceneryPackages => _airport.SceneryPackages;
     public BARS_Client_V2.Domain.SceneryPackage? SelectedPackage { get => _selected; set { if (value != _selected) { _selected = value; OnPropertyChanged(); } } }
     public AirportRowViewModel(BARS_Client_V2.Domain.Airport airport) { _airport = airport; }
+    public bool IsEquivalentTo(BARS_Client_V2.Domain.Airport airport) => string.Equals(_airport.ICAO, airport.ICAO, StringComparison.OrdinalIgnoreCase) && PackagesEqual(_airport.SceneryPackages, airport.SceneryPackages);
+    public void UpdateSource(BARS_Client_V2.Domain.Airport airport)
+    {
+        var packagesChanged = !PackagesEqual(_airport.SceneryPackages, airport.SceneryPackages);
+        _airport = airport;
+        if (packagesChanged)
+        {
+            OnPropertyChanged(nameof(SceneryPackages));
+        }
+    }
     public event PropertyChangedEventHandler? PropertyChanged;
     private void OnPropertyChanged([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    private static bool PackagesEqual(IReadOnlyList<BARS_Client_V2.Domain.SceneryPackage> left, IReadOnlyList<BARS_Client_V2.Domain.SceneryPackage> right)
+    {
+        if (ReferenceEquals(left, right)) return true;
+        if (left.Count != right.Count) return false;
+        for (var i = 0; i < left.Count; i++)
+        {
+            if (!string.Equals(left[i].Name, right[i].Name, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
 }
 
 internal sealed class DelegateCommand : ICommand

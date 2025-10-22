@@ -556,15 +556,17 @@
                TargetType="Border">
             <Setter Property="Opacity"
                     Value="0"/>
-            <Setter Property="RenderTransformOrigin"
-                    Value="0.5,0.5"/>
             <Setter Property="RenderTransform">
                 <Setter.Value>
-                    <TransformGroup>
-                        <ScaleTransform ScaleX="0.985"
-                                        ScaleY="0.985"/>
-                        <TranslateTransform Y="12"/>
-                    </TransformGroup>
+                    <TranslateTransform Y="16"/>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="Effect">
+                <Setter.Value>
+                    <DropShadowEffect Color="#FF000000"
+                                      BlurRadius="14"
+                                      ShadowDepth="0"
+                                      Opacity="0"/>
                 </Setter.Value>
             </Setter>
             <Style.Triggers>
@@ -572,31 +574,25 @@
                     <BeginStoryboard>
                         <Storyboard>
                             <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                             From="0"
                                              To="1"
-                                             Duration="0:0:0.35">
+                                             Duration="0:0:0.22">
                                 <DoubleAnimation.EasingFunction>
-                                    <CubicEase EasingMode="EaseOut"/>
+                                    <QuadraticEase EasingMode="EaseOut"/>
                                 </DoubleAnimation.EasingFunction>
                             </DoubleAnimation>
-                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)"
-                                             To="1"
-                                             Duration="0:0:0.35">
-                                <DoubleAnimation.EasingFunction>
-                                    <CubicEase EasingMode="EaseOut"/>
-                                </DoubleAnimation.EasingFunction>
-                            </DoubleAnimation>
-                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleY)"
-                                             To="1"
-                                             Duration="0:0:0.35">
-                                <DoubleAnimation.EasingFunction>
-                                    <CubicEase EasingMode="EaseOut"/>
-                                </DoubleAnimation.EasingFunction>
-                            </DoubleAnimation>
-                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[1].(TranslateTransform.Y)"
+                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.Y)"
                                              To="0"
-                                             Duration="0:0:0.35">
+                                             Duration="0:0:0.26">
                                 <DoubleAnimation.EasingFunction>
-                                    <CubicEase EasingMode="EaseOut"/>
+                                    <QuinticEase EasingMode="EaseOut"/>
+                                </DoubleAnimation.EasingFunction>
+                            </DoubleAnimation>
+                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.Effect).(DropShadowEffect.Opacity)"
+                                             To="0.12"
+                                             Duration="0:0:0.26">
+                                <DoubleAnimation.EasingFunction>
+                                    <QuadraticEase EasingMode="EaseOut"/>
                                 </DoubleAnimation.EasingFunction>
                             </DoubleAnimation>
                         </Storyboard>
@@ -757,12 +753,7 @@
                 <TextBlock Text="Search Airports"
                            Margin="0,0,0,5"/>
                 <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
                     <TextBox x:Name="SearchAirportsTextBox"
-                             Grid.Column="0"
                              Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}">
                         <TextBox.Style>
                             <Style TargetType="TextBox"
@@ -807,12 +798,6 @@
                             </Style>
                         </TextBox.Style>
                     </TextBox>
-                    <Button x:Name="SearchButton"
-                            Grid.Column="1"
-                            Content="Search"
-                            Width="60"
-                            Margin="5,0,0,0"
-                            Command="{Binding SearchCommand}"/>
                 </Grid>
             </StackPanel>
         </StackPanel>
