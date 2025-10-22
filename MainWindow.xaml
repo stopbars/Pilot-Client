@@ -294,6 +294,7 @@
                     <ControlTemplate TargetType="ComboBox">
                         <Grid>
                             <ToggleButton x:Name="ToggleButton"
+                                          Cursor="Hand"
                                           BorderBrush="{TemplateBinding BorderBrush}"
                                           Background="{TemplateBinding Background}"
                                           Foreground="{TemplateBinding Foreground}"
@@ -434,6 +435,7 @@
                     <ControlTemplate TargetType="ComboBox">
                         <Grid>
                             <ToggleButton x:Name="ToggleButton"
+                                          Cursor="Hand"
                                           BorderBrush="{TemplateBinding BorderBrush}"
                                           Background="{TemplateBinding Background}"
                                           Foreground="{TemplateBinding Foreground}"
