@@ -861,8 +861,10 @@
                                                    Padding="8,8,5,8"
                                                    VerticalAlignment="Center"/>
                                         <Border Grid.Column="1"
-                                                Padding="5,5">
-                                            <ComboBox Width="440"
+                                                Padding="5,5"
+                                                HorizontalAlignment="Stretch">
+                                            <ComboBox HorizontalAlignment="Stretch"
+                                                      MinWidth="460"
                                                       ItemsSource="{Binding SceneryPackages}"
                                                       SelectedItem="{Binding SelectedPackage, Mode=TwoWay}"
                                                       DisplayMemberPath="Name"

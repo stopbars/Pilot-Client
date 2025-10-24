@@ -630,17 +630,28 @@ public sealed class AirportRowViewModel : INotifyPropertyChanged
     private BARS_Client_V2.Domain.Airport _airport;
     private BARS_Client_V2.Domain.SceneryPackage? _selected;
     public string ICAO => _airport.ICAO;
+    public string? Name => _airport.Name;
     public IReadOnlyList<BARS_Client_V2.Domain.SceneryPackage> SceneryPackages => _airport.SceneryPackages;
     public BARS_Client_V2.Domain.SceneryPackage? SelectedPackage { get => _selected; set { if (value != _selected) { _selected = value; OnPropertyChanged(); } } }
     public AirportRowViewModel(BARS_Client_V2.Domain.Airport airport) { _airport = airport; }
-    public bool IsEquivalentTo(BARS_Client_V2.Domain.Airport airport) => string.Equals(_airport.ICAO, airport.ICAO, StringComparison.OrdinalIgnoreCase) && PackagesEqual(_airport.SceneryPackages, airport.SceneryPackages);
+    public bool IsEquivalentTo(BARS_Client_V2.Domain.Airport airport) =>
+        string.Equals(_airport.ICAO, airport.ICAO, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(_airport.Name ?? string.Empty, airport.Name ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+        && PackagesEqual(_airport.SceneryPackages, airport.SceneryPackages);
     public void UpdateSource(BARS_Client_V2.Domain.Airport airport)
     {
         var packagesChanged = !PackagesEqual(_airport.SceneryPackages, airport.SceneryPackages);
+        var currentName = _airport.Name ?? string.Empty;
+        var newName = airport.Name ?? string.Empty;
+        var nameChanged = !string.Equals(currentName, newName, StringComparison.OrdinalIgnoreCase);
         _airport = airport;
         if (packagesChanged)
         {
             OnPropertyChanged(nameof(SceneryPackages));
+        }
+        if (nameChanged)
+        {
+            OnPropertyChanged(nameof(Name));
         }
     }
     public event PropertyChangedEventHandler? PropertyChanged;

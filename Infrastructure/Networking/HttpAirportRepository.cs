@@ -58,30 +58,108 @@ internal sealed class HttpAirportRepository : IAirportRepository
         // Group by airport -> collect distinct package names
         var grouped = data.contributions
             .GroupBy(c => c.airportIcao.Trim().ToUpperInvariant())
-            .Select(g => new Airport(
-                g.Key,
-                g.Select(c => c.packageName)
-                 .Where(p => !string.IsNullOrWhiteSpace(p))
-                 .Select(p => new SceneryPackage(p.Trim()))
-                 .DistinctBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
-                 .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
-                 .ToList()))
+            .Select(g => new
+            {
+                ICAO = g.Key,
+                Packages = g.Select(c => c.packageName)
+                             .Where(p => !string.IsNullOrWhiteSpace(p))
+                             .Select(p => new SceneryPackage(p.Trim()))
+                             .DistinctBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                             .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                             .ToList()
+            })
+            .ToList();
+
+        var airportNames = await FetchAirportNamesAsync(client, grouped.Select(g => g.ICAO), ct);
+
+        var airports = grouped
+            .Select(g =>
+            {
+                airportNames.TryGetValue(g.ICAO, out var name);
+                return new Airport(g.ICAO, name, g.Packages);
+            })
             .ToList();
 
         if (!string.IsNullOrWhiteSpace(search))
         {
             var s = search.Trim();
-            grouped = grouped.Where(a => a.ICAO.Contains(s, StringComparison.OrdinalIgnoreCase) || a.SceneryPackages.Any(p => p.Name.Contains(s, StringComparison.OrdinalIgnoreCase)))
-                             .ToList();
+            airports = airports.Where(a =>
+                    a.ICAO.Contains(s, StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrWhiteSpace(a.Name) && a.Name.Contains(s, StringComparison.OrdinalIgnoreCase)) ||
+                    a.SceneryPackages.Any(p => p.Name.Contains(s, StringComparison.OrdinalIgnoreCase)))
+                               .ToList();
         }
 
-        var total = grouped.Count;
-        var items = grouped
+        var total = airports.Count;
+        var items = airports
             .OrderBy(a => a.ICAO, StringComparer.OrdinalIgnoreCase)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToList();
 
         return (items, total);
+    }
+
+    private sealed class AirportMetadataDto
+    {
+        public string? Icao { get; set; }
+        public string? Name { get; set; }
+    }
+
+    private async Task<Dictionary<string, string>> FetchAirportNamesAsync(HttpClient client, IEnumerable<string> icaos, CancellationToken ct)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var distinct = icaos
+            .Where(i => !string.IsNullOrWhiteSpace(i))
+            .Select(i => i.Trim().ToUpperInvariant())
+            .Where(i => i.Length == 4)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (distinct.Length == 0)
+        {
+            return result;
+        }
+
+        const int batchSize = 50;
+        foreach (var batch in distinct.Chunk(batchSize))
+        {
+            var payload = string.Join(",", batch);
+            if (string.IsNullOrEmpty(payload))
+            {
+                continue;
+            }
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, $"https://v2.stopbars.com/airports?icao={payload}");
+            using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                continue;
+            }
+
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            var data = await JsonSerializer.DeserializeAsync<Dictionary<string, AirportMetadataDto>>(stream, _jsonOptions, ct);
+            if (data == null)
+            {
+                continue;
+            }
+
+            foreach (var entry in data)
+            {
+                if (string.IsNullOrWhiteSpace(entry.Key))
+                {
+                    continue;
+                }
+
+                var icao = entry.Key.Trim().ToUpperInvariant();
+                var name = entry.Value?.Name;
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    result[icao] = name.Trim();
+                }
+            }
+        }
+
+        return result;
     }
 }
