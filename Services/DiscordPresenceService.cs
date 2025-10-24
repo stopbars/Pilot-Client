@@ -31,6 +31,8 @@ internal sealed class DiscordPresenceService : BackgroundService
     private string _serverStatus = "Disconnected";
     private DateTime _lastSendUtc = DateTime.MinValue;
     private bool _forceUpdate;
+    private volatile bool _isEnabled = true;
+    private bool _presenceCleared;
 
     // Rate limiting thresholds
     private static readonly TimeSpan MinUpdateInterval = TimeSpan.FromSeconds(12);
@@ -97,6 +99,11 @@ internal sealed class DiscordPresenceService : BackgroundService
     {
         var client = _client;
         if (client == null || !client.IsInitialized) return;
+        if (!_isEnabled)
+        {
+            EnsurePresenceCleared(client);
+            return;
+        }
         string airport = "";
         var latest = _simManager.LatestState;
         if (latest != null)
@@ -139,7 +146,6 @@ internal sealed class DiscordPresenceService : BackgroundService
             }
         }
 
-        // Choose small image key for MSFS variants (prefer 2024 if ID indicates such in future; using msfs2020 for now)
         string? smallKey = null;
         if (simConnected)
         {
@@ -213,6 +219,105 @@ internal sealed class DiscordPresenceService : BackgroundService
         {
             _logger.LogDebug(ex, "Failed to set Discord presence");
         }
+    }
+
+    private void EnsurePresenceCleared(DiscordRpcClient client)
+    {
+        var shouldClear = false;
+        lock (_stateLock)
+        {
+            if (_presenceCleared)
+            {
+                return;
+            }
+
+            _presenceCleared = true;
+            _lastDetails = null;
+            _lastState = null;
+            _lastSmallKey = null;
+            _lastSmallText = null;
+            _lastLargeText = null;
+            _lastSendUtc = DateTime.MinValue;
+            _forceUpdate = false;
+            shouldClear = true;
+        }
+
+        if (!shouldClear)
+        {
+            return;
+        }
+
+        try
+        {
+            client.ClearPresence();
+            _logger.LogDebug("Discord presence cleared");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to clear Discord presence while disabled");
+        }
+    }
+
+    public bool IsEnabled => _isEnabled;
+
+    public void SetEnabled(bool enabled)
+    {
+        DiscordRpcClient? clientToClear = null;
+        var stateChanged = false;
+
+        lock (_stateLock)
+        {
+            if (_isEnabled == enabled)
+            {
+                return;
+            }
+
+            _isEnabled = enabled;
+            _forceUpdate = true;
+            _lastSendUtc = DateTime.MinValue;
+            stateChanged = true;
+
+            if (enabled)
+            {
+                _presenceCleared = false;
+            }
+            else
+            {
+                clientToClear = _client;
+            }
+        }
+
+        if (!stateChanged)
+        {
+            return;
+        }
+
+        if (enabled)
+        {
+            QueueImmediate();
+            _logger.LogInformation("Discord Rich Presence enabled");
+            return;
+        }
+
+        if (clientToClear != null)
+        {
+            EnsurePresenceCleared(clientToClear);
+        }
+        else
+        {
+            lock (_stateLock)
+            {
+                _presenceCleared = true;
+                _lastDetails = null;
+                _lastState = null;
+                _lastSmallKey = null;
+                _lastSmallText = null;
+                _lastLargeText = null;
+                _forceUpdate = false;
+            }
+        }
+
+        _logger.LogInformation("Discord Rich Presence disabled");
     }
 
     public override Task StopAsync(CancellationToken cancellationToken)

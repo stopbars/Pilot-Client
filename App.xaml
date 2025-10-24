@@ -20,6 +20,11 @@
                                   Tag="AutoMinimizeToggle"
                                   IsCheckable="True"
                                   Click="TaskbarIcon_AutoMinimizeMenuItem_OnClick"/>
+                        <MenuItem Header="Discord Rich Presence"
+                                  Tag="DiscordPresenceToggle"
+                                  IsCheckable="True"
+                                  IsChecked="True"
+                                  Click="TaskbarIcon_DiscordPresenceMenuItem_OnClick"/>
                         <Separator/>
                         <MenuItem Header="Exit"
                                   Click="TaskbarIcon_ExitMenuItem_OnClick"/>

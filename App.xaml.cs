@@ -24,9 +24,12 @@ namespace BARS_Client_V2
         private MainWindow? _mainWindow;
         private ContextMenu? _trayContextMenu;
         private MenuItem? _autoMinimizeMenuItem;
+        private MenuItem? _discordPresenceMenuItem;
+        private DiscordPresenceService? _discordPresenceService;
         private bool _startupAutoMinimizeRequested;
         private MainWindowViewModel? _mainWindowViewModel;
         private bool _suppressStateChanged;
+        private bool _startupDiscordPresenceEnabled = true;
 
         protected override void OnStartup(StartupEventArgs e)
         {
@@ -53,7 +56,8 @@ namespace BARS_Client_V2
                     services.AddSingleton<INearestAirportService, NearestAirportService>();
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>();
                     services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>());
-                    services.AddHostedService<BARS_Client_V2.Services.DiscordPresenceService>();
+                    services.AddSingleton<BARS_Client_V2.Services.DiscordPresenceService>();
+                    services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Services.DiscordPresenceService>());
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>(sp =>
                     {
@@ -77,6 +81,8 @@ namespace BARS_Client_V2
             StartupTrace.Write("Resolving MainWindowViewModel");
             var vm = _host.Services.GetRequiredService<MainWindowViewModel>();
             StartupTrace.Write("MainWindowViewModel resolved");
+            _discordPresenceService = _host.Services.GetRequiredService<DiscordPresenceService>();
+            _startupDiscordPresenceEnabled = _discordPresenceService.IsEnabled;
             ClientSettings startupSettings;
             try
             {
@@ -111,6 +117,7 @@ namespace BARS_Client_V2
 
             ConfigureTaskbarIcon(mainWindow);
             UpdateAutoMinimizeMenuItem(_startupAutoMinimizeRequested);
+            UpdateDiscordPresenceMenuItem(_startupDiscordPresenceEnabled);
 
             _mainWindow = mainWindow;
             MainWindow = mainWindow;
@@ -141,18 +148,19 @@ namespace BARS_Client_V2
             }
             else
             {
-                HideTrayIcon();
+                ShowTrayIcon();
             }
 
             if (_host != null)
             {
+                var host = _host;
                 StartupTrace.Write("Starting host background task");
                 _ = Task.Run(async () =>
                 {
                     try
                     {
                         StartupTrace.Write("Host StartAsync begin");
-                        await _host.StartAsync().ConfigureAwait(false);
+                        await host.StartAsync().ConfigureAwait(false);
                         StartupTrace.Write("Host StartAsync complete");
                     }
                     catch (Exception ex)
@@ -215,6 +223,7 @@ namespace BARS_Client_V2
                     _trayContextMenu = menu;
                     _trayContextMenu.Opened += TrayContextMenuOnOpened;
                     _autoMinimizeMenuItem = FindAutoMinimizeMenuItem(menu);
+                    _discordPresenceMenuItem = FindDiscordPresenceMenuItem(menu);
                 }
                 StartupTrace.Write("Taskbar icon prepared");
             }
@@ -269,7 +278,6 @@ namespace BARS_Client_V2
                 MainWindow.Show();
                 MainWindow.WindowState = WindowState.Normal;
                 MainWindow.Activate();
-                HideTrayIcon();
             }
             finally
             {
@@ -281,17 +289,31 @@ namespace BARS_Client_V2
         {
             var isChecked = _mainWindowViewModel?.AutoMinimizeOnStart ?? false;
             UpdateAutoMinimizeMenuItem(isChecked);
+            var discordEnabled = _discordPresenceService?.IsEnabled ?? _startupDiscordPresenceEnabled;
+            UpdateDiscordPresenceMenuItem(discordEnabled);
         }
 
         private static MenuItem? FindAutoMinimizeMenuItem(ContextMenu menu) =>
             menu.Items.OfType<MenuItem>().FirstOrDefault(item =>
                 item.Tag is string tag && string.Equals(tag, "AutoMinimizeToggle", StringComparison.Ordinal));
 
+        private static MenuItem? FindDiscordPresenceMenuItem(ContextMenu menu) =>
+            menu.Items.OfType<MenuItem>().FirstOrDefault(item =>
+                item.Tag is string tag && string.Equals(tag, "DiscordPresenceToggle", StringComparison.Ordinal));
+
         private void UpdateAutoMinimizeMenuItem(bool isChecked)
         {
             if (_autoMinimizeMenuItem != null)
             {
                 _autoMinimizeMenuItem.IsChecked = isChecked;
+            }
+        }
+
+        private void UpdateDiscordPresenceMenuItem(bool isChecked)
+        {
+            if (_discordPresenceMenuItem != null)
+            {
+                _discordPresenceMenuItem.IsChecked = isChecked;
             }
         }
 
@@ -332,6 +354,25 @@ namespace BARS_Client_V2
         private void TaskbarIcon_ShowMenuItem_OnClick(object? sender, RoutedEventArgs e)
         {
             RestoreMainWindowFromTray();
+        }
+
+        private void TaskbarIcon_DiscordPresenceMenuItem_OnClick(object? sender, RoutedEventArgs e)
+        {
+            if (sender is not MenuItem menuItem)
+            {
+                return;
+            }
+
+            var requestedState = menuItem.IsChecked;
+            if (_discordPresenceService == null)
+            {
+                _startupDiscordPresenceEnabled = requestedState;
+                UpdateDiscordPresenceMenuItem(requestedState);
+                return;
+            }
+
+            _discordPresenceService.SetEnabled(requestedState);
+            UpdateDiscordPresenceMenuItem(_discordPresenceService.IsEnabled);
         }
 
         private void TaskbarIcon_ExitMenuItem_OnClick(object? sender, RoutedEventArgs e)

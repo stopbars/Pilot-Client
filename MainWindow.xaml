@@ -770,7 +770,7 @@
                                                 <Grid>
                                                     <ScrollViewer x:Name="PART_ContentHost"
                                                                   Focusable="false"/>
-                                                    <TextBlock Text="Enter ICAO or scenery package to search"
+                                                    <TextBlock Text="You can search by ICAO, Name, or Package Name"
                                                                Foreground="#858585"
                                                                Margin="5,0,0,0"
                                                                VerticalAlignment="Center"
