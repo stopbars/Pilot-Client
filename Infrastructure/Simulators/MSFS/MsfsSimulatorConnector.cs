@@ -149,8 +149,20 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             }
 
             var sample = await TryGetSampleAsync(ct);
-            if (sample is RawFlightSample s) yield return s;
-            try { await Task.Delay(PollDelayMs, ct); } catch { yield break; }
+            if (sample is RawFlightSample s)
+            {
+                yield return s;
+                continue;
+            }
+
+            try
+            {
+                await Task.Delay(PollDelayMs, ct);
+            }
+            catch
+            {
+                yield break;
+            }
         }
     }
 
@@ -197,12 +209,18 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             await _simVarGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var lat = await svm.GetAsync<double>("PLANE LATITUDE", "degrees", cancellationToken: ct)
-                    .WaitAsync(SimVarRequestTimeout, ct).ConfigureAwait(false);
-                var lon = await svm.GetAsync<double>("PLANE LONGITUDE", "degrees", cancellationToken: ct)
-                    .WaitAsync(SimVarRequestTimeout, ct).ConfigureAwait(false);
-                var onGround = await svm.GetAsync<int>("SIM ON GROUND", "bool", cancellationToken: ct)
-                    .WaitAsync(SimVarRequestTimeout, ct).ConfigureAwait(false) == 1;
+                var latTask = svm.GetAsync<double>("PLANE LATITUDE", "degrees", cancellationToken: ct)
+                    .WaitAsync(SimVarRequestTimeout, ct);
+                var lonTask = svm.GetAsync<double>("PLANE LONGITUDE", "degrees", cancellationToken: ct)
+                    .WaitAsync(SimVarRequestTimeout, ct);
+                var onGroundTask = svm.GetAsync<int>("SIM ON GROUND", "bool", cancellationToken: ct)
+                    .WaitAsync(SimVarRequestTimeout, ct);
+
+                await Task.WhenAll(latTask, lonTask, onGroundTask).ConfigureAwait(false);
+
+                var lat = latTask.Result;
+                var lon = lonTask.Result;
+                var onGround = onGroundTask.Result == 1;
 
                 // success -> reset error budget
                 _consecutiveSampleErrors = 0;
@@ -318,25 +336,25 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
                     "PLANE LATITUDE",
                     "degrees",
                     SimConnectPeriod.Second,
-                    latitude => SafeInvoke(() => OnLatitudeUpdate(latitude)));
+                    latitude => SafeInvoke(OnLatitudeUpdate, latitude));
 
                 _longitudeSubscription = svm.Subscribe<double>(
                     "PLANE LONGITUDE",
                     "degrees",
                     SimConnectPeriod.Second,
-                    longitude => SafeInvoke(() => OnLongitudeUpdate(longitude)));
+                    longitude => SafeInvoke(OnLongitudeUpdate, longitude));
 
                 _onGroundSubscription = svm.Subscribe<int>(
                     "SIM ON GROUND",
                     "bool",
                     SimConnectPeriod.Second,
-                    value => SafeInvoke(() => OnOnGroundUpdate(value == 1)));
+                    value => SafeInvoke(OnOnGroundUpdate, value == 1));
 
                 _altitudeSubscription = svm.Subscribe<double>(
                     "PLANE ALTITUDE",
                     "feet",
                     SimConnectPeriod.Second,
-                    altitude => SafeInvoke(() => OnAltitudeUpdate(altitude)));
+                    altitude => SafeInvoke(OnAltitudeUpdate, altitude));
 
                 _subscriptionsInitialized = true;
                 _subscriptionsStartedUtc = DateTime.UtcNow;
@@ -476,6 +494,18 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
         }
     }
 
+    private void SafeInvoke<T>(Action<T> action, T argument)
+    {
+        try
+        {
+            action(argument);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "SimVar subscription callback failed");
+        }
+    }
+
     public void Dispose() => _ = DisconnectAsync();
 
     internal async Task<SimObject?> SpawnLightAsync(string pointId, double lat, double lon, double? heading, int? stateId, CancellationToken ct)
@@ -589,15 +619,16 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
                     return;
                 }
                 // Attempt to locate by userData if library exposes it; fall back to positional proximity heuristic
-                var candidates = mgr.ManagedObjects.Values.Where(o => o.IsActive).ToList();
                 SimObject? match = null;
-                foreach (var c in candidates)
+                foreach (var candidate in mgr.ManagedObjects.Values)
                 {
+                    if (!candidate.IsActive) continue;
                     try
                     {
-                        if (c.UserData is string ud && string.Equals(ud, pointId, StringComparison.Ordinal))
+                        if (candidate.UserData is string ud && string.Equals(ud, pointId, StringComparison.Ordinal))
                         {
-                            match = c; break;
+                            match = candidate;
+                            break;
                         }
                     }
                     catch { }
