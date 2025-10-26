@@ -27,13 +27,23 @@ internal sealed class AirportWebSocketManager : BackgroundService
     private DateTime _nextConnectAttemptUtc = DateTime.MinValue; // backoff gate
     private Task? _heartbeatTask;
     private string? _tokenUsedForConnection;
+    private string? _desiredAirport;
+    private int _consecutiveForbiddenFailures;
+    private bool _offlineMode;
+    private Task? _offlineSnapshotTask;
+    private const int ForbiddenThresholdForOffline = 3;
+    private AirportStateHub? _stateHub;
+    private static readonly TimeSpan OfflineReconnectInterval = TimeSpan.FromSeconds(45);
 
     public string? ConnectedAirport { get { lock (_sync) return _connectedAirport; } }
     public bool IsConnected { get { lock (_sync) return _ws?.State == WebSocketState.Open; } }
+    public bool IsOfflineMode { get { lock (_sync) return _offlineMode; } }
     public event Action<string>? MessageReceived;
     public event Action? Connected;
     public event Action<int>? ConnectionError; // status code (e.g. 401, 403)
     public event Action<string>? Disconnected; // reason
+    public event Action<bool>? OfflineModeChanged;
+    public event Action<string>? OfflineSnapshotReceived;
 
     public AirportWebSocketManager(
         SimulatorManager simManager,
@@ -53,6 +63,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
         {
             try { _ = SendRawAsync(rawJson); } catch { }
         };
+        _stateHub = hub;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -70,6 +81,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
             }
             await Task.Delay(2000, stoppingToken);
         }
+        DeactivateOfflineMode();
         await DisconnectAsync("Service stopping");
     }
 
@@ -79,12 +91,16 @@ internal sealed class AirportWebSocketManager : BackgroundService
         var connector = _simManager.ActiveConnector;
         if (flight == null || connector == null || !connector.IsConnected)
         {
+            SetDesiredAirport(null);
+            DeactivateOfflineMode();
             await DisconnectAsync("No active simulator");
             return;
         }
 
         if (!flight.OnGround)
         {
+            SetDesiredAirport(null);
+            DeactivateOfflineMode();
             await DisconnectAsync("Airborne");
             return;
         }
@@ -97,13 +113,18 @@ internal sealed class AirportWebSocketManager : BackgroundService
 
         if (string.IsNullOrWhiteSpace(icao) || icao.Length != 4)
         {
+            SetDesiredAirport(null);
+            DeactivateOfflineMode();
             await DisconnectAsync("No nearby airport");
             return;
         }
 
+        SetDesiredAirport(icao);
+
         var token = await GetApiTokenAsync(ct);
         if (!IsValidToken(token))
         {
+            DeactivateOfflineMode();
             await DisconnectAsync("Missing/invalid API token");
             return;
         }
@@ -114,6 +135,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
                 string.Equals(_connectedAirport, icao, StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(_tokenUsedForConnection, token, StringComparison.Ordinal))
             {
+                DeactivateOfflineMode();
                 return; // already connected to desired airport with same token
             }
         }
@@ -172,6 +194,8 @@ internal sealed class AirportWebSocketManager : BackgroundService
             }
             _logger.LogInformation("Airport WebSocket connected for {icao}", icao);
             _nextConnectAttemptUtc = DateTime.MinValue; // reset on success
+            ResetForbiddenFailures();
+            DeactivateOfflineMode();
             try { Connected?.Invoke(); } catch { }
         }
         catch (OperationCanceledException)
@@ -185,12 +209,12 @@ internal sealed class AirportWebSocketManager : BackgroundService
             // If 403 (user not connected to VATSIM / not authorized) apply longer backoff to avoid spam
             if (wex.Message.Contains("403"))
             {
-                _nextConnectAttemptUtc = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-                try { ConnectionError?.Invoke(403); } catch { }
+                HandleForbiddenFailure();
             }
             else
             {
                 _nextConnectAttemptUtc = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+                ResetForbiddenFailures();
                 if (wex.Message.Contains("401"))
                 {
                     try { ConnectionError?.Invoke(401); } catch { }
@@ -202,7 +226,177 @@ internal sealed class AirportWebSocketManager : BackgroundService
             _logger.LogError(ex, "Unexpected error connecting airport WebSocket for {icao}", icao);
             ws.Dispose();
             _nextConnectAttemptUtc = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            ResetForbiddenFailures();
             try { ConnectionError?.Invoke(0); } catch { }
+        }
+    }
+
+    private void SetDesiredAirport(string? icao)
+    {
+        var normalized = string.IsNullOrWhiteSpace(icao) ? null : icao.ToUpperInvariant();
+        bool changed;
+        bool offline;
+        lock (_sync)
+        {
+            offline = _offlineMode;
+            changed = !string.Equals(_desiredAirport, normalized, StringComparison.Ordinal);
+            _desiredAirport = normalized;
+        }
+        if (changed && offline)
+        {
+            BeginOfflineSnapshotWorkflow();
+        }
+    }
+
+    private void HandleForbiddenFailure()
+    {
+        var count = Interlocked.Increment(ref _consecutiveForbiddenFailures);
+        var delay = count >= ForbiddenThresholdForOffline ? OfflineReconnectInterval : TimeSpan.FromSeconds(10);
+        _nextConnectAttemptUtc = DateTime.UtcNow + delay;
+        try { ConnectionError?.Invoke(403); } catch { }
+        if (count >= ForbiddenThresholdForOffline)
+        {
+            ActivateOfflineMode();
+        }
+    }
+
+    private void ResetForbiddenFailures() => Interlocked.Exchange(ref _consecutiveForbiddenFailures, 0);
+
+    private void ActivateOfflineMode()
+    {
+        bool shouldNotify;
+        lock (_sync)
+        {
+            if (_offlineMode)
+            {
+                return;
+            }
+            _offlineMode = true;
+            shouldNotify = true;
+        }
+        BeginOfflineSnapshotWorkflow();
+        if (shouldNotify)
+        {
+            try { OfflineModeChanged?.Invoke(true); } catch { }
+        }
+    }
+
+    private void DeactivateOfflineMode()
+    {
+        bool wasActive;
+        lock (_sync)
+        {
+            wasActive = _offlineMode;
+            _offlineMode = false;
+        }
+        ResetForbiddenFailures();
+        if (!wasActive) return;
+        try { OfflineModeChanged?.Invoke(false); } catch { }
+    }
+
+    private void BeginOfflineSnapshotWorkflow()
+    {
+        lock (_sync)
+        {
+            if (!_offlineMode)
+            {
+                return;
+            }
+            if (_offlineSnapshotTask != null && !_offlineSnapshotTask.IsCompleted)
+            {
+                return;
+            }
+            _offlineSnapshotTask = Task.Run(EmitOfflineSnapshotAsync);
+        }
+    }
+
+    private async Task EmitOfflineSnapshotAsync()
+    {
+        try
+        {
+            var airport = await DetermineOfflineAirportAsync().ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(airport))
+            {
+                _logger.LogDebug("Offline snapshot skipped (no airport available)");
+                return;
+            }
+
+            var hub = _stateHub;
+            if (hub == null)
+            {
+                _logger.LogDebug("Offline snapshot skipped (state hub missing)");
+                return;
+            }
+
+            try
+            {
+                await hub.EnsureMapLoadedAsync(airport, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "EnsureMapLoadedAsync failed during offline fallback");
+            }
+
+            var snapshot = hub.CreateOfflineSnapshot();
+            if (string.IsNullOrWhiteSpace(snapshot))
+            {
+                _logger.LogDebug("Offline snapshot empty for {airport}", airport);
+                return;
+            }
+
+            lock (_sync)
+            {
+                if (string.IsNullOrWhiteSpace(_connectedAirport))
+                {
+                    _connectedAirport = airport;
+                }
+            }
+
+            try { OfflineSnapshotReceived?.Invoke(snapshot); } catch { }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to emit offline snapshot");
+        }
+    }
+
+    private async Task<string?> DetermineOfflineAirportAsync()
+    {
+        string? current;
+        lock (_sync)
+        {
+            current = _desiredAirport;
+        }
+        if (!string.IsNullOrWhiteSpace(current))
+        {
+            return current;
+        }
+
+        return await ResolveTargetAirportAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async Task<string?> ResolveTargetAirportAsync(CancellationToken ct)
+    {
+        var flight = _simManager.LatestState;
+        if (flight == null || !flight.OnGround)
+        {
+            return null;
+        }
+
+        var cached = _nearestAirportService.GetCachedNearest(flight.Latitude, flight.Longitude);
+        if (!string.IsNullOrWhiteSpace(cached))
+        {
+            return cached;
+        }
+
+        try
+        {
+            return await _nearestAirportService.ResolveAndCacheAsync(flight.Latitude, flight.Longitude, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to resolve nearest airport for offline snapshot");
+            return null;
         }
     }
 

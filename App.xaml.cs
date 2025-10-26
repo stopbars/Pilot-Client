@@ -111,7 +111,28 @@ namespace BARS_Client_V2
             wsMgr.ConnectionError += code => vm.NotifyServerError(code);
             wsMgr.MessageReceived += msg => { vm.NotifyServerMessage(); _ = hub.ProcessAsync(msg); };
             var pointController = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>();
-            wsMgr.Disconnected += reason => { pointController.Suspend(); _ = pointController.DespawnAllAsync(); };
+            wsMgr.OfflineSnapshotReceived += snapshot => { vm.NotifyOfflineSnapshot(); _ = hub.ProcessAsync(snapshot); };
+            wsMgr.OfflineModeChanged += offline =>
+            {
+                vm.NotifyServerOfflineMode(offline);
+                if (offline)
+                {
+                    pointController.Resume();
+                }
+                else if (!wsMgr.IsConnected)
+                {
+                    pointController.Suspend();
+                }
+            };
+            wsMgr.Disconnected += reason =>
+            {
+                if (wsMgr.IsOfflineMode)
+                {
+                    pointController.Resume();
+                    return;
+                }
+                pointController.Suspend();
+            };
             wsMgr.Connected += () => pointController.Resume();
             StartupTrace.Write("Event wiring complete");
 

@@ -41,6 +41,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private bool _serverConnected; // backend websocket
     private DateTime _lastServerMessageUtc;
     private bool _autoMinimizeOnStart;
+    private bool _serverOfflineMode;
     private ClientSettings? _preloadedSettings;
     private bool _initializationStarted;
 
@@ -59,8 +60,32 @@ public class MainWindowViewModel : INotifyPropertyChanged
     public bool SimulatorConnected { get => _simConnected; set { if (value != _simConnected) { _simConnected = value; OnPropertyChanged(); OnPropertyChanged(nameof(SimulatorConnectionText)); OnPropertyChanged(nameof(SimulatorStatusColor)); } } }
     public string SimulatorConnectionText => SimulatorConnected ? "Connected" : "Disconnected";
     public string SimulatorStatusColor => SimulatorConnected ? "LimeGreen" : "Gray";
-    public bool ServerConnected { get => _serverConnected; private set { if (value != _serverConnected) { _serverConnected = value; OnPropertyChanged(); OnPropertyChanged(nameof(ServerStatusText)); OnPropertyChanged(nameof(ServerStatusColor)); } } }
-    public string ServerStatusText => ServerConnected ? "Connected" : (string.IsNullOrEmpty(ServerStatusDetail) ? "Disconnected" : ServerStatusDetail);
+    public bool ServerConnected
+    {
+        get => _serverConnected;
+        private set
+        {
+            if (value == _serverConnected)
+            {
+                return;
+            }
+
+            _serverConnected = value;
+            if (value && _serverOfflineMode)
+            {
+                _serverOfflineMode = false;
+            }
+
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(ServerStatusText));
+            OnPropertyChanged(nameof(ServerStatusColor));
+        }
+    }
+
+    public string ServerStatusText => ServerConnected
+        ? "Connected"
+        : (string.IsNullOrEmpty(ServerStatusDetail) ? "Disconnected" : ServerStatusDetail);
+
     public string ServerStatusColor => ServerConnected ? "LimeGreen" : "Gray";
     public string ServerStatusDetail { get; private set; } = ""; // optional reason
     public double Latitude { get => _latitude; set { if (value != _latitude) { _latitude = value; OnPropertyChanged(); } } }
@@ -512,6 +537,12 @@ public class MainWindowViewModel : INotifyPropertyChanged
         RunOnDispatcher(() =>
         {
             _lastServerMessageUtc = DateTime.UtcNow;
+            if (_serverOfflineMode)
+            {
+                _serverOfflineMode = false;
+                OnPropertyChanged(nameof(ServerStatusText));
+                OnPropertyChanged(nameof(ServerStatusColor));
+            }
             if (!ServerConnected)
             {
                 ServerConnected = true;
@@ -529,6 +560,12 @@ public class MainWindowViewModel : INotifyPropertyChanged
     {
         RunOnDispatcher(() =>
         {
+            if (_serverOfflineMode)
+            {
+                _serverOfflineMode = false;
+                OnPropertyChanged(nameof(ServerStatusText));
+                OnPropertyChanged(nameof(ServerStatusColor));
+            }
             ServerConnected = true;
             ServerStatusDetail = string.Empty;
             OnPropertyChanged(nameof(ServerStatusDetail));
@@ -537,10 +574,68 @@ public class MainWindowViewModel : INotifyPropertyChanged
         });
     }
 
+    public void NotifyServerOfflineMode(bool isOffline)
+    {
+        RunOnDispatcher(() =>
+        {
+            if (_serverOfflineMode == isOffline)
+            {
+                return;
+            }
+
+            _serverOfflineMode = isOffline;
+            if (isOffline && ServerConnected)
+            {
+                ServerConnected = false;
+            }
+
+            if (isOffline)
+            {
+                if (!string.Equals(ServerStatusDetail, "Not connected to VATSIM", StringComparison.Ordinal))
+                {
+                    ServerStatusDetail = "Not connected to VATSIM";
+                    OnPropertyChanged(nameof(ServerStatusDetail));
+                }
+            }
+
+            OnPropertyChanged(nameof(ServerStatusText));
+            OnPropertyChanged(nameof(ServerStatusColor));
+        });
+    }
+
+    public void NotifyOfflineSnapshot()
+    {
+        RunOnDispatcher(() =>
+        {
+            _lastServerMessageUtc = DateTime.UtcNow;
+            if (!_serverOfflineMode)
+            {
+                _serverOfflineMode = true;
+                if (ServerConnected)
+                {
+                    ServerConnected = false;
+                }
+                if (!string.Equals(ServerStatusDetail, "Not connected to VATSIM", StringComparison.Ordinal))
+                {
+                    ServerStatusDetail = "Not connected to VATSIM";
+                    OnPropertyChanged(nameof(ServerStatusDetail));
+                }
+                OnPropertyChanged(nameof(ServerStatusText));
+                OnPropertyChanged(nameof(ServerStatusColor));
+            }
+        });
+    }
+
     public void NotifyServerError(int code)
     {
         RunOnDispatcher(() =>
         {
+            if (_serverOfflineMode)
+            {
+                _serverOfflineMode = false;
+                OnPropertyChanged(nameof(ServerStatusText));
+                OnPropertyChanged(nameof(ServerStatusColor));
+            }
             ServerConnected = false;
             ServerStatusDetail = code switch
             {
@@ -591,6 +686,12 @@ public class MainWindowViewModel : INotifyPropertyChanged
         if (_lastServerMessageUtc == DateTime.MinValue) return;
         if ((DateTime.UtcNow - _lastServerMessageUtc) > TimeSpan.FromSeconds(90))
         {
+            if (_serverOfflineMode)
+            {
+                _serverOfflineMode = false;
+                OnPropertyChanged(nameof(ServerStatusText));
+                OnPropertyChanged(nameof(ServerStatusColor));
+            }
             ServerConnected = false;
         }
     }

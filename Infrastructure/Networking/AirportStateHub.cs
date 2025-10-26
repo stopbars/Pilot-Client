@@ -1,9 +1,11 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -200,7 +202,7 @@ internal sealed class AirportStateHub
         try { PointStateChanged?.Invoke(ps); } catch { }
     }
 
-    private async Task EnsureMapLoadedAsync(string airport, CancellationToken ct)
+    public async Task EnsureMapLoadedAsync(string airport, CancellationToken ct = default)
     {
         if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return;
         await _mapLock.WaitAsync(ct);
@@ -343,6 +345,54 @@ internal sealed class AirportStateHub
         }
 
         await TryFetchAsync(package, false);
+    }
+
+    public string? CreateOfflineSnapshot()
+    {
+        string? airport;
+        PointMetadata[] metas;
+        lock (_mapLock)
+        {
+            airport = _mapAirport;
+        }
+        if (string.IsNullOrWhiteSpace(airport)) return null;
+        metas = _metadata.Values.ToArray();
+        if (metas.Length == 0) return null;
+
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("type", "STATE_SNAPSHOT");
+            writer.WriteString("airport", airport);
+            writer.WriteBoolean("offline", true);
+            writer.WritePropertyName("data");
+            writer.WriteStartObject();
+            writer.WriteBoolean("offline", true);
+            writer.WritePropertyName("objects");
+            writer.WriteStartArray();
+            foreach (var meta in metas)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("id", meta.Id);
+                writer.WriteBoolean("state", !IsStopbar(meta.Type));
+                writer.WriteNumber("timestamp", nowMs);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+
+    private static bool IsStopbar(string? type)
+    {
+        if (string.IsNullOrWhiteSpace(type)) return false;
+        return type.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0 &&
+               type.IndexOf("BAR", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private void ParseMap(XDocument doc, string airport)
