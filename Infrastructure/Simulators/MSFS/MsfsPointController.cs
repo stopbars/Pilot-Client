@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -58,9 +59,18 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     // Stopbar crossing detection
     private double? _prevLat;
     private double? _prevLon;
-    private readonly ConcurrentDictionary<string, (double LatA, double LonA, double LatB, double LonB)> _stopbarSegments = new();
+    private readonly ConcurrentDictionary<string, StopbarSegment> _stopbarSegments = new();
     private readonly ConcurrentDictionary<string, DateTime> _crossDebounceUntil = new();
     private readonly TimeSpan _crossDebounceWindow = TimeSpan.FromSeconds(5);
+    private readonly record struct StopbarSegment(
+        double LatA,
+        double LonA,
+        double LatB,
+        double LonB,
+        double? FrontHeadingDeg);
+    private readonly record struct CrossingDetails(
+        (double x, double y) P0,
+        (double x, double y) P1);
 
     // Failure/backoff
     private readonly ConcurrentDictionary<string, (int Failures, DateTime LastFailureUtc)> _spawnFailures = new();
@@ -200,48 +210,76 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     {
         var currLat = flight.Latitude;
         var currLon = flight.Longitude;
+        var currHeading = flight.HeadingDeg;
         if (!_prevLat.HasValue || !_prevLon.HasValue)
         {
             _prevLat = currLat; _prevLon = currLon; return;
         }
-        var prevLat = _prevLat!.Value; var prevLon = _prevLon!.Value;
+        var prevLat = _prevLat!.Value;
+        var prevLon = _prevLon!.Value;
         // If aircraft barely moved, skip
         if (DistanceMeters(prevLat, prevLon, currLat, currLon) < 1.0) { _prevLat = currLat; _prevLon = currLon; return; }
 
-        // Consider only nearby stopbars whose state is OFF (dropped)
         foreach (var kv in _latestStates)
         {
             var ps = kv.Value;
-            if (ps.IsOn) continue; // we only report when dropped
             var type = ps.Metadata.Type ?? string.Empty;
             if (!type.Contains("STOP", StringComparison.OrdinalIgnoreCase) || !type.Contains("BAR", StringComparison.OrdinalIgnoreCase)) continue;
-            // Debounce this object id if recently reported
             if (_crossDebounceUntil.TryGetValue(ps.Metadata.Id, out var until) && DateTime.UtcNow < until) continue;
 
-            // Quick distance gate to avoid scanning far objects
             var dCurr = DistanceMeters(currLat, currLon, ps.Metadata.Latitude, ps.Metadata.Longitude);
             if (dCurr > 200) continue; // 200m radius heuristic
 
             var seg = GetOrBuildStopbarSegment(ps.Metadata.Id, ps);
             if (seg == null) continue;
-            var (aLat, aLon, bLat, bLon) = seg.Value;
-            if (Crosses(prevLat, prevLon, currLat, currLon, aLat, aLon, bLat, bLon))
+            var segment = seg.Value;
+            if (!Crosses(prevLat, prevLon, currLat, currLon, segment.LatA, segment.LonA, segment.LatB, segment.LonB, out var crossing)) continue;
+
+            if (segment.FrontHeadingDeg.HasValue)
             {
-                _crossDebounceUntil[ps.Metadata.Id] = DateTime.UtcNow + _crossDebounceWindow;
-                _hub.SendStopbarCrossing(ps.Metadata.Id);
-                _logger.LogInformation("[StopbarCrossing] objectId={id} pos=({lat:F6},{lon:F6})", ps.Metadata.Id, currLat, currLon);
+                const double HeadingToleranceDeg = 120.0;
+                var frontHeading = segment.FrontHeadingDeg.Value;
+                var aligned = false;
+
+                if (currHeading is double aircraftHeading)
+                {
+                    var diff = AngularDifference(frontHeading, aircraftHeading);
+                    if (diff <= HeadingToleranceDeg) aligned = true;
+                }
+
+                if (!aligned)
+                {
+                    var movementVector = (crossing.P1.x - crossing.P0.x, crossing.P1.y - crossing.P0.y);
+                    if (Math.Abs(movementVector.Item1) > 1e-3 || Math.Abs(movementVector.Item2) > 1e-3)
+                    {
+                        var movementHeading = VectorToHeading(movementVector);
+                        if (!double.IsNaN(movementHeading))
+                        {
+                            var diffMove = AngularDifference(frontHeading, movementHeading);
+                            if (diffMove <= HeadingToleranceDeg) aligned = true;
+                        }
+                    }
+                }
+
+                if (!aligned) continue;
             }
+
+            _crossDebounceUntil[ps.Metadata.Id] = DateTime.UtcNow + _crossDebounceWindow;
+            _hub.SendStopbarCrossing(ps.Metadata.Id);
+            _logger.LogInformation("[StopbarCrossing] objectId={id} pos=({lat:F6},{lon:F6})", ps.Metadata.Id, currLat, currLon);
         }
 
-        _prevLat = currLat; _prevLon = currLon;
+        _prevLat = currLat;
+        _prevLon = currLon;
     }
 
-    private (double LatA, double LonA, double LatB, double LonB)? GetOrBuildStopbarSegment(string pointId, PointState ps)
+    private StopbarSegment? GetOrBuildStopbarSegment(string pointId, PointState ps)
     {
         if (_stopbarSegments.TryGetValue(pointId, out var seg)) return seg;
         if (!_hub.TryGetLightLayout(pointId, out var lights) || lights.Count < 2) return null;
-        // Choose the two lights with maximum separation as segment endpoints
-        double best = -1; (double la, double lo, double lb, double lob) bestPair = default;
+
+        double best = -1;
+        (double la, double lo, double lb, double lob) bestPair = default;
         for (int i = 0; i < lights.Count; i++)
         {
             for (int j = i + 1; j < lights.Count; j++)
@@ -249,68 +287,84 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 var di = DistanceMeters(lights[i].Latitude, lights[i].Longitude, lights[j].Latitude, lights[j].Longitude);
                 if (di > best)
                 {
-                    best = di; bestPair = (lights[i].Latitude, lights[i].Longitude, lights[j].Latitude, lights[j].Longitude);
+                    best = di;
+                    bestPair = (lights[i].Latitude, lights[i].Longitude, lights[j].Latitude, lights[j].Longitude);
                 }
             }
         }
         if (best <= 0) return null;
-        var result = (bestPair.la, bestPair.lo, bestPair.lb, bestPair.lob);
+
+        double? heading = null;
+        var headingCandidates = new List<double>();
+        foreach (var light in lights)
+        {
+            if (!light.Heading.HasValue) continue;
+            var normalized = NormalizeHeading(light.Heading.Value);
+            if (normalized.HasValue) headingCandidates.Add(normalized.Value);
+        }
+        if (headingCandidates.Count > 0)
+        {
+            heading = AverageHeading(headingCandidates);
+        }
+        else
+        {
+            heading = ParseOrientationHeading(ps.Metadata.Orientation);
+        }
+
+        var result = new StopbarSegment(bestPair.la, bestPair.lo, bestPair.lb, bestPair.lob, heading);
         _stopbarSegments[pointId] = result;
         return result;
     }
 
-    private static bool Crosses(double pLat0, double pLon0, double pLat1, double pLon1, double aLat, double aLon, double bLat, double bLon)
+    private static bool Crosses(double pLat0, double pLon0, double pLat1, double pLon1, double aLat, double aLon, double bLat, double bLon, out CrossingDetails details)
     {
-        // Project to a local flat plane using simple equirectangular approximation around the stopbar midpoint for small distances.
         var midLat = (aLat + bLat) * 0.5;
-        (double x, double y) P(double lat, double lon)
+        var cosMidLat = Math.Cos(DegreesToRadians(midLat));
+        (double x, double y) Project(double lat, double lon)
         {
-            double x = (lon - aLon) * Math.Cos(midLat * Math.PI / 180.0) * 111320.0; // meters per deg lon
-            double y = (lat - aLat) * 110540.0; // meters per deg lat
-            return (x, y);
+            double x = (lon - aLon) * cosMidLat * 111320.0;
+            double y = (lat - aLat) * 110540.0;
+            return (x: x, y: y);
         }
-        var p0 = P(pLat0, pLon0);
-        var p1 = P(pLat1, pLon1);
-        var a = (0.0, 0.0);
-        var b = P(bLat, bLon);
 
-        // Orientation signs relative to AB
-        static double Orient((double x, double y) a, (double x, double y) b, (double x, double y) p)
-            => (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        var p0 = Project(pLat0, pLon0);
+        var p1 = Project(pLat1, pLon1);
+        var a = (x: 0.0, y: 0.0);
+        var b = Project(bLat, bLon);
 
         var s0 = Orient(a, b, p0);
         var s1 = Orient(a, b, p1);
 
-        // If signs are same or either is extremely close to zero, consider near-miss. We'll require sign flip and proximity.
-        if (s0 == 0 || s1 == 0) return false;
-        if (Math.Sign(s0) == Math.Sign(s1)) return false;
+        if (s0 == 0 || s1 == 0 || Math.Sign(s0) == Math.Sign(s1))
+        {
+            details = default;
+            return false;
+        }
 
-        // Ensure the perpendicular projection falls within segment extents and distance within tolerance
-        static double Dot((double x, double y) u, (double x, double y) v) => u.x * v.x + u.y * v.y;
-        static (double x, double y) Sub((double x, double y) u, (double x, double y) v) => (u.x - v.x, u.y - v.y);
         var ab = Sub(b, a);
         var ap0 = Sub(p0, a);
         var ap1 = Sub(p1, a);
         double abLen2 = Dot(ab, ab);
-        if (abLen2 < 1) return false;
-        // Closest approach from movement segment to AB
-        // Compute intersection t on AB using average of projections from both endpoints (heuristic)
+        if (abLen2 < 1)
+        {
+            details = default;
+            return false;
+        }
+
         var t0 = Math.Clamp(Dot(ap0, ab) / abLen2, 0, 1);
         var t1 = Math.Clamp(Dot(ap1, ab) / abLen2, 0, 1);
         var t = 0.5 * (t0 + t1);
-        var closest = (x: a.Item1 + ab.x * t, y: a.Item2 + ab.y * t);
-        // Distance from movement segment to closest point
-        double DistPointToSeg((double x, double y) p, (double x, double y) u, (double x, double y) v)
+        var closest = (x: a.x + ab.x * t, y: a.y + ab.y * t);
+        var dist = DistancePointToSegment(closest, p0, p1);
+        const double tolMeters = 12.0;
+        if (dist > tolMeters)
         {
-            var uv = Sub(v, u);
-            var up = Sub(p, u);
-            var tproj = Math.Clamp(Dot(up, uv) / (Dot(uv, uv) + 1e-6), 0, 1);
-            var proj = (x: u.x + uv.x * tproj, y: u.y + uv.y * tproj);
-            var dx = p.x - proj.x; var dy = p.y - proj.y; return Math.Sqrt(dx * dx + dy * dy);
+            details = default;
+            return false;
         }
-        var dist = DistPointToSeg(closest, p0, p1);
-        const double tolMeters = 12.0; // crossing tolerance
-        return dist <= tolMeters;
+
+        details = new CrossingDetails(p0, p1);
+        return true;
     }
 
     private async Task ProcessAsync(PointState ps, CancellationToken ct)
@@ -879,6 +933,101 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _logger.LogTrace("[ProximityEnqueue] added={count} queue={q}", candidates.Count, _queue.Count);
         return Task.CompletedTask;
     }
+
+    private static double? NormalizeHeading(double headingDeg)
+    {
+        if (double.IsNaN(headingDeg) || double.IsInfinity(headingDeg)) return null;
+        var normalized = headingDeg % 360.0;
+        if (normalized < 0) normalized += 360.0;
+        if (normalized >= 360.0) normalized -= 360.0;
+        return normalized;
+    }
+
+    private static double? AverageHeading(IEnumerable<double> headings)
+    {
+        double sumSin = 0;
+        double sumCos = 0;
+        int count = 0;
+        foreach (var h in headings)
+        {
+            var rad = DegreesToRadians(h);
+            sumSin += Math.Sin(rad);
+            sumCos += Math.Cos(rad);
+            count++;
+        }
+        if (count == 0) return null;
+        if (Math.Abs(sumSin) < 1e-6 && Math.Abs(sumCos) < 1e-6) return null;
+        var avg = Math.Atan2(sumSin, sumCos) * 180.0 / Math.PI;
+        if (avg < 0) avg += 360.0;
+        return avg;
+    }
+
+    private static double AngularDifference(double a, double b)
+    {
+        var normA = NormalizeHeading(a) ?? 0;
+        var normB = NormalizeHeading(b) ?? 0;
+        var diff = Math.Abs(normA - normB);
+        return diff > 180 ? 360 - diff : diff;
+    }
+
+    private static double? ParseOrientationHeading(string? orientation)
+    {
+        if (string.IsNullOrWhiteSpace(orientation)) return null;
+        var token = orientation.Trim();
+        if (double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var numeric))
+        {
+            return NormalizeHeading(numeric);
+        }
+        var upper = token.ToUpperInvariant();
+        return upper switch
+        {
+            "N" or "NORTH" or "NORTHBOUND" => 0,
+            "NE" or "NORTHEAST" or "NORTH-EAST" => 45,
+            "E" or "EAST" or "EASTBOUND" => 90,
+            "SE" or "SOUTHEAST" or "SOUTH-EAST" => 135,
+            "S" or "SOUTH" or "SOUTHBOUND" => 180,
+            "SW" or "SOUTHWEST" or "SOUTH-WEST" => 225,
+            "W" or "WEST" or "WESTBOUND" => 270,
+            "NW" or "NORTHWEST" or "NORTH-WEST" => 315,
+            _ => null
+        };
+    }
+
+    private static (double x, double y) HeadingToUnitVector(double headingDeg)
+    {
+        var rad = DegreesToRadians(headingDeg);
+        var x = Math.Sin(rad);
+        var y = Math.Cos(rad);
+        return (x: x, y: y);
+    }
+
+    private static double VectorToHeading((double x, double y) vector)
+    {
+        if (Math.Abs(vector.x) < 1e-6 && Math.Abs(vector.y) < 1e-6) return double.NaN;
+        var rad = Math.Atan2(vector.x, vector.y);
+        var deg = rad * 180.0 / Math.PI;
+        if (deg < 0) deg += 360.0;
+        return deg;
+    }
+
+    private static double DistancePointToSegment((double x, double y) p, (double x, double y) u, (double x, double y) v)
+    {
+        var uv = Sub(v, u);
+        var up = Sub(p, u);
+        var denom = Dot(uv, uv) + 1e-6;
+        var tproj = Math.Clamp(Dot(up, uv) / denom, 0, 1);
+        var proj = (x: u.x + uv.x * tproj, y: u.y + uv.y * tproj);
+        var dx = p.x - proj.x;
+        var dy = p.y - proj.y;
+        return Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    private static double Dot((double x, double y) u, (double x, double y) v) => u.x * v.x + u.y * v.y;
+
+    private static (double x, double y) Sub((double x, double y) u, (double x, double y) v) => (x: u.x - v.x, y: u.y - v.y);
+
+    private static double Orient((double x, double y) a, (double x, double y) b, (double x, double y) p)
+        => (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
 
     private static double DistanceMeters(double lat1, double lon1, double lat2, double lon2)
     {

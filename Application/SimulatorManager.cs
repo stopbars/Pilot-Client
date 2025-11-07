@@ -81,7 +81,7 @@ public sealed class SimulatorManager : BackgroundService
             {
                 await foreach (var raw in active.StreamRawAsync(stoppingToken))
                 {
-                    lock (_lock) _latest = new FlightState(raw.Latitude, raw.Longitude, raw.OnGround);
+                    lock (_lock) _latest = new FlightState(raw.Latitude, raw.Longitude, raw.OnGround, raw.HeadingDeg);
                 }
             }
             catch (OperationCanceledException) { }

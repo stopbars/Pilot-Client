@@ -43,9 +43,11 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
     private ISimVarSubscription? _longitudeSubscription;
     private ISimVarSubscription? _onGroundSubscription;
     private ISimVarSubscription? _altitudeSubscription;
+    private ISimVarSubscription? _headingSubscription;
     private double? _subscribedLatitude;
     private double? _subscribedLongitude;
     private bool? _subscribedOnGround;
+    private double? _subscribedHeading;
     private RawFlightSample? _latestSubscribedSample;
     private DateTime _latestSubscribedSampleUtc = DateTime.MinValue;
     private DateTime _lastDeliveredSampleUtc = DateTime.MinValue;
@@ -215,17 +217,20 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
                     .WaitAsync(SimVarRequestTimeout, ct);
                 var onGroundTask = svm.GetAsync<int>("SIM ON GROUND", "bool", cancellationToken: ct)
                     .WaitAsync(SimVarRequestTimeout, ct);
+                var headingTask = svm.GetAsync<double>("PLANE HEADING DEGREES TRUE", "degrees", cancellationToken: ct)
+                    .WaitAsync(SimVarRequestTimeout, ct);
 
-                await Task.WhenAll(latTask, lonTask, onGroundTask).ConfigureAwait(false);
+                await Task.WhenAll(latTask, lonTask, onGroundTask, headingTask).ConfigureAwait(false);
 
                 var lat = latTask.Result;
                 var lon = lonTask.Result;
                 var onGround = onGroundTask.Result == 1;
+                var heading = NormalizeHeading(headingTask.Result);
 
                 // success -> reset error budget
                 _consecutiveSampleErrors = 0;
                 ResetSampleBackoff();
-                return new RawFlightSample(lat, lon, onGround);
+                return new RawFlightSample(lat, lon, onGround, heading);
             }
             finally
             {
@@ -322,6 +327,15 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
         }
     }
 
+    private static double? NormalizeHeading(double headingDeg)
+    {
+        if (double.IsNaN(headingDeg) || double.IsInfinity(headingDeg)) return null;
+        var normalized = headingDeg % 360.0;
+        if (normalized < 0) normalized += 360.0;
+        if (normalized >= 360.0) normalized -= 360.0;
+        return normalized;
+    }
+
     private void InitializeSimVarSubscriptions(SimConnectClient client)
     {
         var svm = client.SimVars;
@@ -356,6 +370,12 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
                     SimConnectPeriod.Second,
                     altitude => SafeInvoke(OnAltitudeUpdate, altitude));
 
+                _headingSubscription = svm.Subscribe<double>(
+                    "PLANE HEADING DEGREES TRUE",
+                    "degrees",
+                    SimConnectPeriod.Second,
+                    heading => SafeInvoke(OnHeadingUpdate, heading));
+
                 _subscriptionsInitialized = true;
                 _subscriptionsStartedUtc = DateTime.UtcNow;
             }
@@ -377,6 +397,7 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             _subscribedLatitude = null;
             _subscribedLongitude = null;
             _subscribedOnGround = null;
+            _subscribedHeading = null;
             _latestSubscribedSample = null;
             _latestSubscribedSampleUtc = DateTime.MinValue;
             _lastDeliveredSampleUtc = DateTime.MinValue;
@@ -395,6 +416,8 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
         _onGroundSubscription = null;
         _altitudeSubscription?.Dispose();
         _altitudeSubscription = null;
+        _headingSubscription?.Dispose();
+        _headingSubscription = null;
     }
 
     private void OnLatitudeUpdate(double latitude)
@@ -430,6 +453,15 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
         _cachedGroundAltAt = DateTime.UtcNow;
     }
 
+    private void OnHeadingUpdate(double headingDeg)
+    {
+        lock (_sampleSubscriptionLock)
+        {
+            _subscribedHeading = NormalizeHeading(headingDeg);
+            PublishSubscribedSample_NoLock();
+        }
+    }
+
     private void PublishSubscribedSample_NoLock()
     {
         if (_subscribedLatitude.HasValue && _subscribedLongitude.HasValue && _subscribedOnGround.HasValue)
@@ -437,7 +469,8 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             _latestSubscribedSample = new RawFlightSample(
                 _subscribedLatitude.Value,
                 _subscribedLongitude.Value,
-                _subscribedOnGround.Value);
+                _subscribedOnGround.Value,
+                _subscribedHeading);
             _latestSubscribedSampleUtc = DateTime.UtcNow;
         }
     }

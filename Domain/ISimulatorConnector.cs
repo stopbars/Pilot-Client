@@ -4,7 +4,7 @@ using System.Threading.Tasks;
 
 namespace BARS_Client_V2.Domain;
 
-public sealed record RawFlightSample(double Latitude, double Longitude, bool OnGround);
+public sealed record RawFlightSample(double Latitude, double Longitude, bool OnGround, double? HeadingDeg);
 
 public interface ISimulatorConnector
 {
