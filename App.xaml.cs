@@ -1,6 +1,7 @@
 ﻿using System;
 using System.ComponentModel;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -30,6 +31,7 @@ namespace BARS_Client_V2
         private MainWindowViewModel? _mainWindowViewModel;
         private bool _suppressStateChanged;
         private bool _startupDiscordPresenceEnabled = true;
+        private CancellationTokenRegistration _applicationStoppingRegistration;
 
         protected override void OnStartup(StartupEventArgs e)
         {
@@ -72,6 +74,9 @@ namespace BARS_Client_V2
                     services.AddTransient<MainWindow>();
                 })
                 .Build();
+
+            var lifetime = _host.Services.GetRequiredService<IHostApplicationLifetime>();
+            _applicationStoppingRegistration = lifetime.ApplicationStopping.Register(OnHostApplicationStopping);
 
 
             StartupTrace.Write("Host built");
@@ -222,12 +227,41 @@ namespace BARS_Client_V2
                 {
                     StartupTrace.Write($"Host StopAsync error: {ex.Message}");
                 }
+                finally
+                {
+                    _applicationStoppingRegistration.Dispose();
+                }
                 _host.Dispose();
                 StartupTrace.Write("Host disposed");
             }
             DisposeTaskbarIcon();
             base.OnExit(e);
             StartupTrace.Write("OnExit complete");
+        }
+
+        private void OnHostApplicationStopping()
+        {
+            var dispatcher = Dispatcher;
+            if (dispatcher == null || dispatcher.HasShutdownStarted)
+            {
+                return;
+            }
+
+            try
+            {
+                dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (Dispatcher?.HasShutdownStarted == true)
+                    {
+                        return;
+                    }
+                    Shutdown();
+                }));
+            }
+            catch
+            {
+                // Best-effort shutdown; ignore dispatcher rejection during teardown.
+            }
         }
 
         private void ConfigureTaskbarIcon(Window mainWindow)
