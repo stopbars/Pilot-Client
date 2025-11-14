@@ -38,8 +38,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     private readonly int _disconnectedDelayMs;
     private readonly int _errorBackoffMs;
     private readonly double _spawnRadiusMeters;
-    private readonly TimeSpan _proximitySweepInterval;
-    private DateTime _nextProximitySweepUtc = DateTime.UtcNow;
     private readonly bool _dynamicPruneEnabled;
     
     // Distance-based streaming config
@@ -118,7 +116,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _disconnectedDelayMs = options.DisconnectedDelayMs;
         _errorBackoffMs = options.ErrorBackoffMs;
         _spawnRadiusMeters = options.SpawnRadiusMeters;
-        _proximitySweepInterval = TimeSpan.FromSeconds(options.ProximitySweepSeconds);
         _dynamicPruneEnabled = options.DynamicPruneEnabled;
         
         // Distance-based streaming config
@@ -229,11 +226,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 {
                     await Task.Delay(_idleDelayMs, stoppingToken);
                 }
-                if (DateTime.UtcNow >= _nextProximitySweepUtc)
-                {
-                    _nextProximitySweepUtc = DateTime.UtcNow + _proximitySweepInterval;
-                    try { await ProximitySweepAsync(stoppingToken); } catch (Exception ex) { _logger.LogDebug(ex, "ProximitySweep failed"); }
-                }
+                // Old proximity sweep removed - now handled by EvaluateAndScheduleActions
                 if ((DateTime.UtcNow - _lastSummary) > TimeSpan.FromSeconds(30))
                 {
                     _lastSummary = DateTime.UtcNow;
@@ -1226,49 +1219,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _logger.LogInformation("[DespawnPoint] {id} removed={removed} activeLights={active}", pointId, list.Count, TotalActiveLightCount());
     }
 
-    // Perform ordering & pruning based on aircraft proximity.
-    private Task ProximitySweepAsync(CancellationToken ct)
-    {
-        var flight = _simManager.LatestState;
-        if (flight == null) return Task.CompletedTask;
-        // Build active point set via manager
-        var activePointIds = new HashSet<string>(StringComparer.Ordinal);
-        var mgr = GetManager();
-        if (mgr != null)
-        {
-            foreach (var o in mgr.ManagedObjects.Values)
-            {
-                if (!o.IsActive) continue;
-                if (TryGetUserPointAndSlot(o, out var pid, out var _slot) && pid != null)
-                    activePointIds.Add(pid);
-            }
-        }
-        // Radius-based despawn removed: keep all previously spawned objects; rely on global caps for safety.
-        // Identify spawn candidates
-        var candidates = new List<(PointState State, double Dist)>();
-        foreach (var kv in _latestStates)
-        {
-            var st = kv.Value;
-            if (!st.IsOn) continue;
-            var dist = DistanceMeters(flight.Latitude, flight.Longitude, st.Metadata.Latitude, st.Metadata.Longitude);
-            // Distance requirement removed; include all ON points (distance retained only for ordering)
-            var (objs, _) = GetPointObjects(st.Metadata.Id);
-            var layouts = GetOrBuildLayouts(st);
-            if (objs.Count >= layouts.Count) continue;
-            candidates.Add((st, dist));
-        }
-        if (candidates.Count == 0) return Task.CompletedTask;
-        // Order by distance (closest first)
-        foreach (var c in candidates.OrderBy(c => c.Dist))
-        {
-            if (ct.IsCancellationRequested) break;
-            if (TotalActiveLightCount() >= _maxObjects) break;
-            _queue.Enqueue(c.State); // enqueue for ProcessAsync which will respect cap & rate
-        }
-        _logger.LogTrace("[ProximityEnqueue] added={count} queue={q}", candidates.Count, _queue.Count);
-        return Task.CompletedTask;
-    }
-
     private static double? NormalizeHeading(double headingDeg)
     {
         if (double.IsNaN(headingDeg) || double.IsInfinity(headingDeg)) return null;
@@ -1538,7 +1488,6 @@ internal sealed class MsfsPointControllerOptions
     public int ErrorBackoffMs { get; init; } = 200;
     public int OverlapDespawnDelayMs { get; init; } = 1000;
     public double SpawnRadiusMeters { get; init; } = 8000;
-    public int ProximitySweepSeconds { get; init; } = 5;
     public bool DynamicPruneEnabled { get; init; } = true;
     
     // Distance-based streaming parameters
