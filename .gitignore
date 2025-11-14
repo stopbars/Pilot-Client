@@ -366,4 +366,4 @@ ehthumbs.db
 Thumbs.db
 
 # Build
-dist/
+dist/Tests/
