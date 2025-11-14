@@ -1192,7 +1192,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
 internal sealed class MsfsPointControllerOptions
 {
-    public int MaxObjects { get; init; } = 900;
+    public int MaxObjects { get; init; } = 950;
     public int SpawnPerSecond { get; init; } = 10;
     public int IdleDelayMs { get; init; } = 10;
     public int DisconnectedDelayMs { get; init; } = 500;
