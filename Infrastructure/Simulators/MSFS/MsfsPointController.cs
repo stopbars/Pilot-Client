@@ -41,6 +41,26 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     private readonly TimeSpan _proximitySweepInterval;
     private DateTime _nextProximitySweepUtc = DateTime.UtcNow;
     private readonly bool _dynamicPruneEnabled;
+    
+    // Distance-based streaming config
+    private readonly double _movementThresholdMeters;
+    private readonly double _spawnMarginMeters;
+    private readonly double _despawnMarginMeters;
+    private readonly int _recalcThrottleMs;
+    private readonly int _spawnBatchSize;
+    private readonly int _despawnBatchSize;
+    private readonly double _highPriorityRadiusMeters;
+    private readonly bool _useSpatialBucketing;
+    private readonly double _bucketSizeMeters;
+    
+    // Distance-based streaming state
+    private double _lastEvalLatitude;
+    private double _lastEvalLongitude;
+    private DateTime _lastRecalcUtc = DateTime.MinValue;
+    private readonly Queue<string> _pendingSpawns = new();
+    private readonly Queue<string> _pendingDespawns = new();
+    private readonly HashSet<string> _activeSet = new(StringComparer.Ordinal);
+    private readonly object _streamingLock = new();
 
     // Rate tracking
     private readonly object _rateLock = new();
@@ -100,6 +120,18 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         _spawnRadiusMeters = options.SpawnRadiusMeters;
         _proximitySweepInterval = TimeSpan.FromSeconds(options.ProximitySweepSeconds);
         _dynamicPruneEnabled = options.DynamicPruneEnabled;
+        
+        // Distance-based streaming config
+        _movementThresholdMeters = options.MovementThresholdMeters;
+        _spawnMarginMeters = options.SpawnMarginMeters;
+        _despawnMarginMeters = options.DespawnMarginMeters;
+        _recalcThrottleMs = options.RecalcThrottleMs;
+        _spawnBatchSize = options.SpawnBatchSize;
+        _despawnBatchSize = options.DespawnBatchSize;
+        _highPriorityRadiusMeters = options.HighPriorityRadiusMeters;
+        _useSpatialBucketing = options.UseSpatialBucketing;
+        _bucketSizeMeters = options.BucketSizeMeters;
+        
         // Initialize smooth per-spawn pacing (avoid bursty spawns that can overwhelm SimConnect)
         if (options.SpawnPerSecond <= 0)
         {
@@ -141,6 +173,11 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     {
         _suspended = true;
         while (_queue.TryDequeue(out _)) { }
+        lock (_streamingLock)
+        {
+            _pendingSpawns.Clear();
+            _pendingDespawns.Clear();
+        }
         _logger.LogInformation("[Suspend] MsfsPointController suspended; activeLights={lights}", TotalActiveLightCount());
     }
 
@@ -158,7 +195,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MsfsPointController started (manager-driven mode) max={max} rate/s={rate}", _maxObjects, _spawnPerSecond);
+        _logger.LogInformation("MsfsPointController started (distance-based streaming) max={max} rate/s={rate}", _maxObjects, _spawnPerSecond);
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -174,6 +211,13 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                     await Task.Delay(_idleDelayMs * 5, stoppingToken);
                     continue;
                 }
+                
+                // Distance-based evaluation and action scheduling
+                try { EvaluateAndScheduleActions(); } catch (Exception ex) { _logger.LogDebug(ex, "EvaluateAndScheduleActions failed"); }
+                
+                // Process batched spawn/despawn actions
+                try { await ProcessBatchedActionsAsync(stoppingToken); } catch (Exception ex) { _logger.LogDebug(ex, "ProcessBatchedActions failed"); }
+                
                 // Stopbar crossing detection based on latest aircraft movement
                 var flightForCross = _simManager.LatestState;
                 if (flightForCross != null) { try { DetectStopbarCrossings(flightForCross); } catch (Exception ex) { _logger.LogDebug(ex, "DetectStopbarCrossings failed"); } }
@@ -470,6 +514,12 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         {
             _stopbarSegments.Clear();
             _layoutCache.Clear();
+            lock (_streamingLock)
+            {
+                _pendingSpawns.Clear();
+                _pendingDespawns.Clear();
+                _activeSet.Clear();
+            }
             await DespawnAllAsync();
             // Drop cached point states to avoid respawning with old package
             _latestStates.Clear();
@@ -876,6 +926,291 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
     // Overlap despawn removed in simplified implementation
 
+    /// <summary>
+    /// Calculate squared distance for performance (avoids sqrt).
+    /// </summary>
+    private static double SquaredDistanceMeters(double lat1, double lon1, double lat2, double lon2)
+    {
+        const double R = 6371000; // meters
+        double dLat = DegreesToRadians(lat2 - lat1);
+        double dLon = DegreesToRadians(lon2 - lon1);
+        double a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
+                   Math.Cos(DegreesToRadians(lat1)) * Math.Cos(DegreesToRadians(lat2)) *
+                   Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
+        double c = 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
+        double distance = R * c;
+        return distance * distance; // Return squared distance
+    }
+
+    /// <summary>
+    /// Evaluate desired active set based on distance from aircraft.
+    /// Returns list of point IDs that should be active, ordered by priority.
+    /// </summary>
+    private List<string> EvaluateDesiredActiveSet(FlightState flight)
+    {
+        lock (_streamingLock)
+        {
+            var acLat = flight.Latitude;
+            var acLon = flight.Longitude;
+
+            // Build list of all ON point states with their squared distances
+            var candidates = new List<(string PointId, double SqDist, bool IsHighPriority)>();
+            
+            foreach (var kv in _latestStates)
+            {
+                var ps = kv.Value;
+                if (!ps.IsOn) continue; // Only consider ON states
+                
+                var sqDist = SquaredDistanceMeters(acLat, acLon, ps.Metadata.Latitude, ps.Metadata.Longitude);
+                var dist = Math.Sqrt(sqDist);
+                
+                // Check if high priority (within immediate proximity threshold)
+                bool isHighPriority = dist <= _highPriorityRadiusMeters;
+                
+                // Apply spawn margin: only include if within (spawnRadius - margin)
+                double effectiveSpawnRadius = _spawnRadiusMeters - _spawnMarginMeters;
+                if (dist <= effectiveSpawnRadius || isHighPriority)
+                {
+                    candidates.Add((ps.Metadata.Id, sqDist, isHighPriority));
+                }
+            }
+
+            // Sort by priority first (high priority first), then by squared distance (closest first)
+            var sorted = candidates
+                .OrderBy(c => c.IsHighPriority ? 0 : 1)
+                .ThenBy(c => c.SqDist)
+                .ToList();
+
+            // Take up to MaxObjects, but include all high priority objects
+            var desired = new List<string>();
+            foreach (var candidate in sorted)
+            {
+                // Always include high priority
+                if (candidate.IsHighPriority)
+                {
+                    desired.Add(candidate.PointId);
+                }
+                // Include normal priority up to cap
+                else if (desired.Count < _maxObjects)
+                {
+                    desired.Add(candidate.PointId);
+                }
+                // High priority can exceed cap if needed
+                else if (candidate.IsHighPriority)
+                {
+                    desired.Add(candidate.PointId);
+                }
+            }
+
+            return desired;
+        }
+    }
+
+    /// <summary>
+    /// Generate spawn and despawn actions based on diff between current and desired sets.
+    /// </summary>
+    private (List<string> ToSpawn, List<string> ToDespawn) DiffActiveSet(List<string> desiredSet, FlightState flight)
+    {
+        lock (_streamingLock)
+        {
+            var acLat = flight.Latitude;
+            var acLon = flight.Longitude;
+            
+            // Build current active set from spawned objects
+            var currentSet = new HashSet<string>(StringComparer.Ordinal);
+            var mgr = GetManager();
+            if (mgr != null)
+            {
+                foreach (var o in mgr.ManagedObjects.Values)
+                {
+                    if (!o.IsActive) continue;
+                    if (TryGetUserPointAndSlot(o, out var pid, out var _slot) && pid != null)
+                    {
+                        currentSet.Add(pid);
+                    }
+                }
+            }
+            
+            // Also track what we think is active
+            foreach (var pointId in _activeSet)
+            {
+                currentSet.Add(pointId);
+            }
+
+            var desiredHash = new HashSet<string>(desiredSet, StringComparer.Ordinal);
+
+            // Determine what to spawn (in desired but not in current)
+            var toSpawn = new List<string>();
+            foreach (var pointId in desiredSet)
+            {
+                if (!currentSet.Contains(pointId))
+                {
+                    toSpawn.Add(pointId);
+                }
+            }
+
+            // Determine what to despawn (in current but not in desired)
+            // Apply despawn margin: only despawn if beyond (despawnRadius + margin)
+            var toDespawn = new List<(string PointId, double SqDist, bool IsHighPriority)>();
+            double effectiveDespawnRadius = _spawnRadiusMeters + _despawnMarginMeters;
+            double effectiveDespawnSqRadius = effectiveDespawnRadius * effectiveDespawnRadius;
+            
+            foreach (var pointId in currentSet)
+            {
+                if (!desiredHash.Contains(pointId))
+                {
+                    // Check distance and priority before despawning
+                    if (_latestStates.TryGetValue(pointId, out var ps))
+                    {
+                        var sqDist = SquaredDistanceMeters(acLat, acLon, ps.Metadata.Latitude, ps.Metadata.Longitude);
+                        var dist = Math.Sqrt(sqDist);
+                        bool isHighPriority = dist <= _highPriorityRadiusMeters;
+                        
+                        // Only despawn if:
+                        // 1. Not high priority (unless absolutely necessary)
+                        // 2. Beyond despawn margin
+                        if (!isHighPriority && sqDist > effectiveDespawnSqRadius)
+                        {
+                            toDespawn.Add((pointId, sqDist, isHighPriority));
+                        }
+                    }
+                    else
+                    {
+                        // No state info, safe to despawn
+                        toDespawn.Add((pointId, double.MaxValue, false));
+                    }
+                }
+            }
+
+            // Sort despawns by distance (farthest first) and priority (low priority first)
+            var despawnList = toDespawn
+                .OrderBy(d => d.IsHighPriority ? 1 : 0)
+                .ThenByDescending(d => d.SqDist)
+                .Select(d => d.PointId)
+                .ToList();
+
+            return (toSpawn, despawnList);
+        }
+    }
+
+    /// <summary>
+    /// Process batched spawn/despawn actions.
+    /// </summary>
+    private async Task ProcessBatchedActionsAsync(CancellationToken ct)
+    {
+        lock (_streamingLock)
+        {
+            // Process despawn batch
+            int despawnCount = 0;
+            while (despawnCount < _despawnBatchSize && _pendingDespawns.Count > 0)
+            {
+                var pointId = _pendingDespawns.Dequeue();
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await DespawnPointAsync(pointId, ct);
+                        lock (_streamingLock)
+                        {
+                            _activeSet.Remove(pointId);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "[BatchDespawn] Failed to despawn {id}", pointId);
+                    }
+                }, ct);
+                despawnCount++;
+            }
+
+            // Process spawn batch
+            int spawnCount = 0;
+            while (spawnCount < _spawnBatchSize && _pendingSpawns.Count > 0)
+            {
+                var pointId = _pendingSpawns.Dequeue();
+                if (_latestStates.TryGetValue(pointId, out var ps))
+                {
+                    _queue.Enqueue(ps);
+                    lock (_streamingLock)
+                    {
+                        _activeSet.Add(pointId);
+                    }
+                }
+                spawnCount++;
+            }
+
+            if (despawnCount > 0 || spawnCount > 0)
+            {
+                _logger.LogTrace("[BatchProcess] Spawned={spawn} Despawned={despawn} PendingSpawns={ps} PendingDespawns={pd}", 
+                    spawnCount, despawnCount, _pendingSpawns.Count, _pendingDespawns.Count);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Main distance-based evaluation and scheduling logic.
+    /// Called periodically to evaluate desired active set and queue actions.
+    /// </summary>
+    private void EvaluateAndScheduleActions()
+    {
+        var flight = _simManager.LatestState;
+        if (flight == null) return;
+
+        lock (_streamingLock)
+        {
+            var now = DateTime.UtcNow;
+            var acLat = flight.Latitude;
+            var acLon = flight.Longitude;
+
+            // Check movement threshold
+            double movementDist = DistanceMeters(_lastEvalLatitude, _lastEvalLongitude, acLat, acLon);
+            bool hasMoved = movementDist >= _movementThresholdMeters;
+            
+            // Check time throttle
+            bool throttleExpired = (now - _lastRecalcUtc).TotalMilliseconds >= _recalcThrottleMs;
+
+            // Only recalculate if moved enough OR throttle expired
+            if (!hasMoved && !throttleExpired)
+            {
+                return;
+            }
+
+            // Update last evaluation position and time
+            _lastEvalLatitude = acLat;
+            _lastEvalLongitude = acLon;
+            _lastRecalcUtc = now;
+
+            // Step 1: Evaluate desired active set
+            var desiredSet = EvaluateDesiredActiveSet(flight);
+
+            // Step 2: Diff against current
+            var (toSpawn, toDespawn) = DiffActiveSet(desiredSet, flight);
+
+            // Step 3: Queue actions
+            foreach (var pointId in toSpawn)
+            {
+                if (!_pendingSpawns.Contains(pointId))
+                {
+                    _pendingSpawns.Enqueue(pointId);
+                }
+            }
+
+            foreach (var pointId in toDespawn)
+            {
+                if (!_pendingDespawns.Contains(pointId))
+                {
+                    _pendingDespawns.Enqueue(pointId);
+                }
+            }
+
+            if (toSpawn.Count > 0 || toDespawn.Count > 0)
+            {
+                _logger.LogDebug("[DistanceEval] Moved={dist:F0}m NewSpawns={spawn} NewDespawns={despawn} DesiredTotal={desired}", 
+                    movementDist, toSpawn.Count, toDespawn.Count, desiredSet.Count);
+            }
+        }
+    }
+
     private async Task DespawnPointAsync(string pointId, CancellationToken ct)
     {
         var mgr = GetManager();
@@ -1084,6 +1419,10 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             try { await DespawnLightAsync(obj, ct); Interlocked.Increment(ref _totalDespawned); _objectStateIds.TryRemove(obj.ObjectId, out _); }
             catch (Exception ex) { _logger.LogTrace(ex, "[DespawnAllError] obj={id}", obj.ObjectId); }
         }
+        lock (_streamingLock)
+        {
+            _activeSet.Clear();
+        }
         _logger.LogInformation("[DespawnAll] removedLights={removed} activeLights={active}", ours.Count, TotalActiveLightCount());
     }
 
@@ -1201,4 +1540,15 @@ internal sealed class MsfsPointControllerOptions
     public double SpawnRadiusMeters { get; init; } = 8000;
     public int ProximitySweepSeconds { get; init; } = 5;
     public bool DynamicPruneEnabled { get; init; } = true;
+    
+    // Distance-based streaming parameters
+    public double MovementThresholdMeters { get; init; } = 50.0;  // Min movement to trigger recalc
+    public double SpawnMarginMeters { get; init; } = 200.0;        // Spawn if within (spawnRadius - margin)
+    public double DespawnMarginMeters { get; init; } = 200.0;      // Despawn if beyond (despawnRadius + margin)
+    public int RecalcThrottleMs { get; init; } = 1000;             // Min time between full recalcs
+    public int SpawnBatchSize { get; init; } = 5;                  // Max spawns per frame
+    public int DespawnBatchSize { get; init; } = 5;                // Max despawns per frame
+    public double HighPriorityRadiusMeters { get; init; } = 500.0; // Objects within this are high priority
+    public bool UseSpatialBucketing { get; init; } = false;        // Enable spatial optimization for very large airports
+    public double BucketSizeMeters { get; init; } = 2000.0;        // Size of spatial buckets
 }
