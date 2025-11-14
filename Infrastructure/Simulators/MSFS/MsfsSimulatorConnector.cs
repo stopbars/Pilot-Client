@@ -208,6 +208,7 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             var svm = client.SimVars;
             if (svm == null) return null;
 
+            await SimConnectRequestLimiter.WaitAsync(4, ct).ConfigureAwait(false);
             await _simVarGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
@@ -568,6 +569,7 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
                     await _simVarGate.WaitAsync(ct).ConfigureAwait(false);
                     try
                     {
+                        await SimConnectRequestLimiter.WaitAsync(1, ct).ConfigureAwait(false);
                         altitudeFeet = await client.SimVars.GetAsync<double>("PLANE ALTITUDE", "feet", cancellationToken: ct).ConfigureAwait(false);
                     }
                     finally
@@ -598,6 +600,7 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
             SimObject simObj;
             try
             {
+                await SimConnectRequestLimiter.WaitAsync(1, ct).ConfigureAwait(false);
                 simObj = await mgr.CreateObjectAsync(model, pos, userData: pointId, cancellationToken: ct).ConfigureAwait(false);
             }
             catch (Exception createEx)
@@ -630,7 +633,11 @@ public sealed class MsfsSimulatorConnector : ISimulatorConnector, IDisposable
         var client = _client;
         var mgr = client?.AIObjects;
         if (mgr == null) return;
-        try { await mgr.RemoveObjectAsync(simObject, ct).ConfigureAwait(false); }
+        try
+        {
+            await SimConnectRequestLimiter.WaitAsync(1, ct).ConfigureAwait(false);
+            await mgr.RemoveObjectAsync(simObject, ct).ConfigureAwait(false);
+        }
         catch (Exception ex) { _logger.LogDebug(ex, "DespawnLightAsync failed {obj}", simObject.ObjectId); }
     }
 
