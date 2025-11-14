@@ -1,13 +1,15 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
+using BARS_Client_V2.Application;
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Infrastructure.Networking;
-using BARS_Client_V2.Application;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SimConnect.NET.AI;
@@ -15,69 +17,47 @@ using SimConnect.NET.AI;
 namespace BARS_Client_V2.Infrastructure.Simulators.Msfs;
 
 /// <summary>
-/// Queues point state changes and (eventually) reflects them inside MSFS by spawning / updating custom SimObjects.
-/// Currently contains stubs for spawn/despawn until concrete SimObject titles & WASM variables are defined.
+/// Distance-based point controller that keeps MSFS SimObjects in sync with the server state
+/// within a visibility radius around the aircraft. Server state is the sole source of truth;
+/// spawned state simply mirrors whichever objects are currently inside the visibility bubble.
 /// </summary>
 internal sealed class MsfsPointController : BackgroundService, IPointStateListener
 {
     private readonly ILogger<MsfsPointController> _logger;
-    private readonly ISimulatorConnector _connector; // assumed MSFS
     private readonly AirportStateHub _hub;
     private readonly SimulatorManager _simManager;
-    private readonly ConcurrentQueue<PointState> _queue = new();
-    private readonly ConcurrentDictionary<string, PointState> _latestStates = new();
-    private readonly ConcurrentDictionary<string, IReadOnlyList<LightLayout>> _layoutCache = new();
-    private readonly System.Threading.SemaphoreSlim _spawnConcurrency = new(1, 1);
-    // Track stateId for each spawned SimObject (objectId -> stateId) so we don't rely on ContainerTitle which proved unreliable.
-    private readonly ConcurrentDictionary<uint, int> _objectStateIds = new();
+    private readonly ISimulatorConnector _connector;
+    private readonly MsfsPointControllerOptions _options;
+    private static readonly FieldInfo? MsfsConnectorClientField = typeof(MsfsSimulatorConnector)
+        .GetField("_client", BindingFlags.NonPublic | BindingFlags.Instance);
 
-    // Config
-    private readonly int _maxObjects;
-    private readonly int _spawnPerSecond;
-    private readonly int _idleDelayMs;
-    private readonly int _disconnectedDelayMs;
-    private readonly int _errorBackoffMs;
-    private readonly double _spawnRadiusMeters;
-    private readonly TimeSpan _proximitySweepInterval;
-    private DateTime _nextProximitySweepUtc = DateTime.UtcNow;
-    private readonly bool _dynamicPruneEnabled;
+    private readonly ConcurrentDictionary<string, PointState> _serverStates = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SpawnedPoint> _spawnedPoints = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, IReadOnlyList<AirportStateHub.LightLayout>> _layoutCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _updateVersions = new(StringComparer.Ordinal);
+    private readonly Channel<string> _pendingUpdates = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
+    {
+        AllowSynchronousContinuations = false,
+        SingleReader = true,
+        SingleWriter = false
+    });
 
-    // Rate tracking
+    private readonly object _visibilityLock = new();
+    private readonly HashSet<string> _visiblePointIds = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<uint, (string PointId, int Slot)> _objectIndex = new();
+    private readonly SemaphoreSlim _spawnSemaphore = new(1, 1);
+
     private readonly object _rateLock = new();
-    private TimeSpan _perSpawnInterval = TimeSpan.FromMilliseconds(100);
-    private DateTime _nextAllowedSpawnUtc = DateTime.MinValue;
+    private TimeSpan _perSpawnInterval;
+    private DateTime _nextSpawnUtc = DateTime.MinValue;
+    private DateTime _nextVisibilitySweepUtc = DateTime.MinValue;
+    private SimObjectManager? _cachedManager;
+    private readonly List<string> _orderedWorkset = new();
+    private readonly List<string> _visibilitySnapshot = new();
+    private readonly List<string> _staleVisibilityIds = new();
 
-    // Stats
-    private long _totalReceived;
-    private long _totalSpawnAttempts;
-    private long _totalDespawned;
-    private long _totalSkippedCap;
-    private DateTime _lastSummary = DateTime.UtcNow;
-
+    private (double Lat, double Lon)? _lastCenter;
     private volatile bool _suspended;
-
-    // Stopbar crossing detection
-    private double? _prevLat;
-    private double? _prevLon;
-    private readonly ConcurrentDictionary<string, StopbarSegment> _stopbarSegments = new();
-    private readonly ConcurrentDictionary<string, DateTime> _crossDebounceUntil = new();
-    private readonly TimeSpan _crossDebounceWindow = TimeSpan.FromSeconds(5);
-    private readonly record struct StopbarSegment(
-        double LatA,
-        double LonA,
-        double LatB,
-        double LonB,
-        double? FrontHeadingDeg);
-    private readonly record struct CrossingDetails(
-        (double x, double y) P0,
-        (double x, double y) P1);
-
-    // Failure/backoff
-    private readonly ConcurrentDictionary<string, (int Failures, DateTime LastFailureUtc)> _spawnFailures = new();
-    private readonly TimeSpan _failureCooldown = TimeSpan.FromSeconds(10);
-    private const int FailureThresholdForCooldown = 3;
-    private readonly ConcurrentDictionary<string, DateTime> _nextAttemptUtc = new();
-    private readonly ConcurrentDictionary<string, DateTime> _hardCooldownUntil = new();
 
     public MsfsPointController(IEnumerable<ISimulatorConnector> connectors,
                                ILogger<MsfsPointController> logger,
@@ -85,954 +65,681 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                                SimulatorManager simManager,
                                MsfsPointControllerOptions? options = null)
     {
-        _connector = connectors.FirstOrDefault(c => c.SimulatorId.Equals("MSFS", StringComparison.OrdinalIgnoreCase)) ?? connectors.First();
         _logger = logger;
-        options ??= new MsfsPointControllerOptions();
         _hub = hub;
         _simManager = simManager;
+        _options = options ?? new MsfsPointControllerOptions();
+        _connector = connectors.FirstOrDefault(c => c.SimulatorId.Equals("MSFS", StringComparison.OrdinalIgnoreCase))
+                     ?? connectors.First();
+
         _hub.PointStateChanged += OnPointStateChanged;
         _hub.MapLoaded += OnMapLoaded;
-        _maxObjects = options.MaxObjects;
-        _spawnPerSecond = options.SpawnPerSecond;
-        _idleDelayMs = options.IdleDelayMs;
-        _disconnectedDelayMs = options.DisconnectedDelayMs;
-        _errorBackoffMs = options.ErrorBackoffMs;
-        _spawnRadiusMeters = options.SpawnRadiusMeters;
-        _proximitySweepInterval = TimeSpan.FromSeconds(options.ProximitySweepSeconds);
-        _dynamicPruneEnabled = options.DynamicPruneEnabled;
-        // Initialize smooth per-spawn pacing (avoid bursty spawns that can overwhelm SimConnect)
-        if (options.SpawnPerSecond <= 0)
-        {
-            // Treat <=0 as unlimited; keep a very small interval to avoid tight loops
-            _perSpawnInterval = TimeSpan.Zero;
-        }
-        else
-        {
-            // Space spawns evenly: e.g., 10/s -> 100ms between spawns
-            _perSpawnInterval = TimeSpan.FromSeconds(1.0 / Math.Max(1, options.SpawnPerSecond));
-        }
+
+        _perSpawnInterval = _options.SpawnRatePerSecond <= 0
+            ? TimeSpan.Zero
+            : TimeSpan.FromSeconds(1.0 / _options.SpawnRatePerSecond);
     }
 
     public void OnPointStateChanged(PointState state)
     {
-        _latestStates[state.Metadata.Id] = state;
-        if (_suspended) return; // cache only
-        _queue.Enqueue(state);
-        var total = Interlocked.Increment(ref _totalReceived);
-        if (total <= 5 || (total % 500) == 0)
-        {
-            var m = state.Metadata;
-            _logger.LogInformation("[RecvSample] id={id} on={on} type={type} apt={apt} lat={lat:F6} lon={lon:F6} total={tot}",
-                m.Id, state.IsOn, m.Type, m.AirportId, m.Latitude, m.Longitude, total);
-        }
-        else if (_logger.IsEnabled(LogLevel.Trace))
-        {
-            var m = state.Metadata;
-            _logger.LogTrace("[Recv] id={id} on={on} type={type} apt={apt} lat={lat:F6} lon={lon:F6}",
-                m.Id, state.IsOn, m.Type, m.AirportId, m.Latitude, m.Longitude);
-        }
+        var pointId = state.Metadata.Id;
+        _serverStates[pointId] = state;
+        IncrementVersion(pointId);
+        QueuePointSync(pointId);
     }
 
-    /// <summary>
-    /// Temporarily suspend all spawning/despawning activity (except explicit DespawnAllAsync) and clear queued work.
-    /// Used when the upstream server / VATSIM disconnects so we freeze visual state instead of thrashing.
-    /// </summary>
     public void Suspend()
     {
         _suspended = true;
-        while (_queue.TryDequeue(out _)) { }
-        _logger.LogInformation("[Suspend] MsfsPointController suspended; activeLights={lights}", TotalActiveLightCount());
+        _logger.LogInformation("[Suspend] Distance controller paused; active={count}", _spawnedPoints.Count);
     }
 
-    /// <summary>
-    /// Resume normal spawning/despawning operations. Re-enqueues current ON states so they reconcile.
-    /// </summary>
     public void Resume()
     {
         if (!_suspended) return;
         _suspended = false;
-        int requeued = 0;
-        foreach (var kv in _latestStates) if (kv.Value.IsOn) { _queue.Enqueue(kv.Value); requeued++; }
-        _logger.LogInformation("[Resume] MsfsPointController resumed; requeuedActiveOn={requeued} queue={q}", requeued, _queue.Count);
+        foreach (var kv in _serverStates)
+        {
+            QueuePointSync(kv.Key);
+        }
+        _logger.LogInformation("[Resume] Distance controller resumed; queued resync={count}", _serverStates.Count);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MsfsPointController started (manager-driven mode) max={max} rate/s={rate}", _maxObjects, _spawnPerSecond);
+        _logger.LogInformation("MsfsPointController (distance-based) started radius={radius}m", _options.VisibilityRadiusMeters);
+        var workset = new HashSet<string>(StringComparer.Ordinal);
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                if (!_connector.IsConnected)
-                {
-                    if ((_totalReceived % 25) == 0) _logger.LogDebug("[Loop] Waiting for simulator connection.");
-                    await Task.Delay(_disconnectedDelayMs, stoppingToken);
-                    continue;
-                }
                 if (_suspended)
                 {
-                    await Task.Delay(_idleDelayMs * 5, stoppingToken);
+                    await Task.Delay(_options.IdleDelayMs, stoppingToken);
                     continue;
                 }
-                // Stopbar crossing detection based on latest aircraft movement
-                var flightForCross = _simManager.LatestState;
-                if (flightForCross != null) { try { DetectStopbarCrossings(flightForCross); } catch (Exception ex) { _logger.LogDebug(ex, "DetectStopbarCrossings failed"); } }
-                if (_queue.TryDequeue(out var ps))
+
+                if (!_connector.IsConnected || !IsObjectManagerReady())
                 {
-                    await ProcessAsync(ps, stoppingToken);
+                    await Task.Delay(_options.DisconnectedDelayMs, stoppingToken);
+                    continue;
                 }
-                else
+
+                var flight = _simManager.LatestState;
+                if (flight == null)
                 {
-                    await Task.Delay(_idleDelayMs, stoppingToken);
+                    await Task.Delay(_options.IdleDelayMs, stoppingToken);
+                    continue;
                 }
-                if (DateTime.UtcNow >= _nextProximitySweepUtc)
+
+                var center = (Lat: flight.Latitude, Lon: flight.Longitude);
+                var geoCenter = new GeoReference(center.Lat, center.Lon);
+                if (ShouldReevaluateVisibility(center))
                 {
-                    _nextProximitySweepUtc = DateTime.UtcNow + _proximitySweepInterval;
-                    try { await ProximitySweepAsync(stoppingToken); } catch (Exception ex) { _logger.LogDebug(ex, "ProximitySweep failed"); }
+                    ApplyVisibilityChanges(geoCenter, workset);
                 }
-                if ((DateTime.UtcNow - _lastSummary) > TimeSpan.FromSeconds(30))
+
+                QueueVisibilityRechecks(workset);
+
+                DrainPendingUpdates(workset);
+
+                if (workset.Count == 0)
                 {
-                    _lastSummary = DateTime.UtcNow;
-                    _logger.LogInformation("[Summary] received={rec} spawnAttempts={spAtt} activeLights={active} despawned={des} skippedCap={cap} queue={q}",
-                        _totalReceived, _totalSpawnAttempts, TotalActiveLightCount(), _totalDespawned, _totalSkippedCap, _queue.Count);
+                    await Task.Delay(_options.IdleDelayMs, stoppingToken);
+                    continue;
                 }
+
+                OrderWorksetByDistance(workset, geoCenter, _orderedWorkset);
+                foreach (var pointId in _orderedWorkset)
+                {
+                    await SyncPointAsync(pointId, geoCenter, stoppingToken);
+                }
+
+                _orderedWorkset.Clear();
+                workset.Clear();
             }
-            catch (OperationCanceledException) { }
+            catch (OperationCanceledException)
+            {
+            }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "Loop error");
-                try { await Task.Delay(_errorBackoffMs, stoppingToken); } catch { }
+                _logger.LogDebug(ex, "MsfsPointController loop failure");
+                try { await Task.Delay(_options.ErrorBackoffMs, stoppingToken); }
+                catch (OperationCanceledException) { }
             }
         }
     }
 
-    private void DetectStopbarCrossings(FlightState flight)
+    private void DrainPendingUpdates(HashSet<string> workset)
     {
-        var currLat = flight.Latitude;
-        var currLon = flight.Longitude;
-        var currHeading = flight.HeadingDeg;
-        if (!_prevLat.HasValue || !_prevLon.HasValue)
+        while (_pendingUpdates.Reader.TryRead(out var id))
         {
-            _prevLat = currLat; _prevLon = currLon; return;
+            workset.Add(id);
         }
-        var prevLat = _prevLat!.Value;
-        var prevLon = _prevLon!.Value;
-        // If aircraft barely moved, skip
-        if (DistanceMeters(prevLat, prevLon, currLat, currLon) < 1.0) { _prevLat = currLat; _prevLon = currLon; return; }
-
-        foreach (var kv in _latestStates)
-        {
-            var ps = kv.Value;
-            var type = ps.Metadata.Type ?? string.Empty;
-            if (!type.Contains("STOP", StringComparison.OrdinalIgnoreCase) || !type.Contains("BAR", StringComparison.OrdinalIgnoreCase)) continue;
-            if (_crossDebounceUntil.TryGetValue(ps.Metadata.Id, out var until) && DateTime.UtcNow < until) continue;
-
-            var dCurr = DistanceMeters(currLat, currLon, ps.Metadata.Latitude, ps.Metadata.Longitude);
-            if (dCurr > 200) continue; // 200m radius heuristic
-
-            var seg = GetOrBuildStopbarSegment(ps.Metadata.Id, ps);
-            if (seg == null) continue;
-            var segment = seg.Value;
-            if (!Crosses(prevLat, prevLon, currLat, currLon, segment.LatA, segment.LonA, segment.LatB, segment.LonB, out var crossing)) continue;
-
-            if (segment.FrontHeadingDeg.HasValue)
-            {
-                const double HeadingToleranceDeg = 120.0;
-                var frontHeading = segment.FrontHeadingDeg.Value;
-                var aligned = false;
-
-                if (currHeading is double aircraftHeading)
-                {
-                    var diff = AngularDifference(frontHeading, aircraftHeading);
-                    if (diff <= HeadingToleranceDeg) aligned = true;
-                }
-
-                if (!aligned)
-                {
-                    var movementVector = (crossing.P1.x - crossing.P0.x, crossing.P1.y - crossing.P0.y);
-                    if (Math.Abs(movementVector.Item1) > 1e-3 || Math.Abs(movementVector.Item2) > 1e-3)
-                    {
-                        var movementHeading = VectorToHeading(movementVector);
-                        if (!double.IsNaN(movementHeading))
-                        {
-                            var diffMove = AngularDifference(frontHeading, movementHeading);
-                            if (diffMove <= HeadingToleranceDeg) aligned = true;
-                        }
-                    }
-                }
-
-                if (!aligned) continue;
-            }
-
-            _crossDebounceUntil[ps.Metadata.Id] = DateTime.UtcNow + _crossDebounceWindow;
-            _hub.SendStopbarCrossing(ps.Metadata.Id);
-            _logger.LogInformation("[StopbarCrossing] objectId={id} pos=({lat:F6},{lon:F6})", ps.Metadata.Id, currLat, currLon);
-        }
-
-        _prevLat = currLat;
-        _prevLon = currLon;
     }
 
-    private StopbarSegment? GetOrBuildStopbarSegment(string pointId, PointState ps)
+    private void QueuePointSync(string pointId)
     {
-        if (_stopbarSegments.TryGetValue(pointId, out var seg)) return seg;
-        if (!_hub.TryGetLightLayout(pointId, out var lights) || lights.Count < 2) return null;
-
-        double best = -1;
-        (double la, double lo, double lb, double lob) bestPair = default;
-        for (int i = 0; i < lights.Count; i++)
+        if (!_pendingUpdates.Writer.TryWrite(pointId))
         {
-            for (int j = i + 1; j < lights.Count; j++)
-            {
-                var di = DistanceMeters(lights[i].Latitude, lights[i].Longitude, lights[j].Latitude, lights[j].Longitude);
-                if (di > best)
-                {
-                    best = di;
-                    bestPair = (lights[i].Latitude, lights[i].Longitude, lights[j].Latitude, lights[j].Longitude);
-                }
-            }
+            _ = _pendingUpdates.Writer.WriteAsync(pointId);
         }
-        if (best <= 0) return null;
-
-        double? heading = null;
-        var headingCandidates = new List<double>();
-        foreach (var light in lights)
-        {
-            if (!light.Heading.HasValue) continue;
-            var normalized = NormalizeHeading(light.Heading.Value);
-            if (normalized.HasValue) headingCandidates.Add(normalized.Value);
-        }
-        if (headingCandidates.Count > 0)
-        {
-            heading = AverageHeading(headingCandidates);
-        }
-        else
-        {
-            heading = ParseOrientationHeading(ps.Metadata.Orientation);
-        }
-
-        var result = new StopbarSegment(bestPair.la, bestPair.lo, bestPair.lb, bestPair.lob, heading);
-        _stopbarSegments[pointId] = result;
-        return result;
     }
 
-    private static bool Crosses(double pLat0, double pLon0, double pLat1, double pLon1, double aLat, double aLon, double bLat, double bLon, out CrossingDetails details)
+    private long GetVersionToken(string pointId)
     {
-        var midLat = (aLat + bLat) * 0.5;
-        var cosMidLat = Math.Cos(DegreesToRadians(midLat));
-        (double x, double y) Project(double lat, double lon)
+        return _updateVersions.TryGetValue(pointId, out var version) ? version : 0;
+    }
+
+    private void IncrementVersion(string pointId)
+    {
+        _updateVersions.AddOrUpdate(pointId, 1, static (_, current) => current == long.MaxValue ? 1 : current + 1);
+    }
+
+    private bool AbortIfSuperseded(string pointId, long versionToken)
+    {
+        if (!_updateVersions.TryGetValue(pointId, out var latest) || latest <= versionToken)
         {
-            double x = (lon - aLon) * cosMidLat * 111320.0;
-            double y = (lat - aLat) * 110540.0;
-            return (x: x, y: y);
-        }
-
-        var p0 = Project(pLat0, pLon0);
-        var p1 = Project(pLat1, pLon1);
-        var a = (x: 0.0, y: 0.0);
-        var b = Project(bLat, bLon);
-
-        var s0 = Orient(a, b, p0);
-        var s1 = Orient(a, b, p1);
-
-        if (s0 == 0 || s1 == 0 || Math.Sign(s0) == Math.Sign(s1))
-        {
-            details = default;
             return false;
         }
 
-        var ab = Sub(b, a);
-        var ap0 = Sub(p0, a);
-        var ap1 = Sub(p1, a);
-        double abLen2 = Dot(ab, ab);
-        if (abLen2 < 1)
-        {
-            details = default;
-            return false;
-        }
-
-        var t0 = Math.Clamp(Dot(ap0, ab) / abLen2, 0, 1);
-        var t1 = Math.Clamp(Dot(ap1, ab) / abLen2, 0, 1);
-        var t = 0.5 * (t0 + t1);
-        var closest = (x: a.x + ab.x * t, y: a.y + ab.y * t);
-        var dist = DistancePointToSegment(closest, p0, p1);
-        const double tolMeters = 12.0;
-        if (dist > tolMeters)
-        {
-            details = default;
-            return false;
-        }
-
-        details = new CrossingDetails(p0, p1);
+        QueuePointSync(pointId);
         return true;
     }
 
-    private async Task ProcessAsync(PointState ps, CancellationToken ct)
+    private void OrderWorksetByDistance(HashSet<string> workset, in GeoReference center, List<string> ordered)
     {
-        if (_suspended) return;
-        var id = ps.Metadata.Id;
-        var layouts = GetOrBuildLayouts(ps);
-        if (layouts.Count == 0) return;
-        var flight = _simManager.LatestState;
-        if (ps.IsOn && _nextAttemptUtc.TryGetValue(id, out var next) && DateTime.UtcNow < next) { if (_latestStates.TryGetValue(id, out var latest) && (next - DateTime.UtcNow).TotalMilliseconds < _idleDelayMs * 4) _queue.Enqueue(latest); return; }
-        if (ps.IsOn && _spawnFailures.TryGetValue(id, out var fi)) { var since = DateTime.UtcNow - fi.LastFailureUtc; if (fi.Failures >= FailureThresholdForCooldown && since < _failureCooldown) return; }
-        if (ps.IsOn && _hardCooldownUntil.TryGetValue(id, out var hardUntil) && DateTime.UtcNow < hardUntil) return;
-        ClassifyPointObjects(id, out var placeholders, out var variants);
-        _logger.LogTrace("[ProcessState] {id} on={on} placeholders={ph}/{need} variants={varCnt}/{need}", id, ps.IsOn, placeholders.Count, layouts.Count, variants.Count, layouts.Count);
-
-        // Guard: if we somehow have exploded variants count, trim extras (runaway protection)
-        int runawayLimit = layouts.Count * 3;
-        if (variants.Count > runawayLimit)
+        if (workset.Count == 0)
         {
-            var excess = variants.Skip(layouts.Count).ToList(); // keep first layout.Count (arbitrary order)
-            _logger.LogWarning("[Runaway] {id} variants={varCnt} expected={exp} trimming={trim}", id, variants.Count, layouts.Count, excess.Count);
-            await RemoveObjectsAsync(excess, id, ct, "[RunawayTrim]");
-            ClassifyPointObjects(id, out placeholders, out variants); // refresh
-        }
-
-        if (!ps.IsOn)
-        {
-            // OFF: Ensure per-light off variant (offStateId) if provided; otherwise fallback to placeholder (stateId=0).
-            await EnsureOffStateAsync(id, layouts, variants, placeholders, ct);
             return;
         }
 
-        // ON: spawn ON variants first, then remove OFF variants/placeholders once desired counts are satisfied.
-        await EnsureOnStateAsync(id, layouts, ct);
-    }
-
-    private async Task SpawnBatchAsync(string pointId, IReadOnlyList<LightLayout> layouts, int maxToSpawn, bool isPlaceholder, CancellationToken ct)
-    {
-        if (maxToSpawn <= 0) return;
-        int spawned = 0;
-        for (int i = 0; i < layouts.Count && spawned < maxToSpawn; i++)
+        if (workset.Count == 1)
         {
-            if (TotalActiveLightCount() >= _maxObjects)
-            {
-                bool freed = false;
-                if (_dynamicPruneEnabled)
-                {
-                    try { freed = await EnsureCapacityForSpawnAsync(pointId, 1, ct); } catch (Exception ex) { _logger.LogDebug(ex, "[PruneError]"); }
-                }
-                if (!freed && TotalActiveLightCount() >= _maxObjects)
-                {
-                    Interlocked.Increment(ref _totalSkippedCap);
-                    if (_latestStates.TryGetValue(pointId, out var latestCap)) _queue.Enqueue(latestCap);
-                    break;
-                }
-            }
-            await WaitForSpawnSlotAsync(ct);
-            var layout = layouts[i];
-            int? variantState = layout.StateId;
-            if (!isPlaceholder)
-            {
-                // Ensure we don't accidentally spawn placeholders for ON lights when StateId missing
-                if (!variantState.HasValue || variantState == 0) variantState = 1; // default variant state
-            }
-            var desired = isPlaceholder ? layout with { StateId = 0 } : layout with { StateId = variantState };
-            try
-            {
-                var handle = await SpawnLightAsync(pointId, desired, ct);
-                Interlocked.Increment(ref _totalSpawnAttempts);
-                if (handle == null) { RegisterSpawnFailure(pointId); break; }
-                _spawnFailures.TryRemove(pointId, out _);
-                var sid = desired.StateId ?? 0;
-                _objectStateIds[handle.ObjectId] = sid;
-                spawned++;
-                _logger.LogTrace("[Spawned] {id} placeholder={ph} stateId={sid} obj={obj}", pointId, isPlaceholder, sid, handle.ObjectId);
-            }
-            catch (Exception ex)
-            {
-                RegisterSpawnFailure(pointId);
-                _logger.LogDebug(ex, "[SpawnError:Batch] {id}", pointId);
-                break;
-            }
+            ordered.Add(workset.First());
+            return;
         }
-    }
 
-    private async Task RemoveObjectsAsync(List<SimObject> objects, string pointId, CancellationToken ct, string contextTag)
-    {
-        foreach (var obj in objects)
-        {
-            try { await DespawnLightAsync(obj, ct); Interlocked.Increment(ref _totalDespawned); _objectStateIds.TryRemove(obj.ObjectId, out _); }
-            catch (Exception ex) { _logger.LogTrace(ex, "{tag} {id} obj={objId}", contextTag, pointId, obj.ObjectId); }
-        }
-        _logger.LogDebug("{tag} {id} removed={count} activeLights={active}", contextTag, pointId, objects.Count, TotalActiveLightCount());
-    }
+        var pool = ArrayPool<WorkItem>.Shared;
+        var buffer = pool.Rent(workset.Count);
+        var radius = _options.VisibilityRadiusMeters;
+        var length = 0;
 
-    private void TryCompleteOverlap(string pointId) { }
-
-    private async void OnMapLoaded(string _)
-    {
-        // Scenery package or map layout changed for the current airport.
-        // Clear caches and all active sim objects. Do NOT re-enqueue old states here; a fresh snapshot will arrive.
         try
         {
-            _stopbarSegments.Clear();
-            _layoutCache.Clear();
-            await DespawnAllAsync();
-            // Drop cached point states to avoid respawning with old package
-            _latestStates.Clear();
-            while (_queue.TryDequeue(out var __)) { }
-            _logger.LogInformation("[MapReload] Cleared caches, states, and all spawned lights; awaiting fresh snapshot");
+            foreach (var id in workset)
+            {
+                var distance = DistanceForOrdering(id, center);
+                var outside = distance >= radius && distance < double.MaxValue;
+                buffer[length++] = new WorkItem(id, distance, outside);
+            }
+
+            Array.Sort(buffer, 0, length, WorkItemComparer.Instance);
+
+            for (var i = 0; i < length; i++)
+            {
+                ordered.Add(buffer[i].Id);
+            }
+        }
+        finally
+        {
+            pool.Return(buffer, clearArray: true);
+        }
+    }
+
+    private double DistanceForOrdering(string pointId, in GeoReference center)
+    {
+        if (_serverStates.TryGetValue(pointId, out var state))
+        {
+            var dist = DistanceMeters(center, state.Metadata.Latitude, state.Metadata.Longitude);
+            if (double.IsNaN(dist) || double.IsInfinity(dist))
+            {
+                return double.MaxValue;
+            }
+
+            return dist;
+        }
+
+        return double.MaxValue;
+    }
+
+    private bool ShouldReevaluateVisibility((double Lat, double Lon) center)
+    {
+        if (!_lastCenter.HasValue)
+        {
+            _lastCenter = center;
+            return true;
+        }
+
+        var moved = DistanceMeters(_lastCenter.Value.Lat, _lastCenter.Value.Lon, center.Lat, center.Lon);
+        if (moved >= _options.CenterRecalcThresholdMeters)
+        {
+            _lastCenter = center;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void ApplyVisibilityChanges(in GeoReference center, HashSet<string> workset)
+    {
+        var entryRadius = _options.VisibilityRadiusMeters;
+        var exitRadius = entryRadius + _options.VisibilityHysteresisMeters;
+        var staleIds = _staleVisibilityIds;
+        staleIds.Clear();
+
+        lock (_visibilityLock)
+        {
+            foreach (var kv in _serverStates)
+            {
+                var dist = DistanceMeters(center, kv.Value.Metadata.Latitude, kv.Value.Metadata.Longitude);
+                if (dist <= entryRadius)
+                {
+                    if (_visiblePointIds.Add(kv.Key))
+                    {
+                        workset.Add(kv.Key);
+                    }
+                }
+                else if (_visiblePointIds.Contains(kv.Key) && dist > exitRadius)
+                {
+                    _visiblePointIds.Remove(kv.Key);
+                    workset.Add(kv.Key);
+                }
+            }
+
+            foreach (var id in _visiblePointIds)
+            {
+                if (!_serverStates.ContainsKey(id))
+                {
+                    staleIds.Add(id);
+                }
+            }
+
+            if (staleIds.Count > 0)
+            {
+                foreach (var staleId in staleIds)
+                {
+                    _visiblePointIds.Remove(staleId);
+                    workset.Add(staleId);
+                }
+            }
+        }
+
+        staleIds.Clear();
+    }
+
+    private void QueueVisibilityRechecks(HashSet<string> workset)
+    {
+        if (_options.VisibilitySweepIntervalMs <= 0)
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        if (now < _nextVisibilitySweepUtc)
+        {
+            return;
+        }
+
+        List<string>? snapshot = null;
+        lock (_visibilityLock)
+        {
+            if (_visiblePointIds.Count > 0)
+            {
+                snapshot = _visibilitySnapshot;
+                snapshot.Clear();
+                snapshot.AddRange(_visiblePointIds);
+            }
+        }
+
+        if (snapshot != null)
+        {
+            foreach (var id in snapshot)
+            {
+                workset.Add(id);
+            }
+
+            snapshot.Clear();
+        }
+
+        _nextVisibilitySweepUtc = now.AddMilliseconds(_options.VisibilitySweepIntervalMs);
+    }
+
+    private async Task SyncPointAsync(string pointId, GeoReference center, CancellationToken ct)
+    {
+        var versionToken = GetVersionToken(pointId);
+
+        if (!_serverStates.TryGetValue(pointId, out var state))
+        {
+            if (AbortIfSuperseded(pointId, versionToken))
+            {
+                return;
+            }
+            await DespawnPointAsync(pointId, ct);
+            return;
+        }
+
+        if (AbortIfSuperseded(pointId, versionToken))
+        {
+            return;
+        }
+
+        var insideRadius = IsWithinRadius(pointId, state, center);
+        lock (_visibilityLock)
+        {
+            if (insideRadius) _visiblePointIds.Add(pointId);
+            else _visiblePointIds.Remove(pointId);
+        }
+
+        if (AbortIfSuperseded(pointId, versionToken))
+        {
+            return;
+        }
+
+        if (!insideRadius)
+        {
+            if (AbortIfSuperseded(pointId, versionToken))
+            {
+                return;
+            }
+            await DespawnPointAsync(pointId, ct);
+            return;
+        }
+
+        var layouts = GetLayouts(pointId, state);
+        if (layouts.Count == 0)
+        {
+            if (AbortIfSuperseded(pointId, versionToken))
+            {
+                return;
+            }
+            await DespawnPointAsync(pointId, ct);
+            return;
+        }
+
+        var spawned = _spawnedPoints.GetOrAdd(pointId, id => new SpawnedPoint(id));
+
+        for (int slot = 0; slot < layouts.Count; slot++)
+        {
+            if (AbortIfSuperseded(pointId, versionToken))
+            {
+                return;
+            }
+
+            var layout = layouts[slot];
+            var desiredState = ResolveStateId(layout, state.IsOn);
+            SpawnedLight? overlapLight = null;
+            var overlapRemoval = false;
+            if (spawned.Lights.TryGetValue(slot, out var existing))
+            {
+                if (existing.StateId == desiredState && existing.Object.IsActive)
+                {
+                    continue;
+                }
+
+                overlapRemoval = ShouldOverlapPlaceholder(existing.StateId, desiredState, layout, existing.Object.IsActive);
+                if (overlapRemoval)
+                {
+                    overlapLight = existing;
+                }
+                else
+                {
+                    await RemoveLightAsync(pointId, slot, existing, ct);
+                }
+
+                if (AbortIfSuperseded(pointId, versionToken))
+                {
+                    return;
+                }
+            }
+
+            var simObject = await SpawnLightAsync(pointId, layout, desiredState, slot, ct);
+            if (simObject != null)
+            {
+                var light = new SpawnedLight(simObject, desiredState, slot);
+                spawned.Lights[slot] = light;
+                _objectIndex[simObject.ObjectId] = (pointId, slot);
+                if (overlapRemoval && overlapLight != null)
+                {
+                    await RemoveLightAsync(pointId, slot, overlapLight, ct);
+                }
+            }
+
+            if (AbortIfSuperseded(pointId, versionToken))
+            {
+                return;
+            }
+        }
+
+        foreach (var extra in spawned.Lights.Keys.Where(k => k >= layouts.Count).ToList())
+        {
+            if (spawned.Lights.TryRemove(extra, out var light))
+            {
+                await RemoveLightAsync(pointId, extra, light, ct);
+
+                if (AbortIfSuperseded(pointId, versionToken))
+                {
+                    return;
+                }
+            }
+        }
+
+        if (AbortIfSuperseded(pointId, versionToken))
+        {
+            return;
+        }
+    }
+
+    private IReadOnlyList<AirportStateHub.LightLayout> GetLayouts(string pointId, PointState state)
+    {
+        return _layoutCache.GetOrAdd(pointId, _ =>
+        {
+            if (_hub.TryGetLightLayout(pointId, out var layouts) && layouts.Count > 0)
+            {
+                return layouts.ToList();
+            }
+
+            return new List<AirportStateHub.LightLayout>
+            {
+                new(state.Metadata.Latitude, state.Metadata.Longitude, null, state.Metadata.Color, null, null)
+            };
+        });
+    }
+
+    private static int ResolveStateId(AirportStateHub.LightLayout layout, bool isOn)
+    {
+        if (isOn)
+        {
+            if (layout.StateId.HasValue && layout.StateId.Value > 0)
+            {
+                return layout.StateId.Value;
+            }
+
+            return 1;
+        }
+
+        if (layout.OffStateId.HasValue)
+        {
+            return layout.OffStateId.Value;
+        }
+
+        return 0;
+    }
+
+    private async Task RemoveLightAsync(string pointId, int slot, SpawnedLight light, CancellationToken ct)
+    {
+        try
+        {
+            await DespawnLightAsync(light.Object, ct);
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "[MapReload] Failed to hot-reload after map change");
+            _logger.LogTrace(ex, "[DespawnFail] point={id} slot={slot}", pointId, slot);
         }
+        finally
+        {
+            _objectIndex.TryRemove(light.Object.ObjectId, out _);
+        }
+    }
+
+    private bool ShouldOverlapPlaceholder(int existingStateId, int desiredStateId, AirportStateHub.LightLayout layout, bool existingIsActive)
+    {
+        if (!existingIsActive)
+        {
+            return false;
+        }
+
+        var onState = ResolveStateId(layout, true);
+        var offState = ResolveStateId(layout, false);
+
+        if (onState == offState)
+        {
+            return false;
+        }
+
+        var goingOn = desiredStateId == onState && existingStateId == offState;
+        var goingOff = desiredStateId == offState && existingStateId == onState;
+        return goingOn || goingOff;
+    }
+
+    private async Task DespawnPointAsync(string pointId, CancellationToken ct)
+    {
+        await _spawnSemaphore.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!_spawnedPoints.TryRemove(pointId, out var spawned))
+            {
+                lock (_visibilityLock)
+                {
+                    _visiblePointIds.Remove(pointId);
+                }
+                return;
+            }
+
+            foreach (var kv in spawned.Lights)
+            {
+                await RemoveLightAsync(pointId, kv.Key, kv.Value, ct).ConfigureAwait(false);
+            }
+
+            lock (_visibilityLock)
+            {
+                _visiblePointIds.Remove(pointId);
+            }
+        }
+        finally
+        {
+            _spawnSemaphore.Release();
+        }
+    }
+
+    private async Task<SimObject?> SpawnLightAsync(string pointId,
+                                                   AirportStateHub.LightLayout layout,
+                                                   int desiredStateId,
+                                                   int slotIndex,
+                                                   CancellationToken ct)
+    {
+        var manager = GetManager();
+        if (manager == null)
+        {
+            return null;
+        }
+
+        if (layout == null)
+        {
+            return null;
+        }
+
+        if (_options.VisibilityRadiusMeters <= 0)
+        {
+            return null;
+        }
+
+        await WaitForSpawnSlotAsync(ct);
+        await SimConnectRequestLimiter.WaitAsync(1, ct).ConfigureAwait(false);
+
+        await _spawnSemaphore.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var tag = $"{pointId}|{slotIndex}";
+            return await manager.CreateObjectAsync(ResolveModel(desiredStateId), new SimConnect.NET.SimConnectDataInitPosition
+            {
+                Latitude = layout.Latitude,
+                Longitude = layout.Longitude,
+                Altitude = _options.SpawnAltitudeFeet,
+                Heading = layout.Heading ?? 0,
+                Pitch = 0,
+                Bank = 0,
+                OnGround = 1,
+                Airspeed = 0
+            }, tag, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[SpawnFail] point={id} slot={slot} state={state}", pointId, slotIndex, desiredStateId);
+            return null;
+        }
+        finally
+        {
+            _spawnSemaphore.Release();
+        }
+    }
+
+    private async Task DespawnLightAsync(SimObject simObject, CancellationToken ct)
+    {
+        var manager = GetManager();
+        if (manager == null)
+        {
+            return;
+        }
+
+        await SimConnectRequestLimiter.WaitAsync(1, ct).ConfigureAwait(false);
+        await manager.RemoveObjectAsync(simObject, ct).ConfigureAwait(false);
     }
 
     private async Task WaitForSpawnSlotAsync(CancellationToken ct)
     {
-        if (_spawnPerSecond <= 0 || _perSpawnInterval <= TimeSpan.Zero) return;
-        var now = DateTime.UtcNow;
+        if (_perSpawnInterval <= TimeSpan.Zero)
+        {
+            return;
+        }
+
         TimeSpan delay;
         lock (_rateLock)
         {
-            if (_nextAllowedSpawnUtc < now)
+            var now = DateTime.UtcNow;
+            if (_nextSpawnUtc < now)
             {
-                _nextAllowedSpawnUtc = now;
+                _nextSpawnUtc = now;
             }
-            delay = _nextAllowedSpawnUtc - now;
-            _nextAllowedSpawnUtc = _nextAllowedSpawnUtc + _perSpawnInterval;
+            delay = _nextSpawnUtc - now;
+            _nextSpawnUtc = _nextSpawnUtc + _perSpawnInterval;
         }
+
         if (delay > TimeSpan.Zero)
         {
-            try { await Task.Delay(delay, ct).ConfigureAwait(false); } catch (TaskCanceledException) { }
+            try { await Task.Delay(delay, ct).ConfigureAwait(false); }
+            catch (TaskCanceledException) { }
         }
     }
 
-    private async Task<SimObject?> SpawnLightAsync(string pointId, LightLayout layout, CancellationToken ct)
+    private bool IsWithinRadius(string pointId, PointState state, GeoReference center)
     {
-        if (_connector is not MsfsSimulatorConnector msfs || !msfs.IsConnected) return null;
-        var clientField = typeof(MsfsSimulatorConnector).GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var client = clientField?.GetValue(msfs) as SimConnect.NET.SimConnectClient;
-        var mgr = client?.AIObjects;
-        if (mgr == null) return null;
-        await _spawnConcurrency.WaitAsync(ct).ConfigureAwait(false);
-        try
+        var dist = DistanceMeters(center, state.Metadata.Latitude, state.Metadata.Longitude);
+        if (dist <= _options.VisibilityRadiusMeters)
         {
-            return await mgr.CreateObjectAsync(ResolveModel(layout.StateId), new SimConnect.NET.SimConnectDataInitPosition
-            {
-                Latitude = layout.Latitude,
-                Longitude = layout.Longitude,
-                Altitude = 50,
-                Heading = layout.Heading ?? 0,
-                Pitch = 0,
-                Bank = 0,
-                OnGround = 1,
-                Airspeed = 0
-            }, userData: pointId, cancellationToken: ct).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "[Connector.Spawn.Fail] point={pointId} stateId={sid}", pointId, layout.StateId);
-            throw;
-        }
-        finally { _spawnConcurrency.Release(); }
-    }
-
-    // Overload that tags the UserData with a specific slot index for per-slot handover: "{pointId}|{slotIndex}"
-    private async Task<SimObject?> SpawnLightAsync(string pointId, LightLayout layout, int slotIndex, CancellationToken ct)
-    {
-        if (slotIndex < 0) return await SpawnLightAsync(pointId, layout, ct);
-        if (_connector is not MsfsSimulatorConnector msfs || !msfs.IsConnected) return null;
-        var clientField = typeof(MsfsSimulatorConnector).GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var client = clientField?.GetValue(msfs) as SimConnect.NET.SimConnectClient;
-        var mgr = client?.AIObjects;
-        if (mgr == null) return null;
-        await _spawnConcurrency.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            var tag = $"{pointId}|{slotIndex}";
-            return await mgr.CreateObjectAsync(ResolveModel(layout.StateId), new SimConnect.NET.SimConnectDataInitPosition
-            {
-                Latitude = layout.Latitude,
-                Longitude = layout.Longitude,
-                Altitude = 50,
-                Heading = layout.Heading ?? 0,
-                Pitch = 0,
-                Bank = 0,
-                OnGround = 1,
-                Airspeed = 0
-            }, userData: tag, cancellationToken: ct).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "[Connector.Spawn.Fail] point={pointId} stateId={sid}", pointId, layout.StateId);
-            throw;
-        }
-        finally { _spawnConcurrency.Release(); }
-    }
-
-    private static bool TryGetUserPointAndSlot(SimObject o, out string? pointId, out int? slotIndex)
-    {
-        pointId = null; slotIndex = null;
-        if (o.UserData is string s && !string.IsNullOrEmpty(s))
-        {
-            pointId = ExtractPointId(s);
-            if (pointId == null) return false;
-            var sep = s.IndexOf('|');
-            if (sep >= 0 && int.TryParse(s.Substring(sep + 1), out var idx)) slotIndex = idx;
             return true;
         }
+
+        var exitRadius = _options.VisibilityRadiusMeters + _options.VisibilityHysteresisMeters;
+        lock (_visibilityLock)
+        {
+            if (_visiblePointIds.Contains(pointId) && dist <= exitRadius)
+            {
+                return true;
+            }
+        }
+
         return false;
     }
 
-    private bool IsOwnedObject(SimObject o)
+    private readonly struct GeoReference
     {
-        if (o == null || !o.IsActive) return false;
-        if (_objectStateIds.ContainsKey(o.ObjectId)) return true;
-        if (o.UserData is string tag)
+        public GeoReference(double lat, double lon)
         {
-            var pointId = ExtractPointId(tag);
-            if (!string.IsNullOrEmpty(pointId))
-            {
-                if (_latestStates.ContainsKey(pointId)) return true;
-                if (pointId.StartsWith("BARS_", StringComparison.OrdinalIgnoreCase)) return true;
-            }
-        }
-        var title = o.ContainerTitle;
-        return !string.IsNullOrEmpty(title) && title.StartsWith("BARS_Light_", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string? ExtractPointId(string tag)
-    {
-        if (string.IsNullOrWhiteSpace(tag)) return null;
-        var sep = tag.IndexOf('|');
-        return sep >= 0 ? tag[..sep] : tag;
-    }
-
-    private async Task RemoveWrongForSlotAsync(string pointId, int desiredState, int slotIndex, CancellationToken ct, string contextTag)
-    {
-        var mgr = GetManager(); if (mgr == null) return;
-        var toRemove = new List<SimObject>();
-        foreach (var o in mgr.ManagedObjects.Values)
-        {
-            if (!o.IsActive) continue;
-            if (!TryGetUserPointAndSlot(o, out var pid, out var idx)) continue;
-            if (!string.Equals(pid, pointId, StringComparison.Ordinal)) continue;
-            if (!idx.HasValue || idx.Value != slotIndex) continue; // act only on the specific slot
-            var sid = ResolveObjectState(o);
-            if (sid != desiredState) toRemove.Add(o);
-        }
-        if (toRemove.Count > 0)
-        {
-            await RemoveObjectsAsync(toRemove, pointId, ct, contextTag);
-        }
-    }
-
-    private async Task EnsureOffStateAsync(string pointId, IReadOnlyList<LightLayout> layouts, List<SimObject> variants, List<SimObject> placeholders, CancellationToken ct)
-    {
-        // Determine desired off-state ids per layout
-        var desiredByIndex = layouts.Select(l => l.OffStateId ?? 0).ToList();
-        var desiredSet = new HashSet<int>(desiredByIndex);
-
-        // Build current list of objects for this point with resolved stateIds
-        var mgr = GetManager();
-        var current = mgr == null ? new List<(SimObject Obj, int State)>()
-                                  : mgr.ManagedObjects.Values
-                                      .Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal))
-                                      .Select(o => (Obj: o, State: ResolveObjectState(o)))
-                                      .ToList();
-
-        // Count current per-state
-        var counts = new Dictionary<int, int>();
-        foreach (var c in current) { if (!counts.TryAdd(c.State, 1)) counts[c.State]++; }
-
-        // Determine desired counts per state
-        var desiredCounts = new Dictionary<int, int>();
-        foreach (var s in desiredByIndex) { var v = s; if (!desiredCounts.TryAdd(v, 1)) desiredCounts[v]++; }
-
-        // Spawn missing OFF objects iterating layouts for positions and states (spawn-first ordering)
-        for (int i = 0; i < layouts.Count; i++)
-        {
-            var desiredState = desiredByIndex[i];
-            var haveCount = counts.TryGetValue(desiredState, out var cv) ? cv : 0;
-            var wantCount = desiredCounts[desiredState];
-            if (haveCount >= wantCount) continue; // enough of this variant exists overall
-
-            // Capacity and rate checks
-            if (TotalActiveLightCount() >= _maxObjects)
-            {
-                bool freed = false;
-                if (_dynamicPruneEnabled)
-                {
-                    try { freed = await EnsureCapacityForSpawnAsync(pointId, 1, ct); } catch (Exception ex) { _logger.LogDebug(ex, "[PruneError]"); }
-                }
-                if (!freed && TotalActiveLightCount() >= _maxObjects)
-                {
-                    Interlocked.Increment(ref _totalSkippedCap);
-                    if (_latestStates.TryGetValue(pointId, out var latestCap)) _queue.Enqueue(latestCap);
-                    break;
-                }
-            }
-            await WaitForSpawnSlotAsync(ct);
-
-            var layout = layouts[i] with { StateId = desiredState };
-            try
-            {
-                var handle = await SpawnLightAsync(pointId, layout, i, ct);
-                Interlocked.Increment(ref _totalSpawnAttempts);
-                if (handle == null) { RegisterSpawnFailure(pointId); break; }
-                _spawnFailures.TryRemove(pointId, out _);
-                _objectStateIds[handle.ObjectId] = desiredState;
-                if (!counts.TryAdd(desiredState, 1)) counts[desiredState]++;
-                _logger.LogTrace("[OffSync:Spawned] {id} stateId={sid} obj={obj}", pointId, desiredState, handle.ObjectId);
-                // Immediately hand over this slot to prevent z-fighting
-                await RemoveWrongForSlotAsync(pointId, desiredState, i, ct, "[OffSync:Swap]");
-            }
-            catch (Exception ex)
-            {
-                RegisterSpawnFailure(pointId);
-                _logger.LogDebug(ex, "[OffSync:SpawnError] {id}", pointId);
-                break;
-            }
+            Lat = lat;
+            Lon = lon;
+            LatitudeRadians = DegreesToRadians(lat);
+            LongitudeRadians = DegreesToRadians(lon);
+            SinLatitude = Math.Sin(LatitudeRadians);
+            CosLatitude = Math.Cos(LatitudeRadians);
         }
 
-        // If we now have all desired OFF objects, remove any wrong-state remnants (ON variants etc.)
-        bool satisfied = desiredCounts.All(kv => counts.TryGetValue(kv.Key, out var cv) && cv >= kv.Value);
-        if (satisfied)
-        {
-            var mgr2 = GetManager();
-            if (mgr2 != null)
-            {
-                var removeWrong = mgr2.ManagedObjects.Values
-                    .Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal))
-                    .Where(o => { var sid = _objectStateIds.TryGetValue(o.ObjectId, out var sidv) ? sidv : ResolveObjectState(o); return !desiredSet.Contains(sid); })
-                    .ToList();
-                if (removeWrong.Count > 0)
-                {
-                    await RemoveObjectsAsync(removeWrong, pointId, ct, "[OffSync:RemoveWrong]");
-                }
-            }
-        }
-        else
-        {
-            if (_latestStates.TryGetValue(pointId, out var latestOff)) _queue.Enqueue(latestOff);
-        }
+        public double Lat { get; }
+        public double Lon { get; }
+        public double LatitudeRadians { get; }
+        public double LongitudeRadians { get; }
+        public double SinLatitude { get; }
+        public double CosLatitude { get; }
     }
 
-    private async Task EnsureOnStateAsync(string pointId, IReadOnlyList<LightLayout> layouts, CancellationToken ct)
+    private static double DistanceMeters(in GeoReference origin, double lat2, double lon2)
     {
-        // Determine desired ON-state ids per layout (fallback to 1 if missing/zero)
-        var desiredByIndex = layouts.Select(l =>
-        {
-            var s = l.StateId.HasValue && l.StateId.Value != 0 ? l.StateId.Value : 1;
-            return s;
-        }).ToList();
-        var desiredSet = new HashSet<int>(desiredByIndex);
-
-        // Build current list of objects for this point with resolved stateIds
-        var mgr = GetManager();
-        var current = mgr == null ? new List<(SimObject Obj, int State)>()
-                                  : mgr.ManagedObjects.Values
-                                      .Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal))
-                                      .Select(o => (Obj: o, State: ResolveObjectState(o)))
-                                      .ToList();
-
-        // Count current per-state
-        var counts = new Dictionary<int, int>();
-        foreach (var c in current) { if (!counts.TryAdd(c.State, 1)) counts[c.State]++; }
-
-        // Determine desired counts per state
-        var desiredCounts = new Dictionary<int, int>();
-        foreach (var s in desiredByIndex) { if (!desiredCounts.TryAdd(s, 1)) desiredCounts[s]++; }
-
-        // Spawn missing ON objects iterating layouts for positions and states (spawn-first ordering)
-        for (int i = 0; i < layouts.Count; i++)
-        {
-            var desiredState = desiredByIndex[i];
-            var haveCount = counts.TryGetValue(desiredState, out var cv) ? cv : 0;
-            var wantCount = desiredCounts[desiredState];
-            if (haveCount >= wantCount) continue; // enough of this variant exists overall
-
-            // Capacity and rate checks
-            if (TotalActiveLightCount() >= _maxObjects)
-            {
-                bool freed = false;
-                if (_dynamicPruneEnabled)
-                {
-                    try { freed = await EnsureCapacityForSpawnAsync(pointId, 1, ct); } catch (Exception ex) { _logger.LogDebug(ex, "[PruneError]"); }
-                }
-                if (!freed && TotalActiveLightCount() >= _maxObjects)
-                {
-                    Interlocked.Increment(ref _totalSkippedCap);
-                    if (_latestStates.TryGetValue(pointId, out var latestCap)) _queue.Enqueue(latestCap);
-                    break;
-                }
-            }
-            await WaitForSpawnSlotAsync(ct);
-
-            var layout = layouts[i];
-            var spawnLayout = layout with { StateId = desiredState };
-            try
-            {
-                var handle = await SpawnLightAsync(pointId, spawnLayout, i, ct);
-                Interlocked.Increment(ref _totalSpawnAttempts);
-                if (handle == null) { RegisterSpawnFailure(pointId); break; }
-                _spawnFailures.TryRemove(pointId, out _);
-                _objectStateIds[handle.ObjectId] = desiredState;
-                if (!counts.TryAdd(desiredState, 1)) counts[desiredState]++;
-                _logger.LogTrace("[OnSync:Spawned] {id} stateId={sid} obj={obj}", pointId, desiredState, handle.ObjectId);
-                // Immediately hand over this slot to prevent z-fighting
-                await RemoveWrongForSlotAsync(pointId, desiredState, i, ct, "[OnSync:Swap]");
-            }
-            catch (Exception ex)
-            {
-                RegisterSpawnFailure(pointId);
-                _logger.LogDebug(ex, "[OnSync:SpawnError] {id}", pointId);
-                break;
-            }
-        }
-
-        // If we now have all desired ON objects, remove any wrong-state remnants (OFF variants/placeholders)
-        bool satisfied = desiredCounts.All(kv => counts.TryGetValue(kv.Key, out var cv) && cv >= kv.Value);
-        if (satisfied)
-        {
-            var mgr2 = GetManager();
-            if (mgr2 != null)
-            {
-                var removeWrong = mgr2.ManagedObjects.Values
-                    .Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal))
-                    .Where(o => { var sid = _objectStateIds.TryGetValue(o.ObjectId, out var sidv) ? sidv : ResolveObjectState(o); return !desiredSet.Contains(sid); })
-                    .ToList();
-                if (removeWrong.Count > 0)
-                {
-                    await RemoveObjectsAsync(removeWrong, pointId, ct, "[OnSync:RemoveWrong]");
-                }
-            }
-        }
-        else
-        {
-            if (_latestStates.TryGetValue(pointId, out var latestOn)) _queue.Enqueue(latestOn);
-        }
+        const double R = 6371000;
+        double lat2Rad = DegreesToRadians(lat2);
+        double dLat = lat2Rad - origin.LatitudeRadians;
+        double lon2Rad = DegreesToRadians(lon2);
+        double dLon = lon2Rad - origin.LongitudeRadians;
+        double sinLat = Math.Sin(dLat / 2);
+        double sinLon = Math.Sin(dLon / 2);
+        double a = sinLat * sinLat + origin.CosLatitude * Math.Cos(lat2Rad) * sinLon * sinLon;
+        double c = 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
+        return R * c;
     }
-
-    private Task DespawnLightAsync(SimObject simObject, CancellationToken ct)
-    {
-        if (_connector is not MsfsSimulatorConnector msfs) return Task.CompletedTask;
-        var clientField = typeof(MsfsSimulatorConnector).GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var client = clientField?.GetValue(msfs) as SimConnect.NET.SimConnectClient;
-        var mgr = client?.AIObjects;
-        if (mgr == null) return Task.CompletedTask;
-        return mgr.RemoveObjectAsync(simObject, ct);
-    }
-
-
-    private int TotalActiveLightCount()
-    {
-        var mgr = GetManager();
-        if (mgr == null) return 0;
-        return mgr.ManagedObjects.Values.Count(IsOwnedObject);
-    }
-
-    private sealed record LightLayout(double Latitude, double Longitude, double? Heading, string? Color, int? StateId, int? OffStateId);
-
-    private IReadOnlyList<LightLayout> GetOrBuildLayouts(PointState ps) => _layoutCache.GetOrAdd(ps.Metadata.Id, _ =>
-    {
-        IReadOnlyList<AirportStateHub.LightLayout> raw;
-        if (!_hub.TryGetLightLayout(ps.Metadata.Id, out var hubLights) || hubLights.Count == 0)
-            raw = new List<AirportStateHub.LightLayout> { new AirportStateHub.LightLayout(ps.Metadata.Latitude, ps.Metadata.Longitude, null, ps.Metadata.Color, null, null) };
-        else raw = hubLights;
-        return (IReadOnlyList<LightLayout>)raw.Select(l => new LightLayout(l.Latitude, l.Longitude, l.Heading, l.Color, l.StateId, l.OffStateId)).ToList();
-    });
-
-    // group spawning logic removed in manager-driven mode
-
-    private void RegisterSpawnFailure(string pointId)
-    {
-        var now = DateTime.UtcNow;
-        var updated = _spawnFailures.AddOrUpdate(pointId,
-            _ => (1, now),
-            (_, prev) => (prev.Failures + 1, now));
-
-        // Dynamic backoff now exponential: 2^n * 400ms capped at 15s (pre threshold)
-        var backoffMs = (int)Math.Min(Math.Pow(2, updated.Failures) * 400, 15000);
-        if (updated.Failures >= FailureThresholdForCooldown)
-        {
-            // ensure at least failureCooldown (e.g. 10s) after threshold reached, escalate cap to 30s
-            backoffMs = Math.Max(backoffMs, (int)_failureCooldown.TotalMilliseconds);
-            backoffMs = Math.Min(backoffMs, 30000);
-        }
-        var next = now.AddMilliseconds(backoffMs);
-        _nextAttemptUtc[pointId] = next;
-
-        if (updated.Failures == FailureThresholdForCooldown)
-            _logger.LogWarning("[SpawnFail:BackoffStart] {id} failures={fail} backoffMs={ms}", pointId, updated.Failures, backoffMs);
-        else if (updated.Failures > FailureThresholdForCooldown)
-            _logger.LogTrace("[SpawnFail:Backoff] {id} failures={fail} backoffMs={ms}", pointId, updated.Failures, backoffMs);
-        else if (updated.Failures == 1)
-            _logger.LogDebug("[SpawnFail] {id} firstFailure backoffMs={ms}", pointId, backoffMs);
-
-        // Escalate to hard cooldown if failures very high (likely persistent model issue)
-        if (updated.Failures == 6)
-        {
-            var hardUntil = now.AddMinutes(1);
-            _hardCooldownUntil[pointId] = hardUntil;
-            _logger.LogWarning("[SpawnFail:HardCooldownStart] {id} failures={fail} pauseUntil={until:O}", pointId, updated.Failures, hardUntil);
-        }
-    }
-
-    // Overlap despawn removed in simplified implementation
-
-    private async Task DespawnPointAsync(string pointId, CancellationToken ct)
-    {
-        var mgr = GetManager();
-        if (mgr == null) return;
-        var list = mgr.ManagedObjects.Values.Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal)).ToList();
-        if (list.Count == 0) return;
-        _logger.LogDebug("[DespawnPointStart] {id} count={count}", pointId, list.Count);
-        foreach (var obj in list)
-        {
-            try { await DespawnLightAsync(obj, ct); Interlocked.Increment(ref _totalDespawned); _objectStateIds.TryRemove(obj.ObjectId, out _); }
-            catch (Exception ex) { _logger.LogTrace(ex, "[DespawnPointError] {id} obj={objId}", pointId, obj.ObjectId); }
-        }
-        _logger.LogInformation("[DespawnPoint] {id} removed={removed} activeLights={active}", pointId, list.Count, TotalActiveLightCount());
-    }
-
-    // Perform ordering & pruning based on aircraft proximity.
-    private Task ProximitySweepAsync(CancellationToken ct)
-    {
-        var flight = _simManager.LatestState;
-        if (flight == null) return Task.CompletedTask;
-        // Build active point set via manager
-        var activePointIds = new HashSet<string>(StringComparer.Ordinal);
-        var mgr = GetManager();
-        if (mgr != null)
-        {
-            foreach (var o in mgr.ManagedObjects.Values)
-            {
-                if (!o.IsActive) continue;
-                if (TryGetUserPointAndSlot(o, out var pid, out var _slot) && pid != null)
-                    activePointIds.Add(pid);
-            }
-        }
-        // Radius-based despawn removed: keep all previously spawned objects; rely on global caps for safety.
-        // Identify spawn candidates
-        var candidates = new List<(PointState State, double Dist)>();
-        foreach (var kv in _latestStates)
-        {
-            var st = kv.Value;
-            if (!st.IsOn) continue;
-            var dist = DistanceMeters(flight.Latitude, flight.Longitude, st.Metadata.Latitude, st.Metadata.Longitude);
-            // Distance requirement removed; include all ON points (distance retained only for ordering)
-            var (objs, _) = GetPointObjects(st.Metadata.Id);
-            var layouts = GetOrBuildLayouts(st);
-            if (objs.Count >= layouts.Count) continue;
-            candidates.Add((st, dist));
-        }
-        if (candidates.Count == 0) return Task.CompletedTask;
-        // Order by distance (closest first)
-        foreach (var c in candidates.OrderBy(c => c.Dist))
-        {
-            if (ct.IsCancellationRequested) break;
-            if (TotalActiveLightCount() >= _maxObjects) break;
-            _queue.Enqueue(c.State); // enqueue for ProcessAsync which will respect cap & rate
-        }
-        _logger.LogTrace("[ProximityEnqueue] added={count} queue={q}", candidates.Count, _queue.Count);
-        return Task.CompletedTask;
-    }
-
-    private static double? NormalizeHeading(double headingDeg)
-    {
-        if (double.IsNaN(headingDeg) || double.IsInfinity(headingDeg)) return null;
-        var normalized = headingDeg % 360.0;
-        if (normalized < 0) normalized += 360.0;
-        if (normalized >= 360.0) normalized -= 360.0;
-        return normalized;
-    }
-
-    private static double? AverageHeading(IEnumerable<double> headings)
-    {
-        double sumSin = 0;
-        double sumCos = 0;
-        int count = 0;
-        foreach (var h in headings)
-        {
-            var rad = DegreesToRadians(h);
-            sumSin += Math.Sin(rad);
-            sumCos += Math.Cos(rad);
-            count++;
-        }
-        if (count == 0) return null;
-        if (Math.Abs(sumSin) < 1e-6 && Math.Abs(sumCos) < 1e-6) return null;
-        var avg = Math.Atan2(sumSin, sumCos) * 180.0 / Math.PI;
-        if (avg < 0) avg += 360.0;
-        return avg;
-    }
-
-    private static double AngularDifference(double a, double b)
-    {
-        var normA = NormalizeHeading(a) ?? 0;
-        var normB = NormalizeHeading(b) ?? 0;
-        var diff = Math.Abs(normA - normB);
-        return diff > 180 ? 360 - diff : diff;
-    }
-
-    private static double? ParseOrientationHeading(string? orientation)
-    {
-        if (string.IsNullOrWhiteSpace(orientation)) return null;
-        var token = orientation.Trim();
-        if (double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var numeric))
-        {
-            return NormalizeHeading(numeric);
-        }
-        var upper = token.ToUpperInvariant();
-        return upper switch
-        {
-            "N" or "NORTH" or "NORTHBOUND" => 0,
-            "NE" or "NORTHEAST" or "NORTH-EAST" => 45,
-            "E" or "EAST" or "EASTBOUND" => 90,
-            "SE" or "SOUTHEAST" or "SOUTH-EAST" => 135,
-            "S" or "SOUTH" or "SOUTHBOUND" => 180,
-            "SW" or "SOUTHWEST" or "SOUTH-WEST" => 225,
-            "W" or "WEST" or "WESTBOUND" => 270,
-            "NW" or "NORTHWEST" or "NORTH-WEST" => 315,
-            _ => null
-        };
-    }
-
-    private static (double x, double y) HeadingToUnitVector(double headingDeg)
-    {
-        var rad = DegreesToRadians(headingDeg);
-        var x = Math.Sin(rad);
-        var y = Math.Cos(rad);
-        return (x: x, y: y);
-    }
-
-    private static double VectorToHeading((double x, double y) vector)
-    {
-        if (Math.Abs(vector.x) < 1e-6 && Math.Abs(vector.y) < 1e-6) return double.NaN;
-        var rad = Math.Atan2(vector.x, vector.y);
-        var deg = rad * 180.0 / Math.PI;
-        if (deg < 0) deg += 360.0;
-        return deg;
-    }
-
-    private static double DistancePointToSegment((double x, double y) p, (double x, double y) u, (double x, double y) v)
-    {
-        var uv = Sub(v, u);
-        var up = Sub(p, u);
-        var denom = Dot(uv, uv) + 1e-6;
-        var tproj = Math.Clamp(Dot(up, uv) / denom, 0, 1);
-        var proj = (x: u.x + uv.x * tproj, y: u.y + uv.y * tproj);
-        var dx = p.x - proj.x;
-        var dy = p.y - proj.y;
-        return Math.Sqrt(dx * dx + dy * dy);
-    }
-
-    private static double Dot((double x, double y) u, (double x, double y) v) => u.x * v.x + u.y * v.y;
-
-    private static (double x, double y) Sub((double x, double y) u, (double x, double y) v) => (x: u.x - v.x, y: u.y - v.y);
-
-    private static double Orient((double x, double y) a, (double x, double y) b, (double x, double y) p)
-        => (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
 
     private static double DistanceMeters(double lat1, double lon1, double lat2, double lon2)
     {
-        // Haversine formula
-        const double R = 6371000; // meters
+        const double R = 6371000;
         double dLat = DegreesToRadians(lat2 - lat1);
         double dLon = DegreesToRadians(lon2 - lon1);
         double a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
@@ -1044,161 +751,136 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
     private static double DegreesToRadians(double deg) => deg * Math.PI / 180.0;
 
-    private void ResyncActivePointsAfterLayout()
+    private async void OnMapLoaded(string airport)
     {
-        int queued = 0;
-        foreach (var kv in _latestStates)
+        try
         {
-            var ps = kv.Value;
-            if (!ps.IsOn) continue;
-            if (!_hub.TryGetLightLayout(ps.Metadata.Id, out var layout) || layout.Count == 0) continue;
-            var (objs, _) = GetPointObjects(ps.Metadata.Id);
-            if (objs.Count >= layout.Count) continue;
-            _queue.Enqueue(ps);
-            queued++;
+            _layoutCache.Clear();
+            lock (_visibilityLock)
+            {
+                _visiblePointIds.Clear();
+            }
+            _serverStates.Clear();
+            _nextVisibilitySweepUtc = DateTime.MinValue;
+            Volatile.Write(ref _cachedManager, null);
+            await DespawnAllAsync();
         }
-        if (queued > 0) _logger.LogInformation("Resync queued {count} active points for full layout spawn", queued);
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[MapReload] Failed to reset controller for {apt}", airport);
+        }
     }
 
-    /// <summary>
-    /// Despawn all currently active SimObjects immediately (e.g. on server disconnect) without altering cached states.
-    /// New incoming states will respawn as needed.
-    /// </summary>
     public async Task DespawnAllAsync(CancellationToken ct = default)
     {
-        var mgr = GetManager();
-        if (mgr == null)
+        foreach (var pointId in _spawnedPoints.Keys.ToList())
         {
-            _logger.LogInformation("[DespawnAll] AI manager not available");
-            return;
+            await DespawnPointAsync(pointId, ct);
         }
-        var ours = mgr.ManagedObjects.Values.Where(IsOwnedObject).ToList();
-        if (ours.Count == 0)
-        {
-            _logger.LogInformation("[DespawnAll] No active lights to remove");
-            return;
-        }
-        _logger.LogInformation("[DespawnAllStart] lights={lights}", ours.Count);
-        foreach (var obj in ours)
-        {
-            try { await DespawnLightAsync(obj, ct); Interlocked.Increment(ref _totalDespawned); _objectStateIds.TryRemove(obj.ObjectId, out _); }
-            catch (Exception ex) { _logger.LogTrace(ex, "[DespawnAllError] obj={id}", obj.ObjectId); }
-        }
-        _logger.LogInformation("[DespawnAll] removedLights={removed} activeLights={active}", ours.Count, TotalActiveLightCount());
     }
 
-    private (List<SimObject> Objects, int Count) GetPointObjects(string pointId)
+    private bool IsObjectManagerReady()
     {
-        var mgr = GetManager();
-        if (mgr == null) return (new List<SimObject>(), 0);
-        var list = mgr.ManagedObjects.Values.Where(o => o.IsActive && TryGetUserPointAndSlot(o, out var pid, out var _slot) && string.Equals(pid, pointId, StringComparison.Ordinal)).ToList();
-        return (list, list.Count);
+        var manager = GetManager();
+        return manager != null && _connector.IsConnected;
     }
 
     private SimObjectManager? GetManager()
     {
-        if (_connector is not MsfsSimulatorConnector msfs) return null;
-        var clientField = typeof(MsfsSimulatorConnector).GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var client = clientField?.GetValue(msfs) as SimConnect.NET.SimConnectClient;
-        return client?.AIObjects;
-    }
-
-    private int ResolveObjectState(SimObject o)
-    {
-        if (_objectStateIds.TryGetValue(o.ObjectId, out var sid)) return sid;
-        // Fallback: attempt parse from title tail e.g. BARS_Light_21
-        try
+        if (!_connector.IsConnected)
         {
-            var title = o.ContainerTitle ?? string.Empty;
-            var tail = title.Split('_').LastOrDefault();
-            if (int.TryParse(tail, out var parsed)) return parsed;
-        }
-        catch { }
-        return 0; // default placeholder assumption
-    }
-
-    private static string ResolveModel(int? stateId)
-    {
-        if (!stateId.HasValue) return "BARS_Light_0";
-        var s = stateId.Value; if (s < 0) s = 0; return $"BARS_Light_{s}";
-    }
-    private async Task<bool> EnsureCapacityForSpawnAsync(string priorityPointId, int requiredSlots, CancellationToken ct)
-    {
-        var flight = _simManager.LatestState;
-        if (flight == null) return false;
-        if (TotalActiveLightCount() + requiredSlots < _maxObjects) return true; // already enough
-        var mgr = GetManager();
-        if (mgr == null) return false;
-
-        // Build distinct active point set with object counts
-        var pointCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var o in mgr.ManagedObjects.Values)
-        {
-            if (!o.IsActive) continue;
-            if (!TryGetUserPointAndSlot(o, out var pid, out var _slot) || pid == null) continue;
-            if (!pointCounts.TryAdd(pid, 1)) pointCounts[pid]++;
-        }
-        if (pointCounts.Count == 0) return false;
-        // Build distance list
-        var distances = new List<(string PointId, double Dist, int Count)>();
-        foreach (var kv in pointCounts)
-        {
-            if (!_latestStates.TryGetValue(kv.Key, out var ps)) continue; // stale
-            var d = DistanceMeters(flight.Latitude, flight.Longitude, ps.Metadata.Latitude, ps.Metadata.Longitude);
-            distances.Add((kv.Key, d, kv.Value));
-        }
-        if (distances.Count == 0) return false;
-
-        // Order farthest first, but never prune the priority point
-        foreach (var item in distances.OrderByDescending(d => d.Dist))
-        {
-            if (item.PointId == priorityPointId) continue;
-            if (TotalActiveLightCount() + requiredSlots < _maxObjects) break;
-            _logger.LogTrace("[PruneBegin] freeing point={id} dist={dist:F0}m count={count} active={active}/{cap}", item.PointId, item.Dist, item.Count, TotalActiveLightCount(), _maxObjects);
-            try { await DespawnPointAsync(item.PointId, ct); }
-            catch (Exception ex) { _logger.LogDebug(ex, "[PruneFail] point={id}", item.PointId); }
+            Volatile.Write(ref _cachedManager, null);
+            return null;
         }
 
-        var success = TotalActiveLightCount() + requiredSlots <= _maxObjects;
-        if (success) _logger.LogTrace("[PruneSuccess] priority={prio} needed={need} active={active}/{cap}", priorityPointId, requiredSlots, TotalActiveLightCount(), _maxObjects);
-        else _logger.LogDebug("[PruneInsufficient] priority={prio} needed={need} active={active}/{cap}", priorityPointId, requiredSlots, TotalActiveLightCount(), _maxObjects);
-        return success;
+        var cached = Volatile.Read(ref _cachedManager);
+        if (cached != null)
+        {
+            return cached;
+        }
+
+        if (_connector is not MsfsSimulatorConnector msfs)
+        {
+            return null;
+        }
+
+        var client = MsfsConnectorClientField?.GetValue(msfs) as SimConnect.NET.SimConnectClient;
+        var manager = client?.AIObjects;
+        if (manager != null)
+        {
+            Volatile.Write(ref _cachedManager, manager);
+        }
+
+        return manager;
     }
 
-    private void ClassifyPointObjects(string pointId, out List<SimObject> placeholders, out List<SimObject> variants)
+    private static string ResolveModel(int stateId)
     {
-        placeholders = new List<SimObject>();
-        variants = new List<SimObject>();
-        var (objs, _) = GetPointObjects(pointId);
-        foreach (var o in objs)
+        if (stateId < 0) stateId = 0;
+        return $"BARS_Light_{stateId}";
+    }
+
+    private readonly struct WorkItem
+    {
+        public WorkItem(string id, double distance, bool outside)
         {
-            int sid;
-            if (!_objectStateIds.TryGetValue(o.ObjectId, out sid))
+            Id = id;
+            Distance = distance;
+            Outside = outside;
+        }
+
+        public string Id { get; }
+        public double Distance { get; }
+        public bool Outside { get; }
+    }
+
+    private sealed class WorkItemComparer : IComparer<WorkItem>
+    {
+        public static readonly WorkItemComparer Instance = new();
+
+        public int Compare(WorkItem x, WorkItem y)
+        {
+            if (x.Outside != y.Outside)
             {
-                // Fallback: attempt parse from title tail
-                sid = 0;
-                try
-                {
-                    var title = o.ContainerTitle ?? string.Empty;
-                    var tail = title.Split('_').LastOrDefault();
-                    if (int.TryParse(tail, out var parsed)) sid = parsed; else sid = 0; // default placeholder assumption
-                }
-                catch { sid = 0; }
+                return x.Outside ? -1 : 1;
             }
-            if (sid == 0) placeholders.Add(o); else variants.Add(o);
+
+            return x.Distance.CompareTo(y.Distance);
         }
+    }
+
+    private sealed class SpawnedPoint
+    {
+        public SpawnedPoint(string pointId) => PointId = pointId;
+
+        public string PointId { get; }
+        public ConcurrentDictionary<int, SpawnedLight> Lights { get; } = new();
+    }
+
+    private sealed class SpawnedLight
+    {
+        public SpawnedLight(SimObject obj, int stateId, int slot)
+        {
+            Object = obj;
+            StateId = stateId;
+            SlotIndex = slot;
+        }
+
+        public SimObject Object { get; }
+        public int StateId { get; }
+        public int SlotIndex { get; }
     }
 }
 
 internal sealed class MsfsPointControllerOptions
 {
-    public int MaxObjects { get; init; } = 950;
-    public int SpawnPerSecond { get; init; } = 10;
-    public int IdleDelayMs { get; init; } = 10;
+    public double VisibilityRadiusMeters { get; init; } = 500;
+    public double VisibilityHysteresisMeters { get; init; } = 200;
+    public double CenterRecalcThresholdMeters { get; init; } = 50;
+    public int VisibilitySweepIntervalMs { get; init; } = 200;
+    public int SpawnRatePerSecond { get; init; } = 0;
+    public int IdleDelayMs { get; init; } = 50;
     public int DisconnectedDelayMs { get; init; } = 500;
-    public int ErrorBackoffMs { get; init; } = 200;
-    public int OverlapDespawnDelayMs { get; init; } = 1000;
-    public double SpawnRadiusMeters { get; init; } = 8000;
-    public int ProximitySweepSeconds { get; init; } = 5;
-    public bool DynamicPruneEnabled { get; init; } = true;
+    public int ErrorBackoffMs { get; init; } = 250;
+    public double SpawnAltitudeFeet { get; init; } = 0;
 }
