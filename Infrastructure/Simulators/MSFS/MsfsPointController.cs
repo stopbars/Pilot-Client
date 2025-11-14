@@ -230,8 +230,14 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 if ((DateTime.UtcNow - _lastSummary) > TimeSpan.FromSeconds(30))
                 {
                     _lastSummary = DateTime.UtcNow;
-                    _logger.LogInformation("[Summary] received={rec} spawnAttempts={spAtt} activeLights={active} despawned={des} skippedCap={cap} queue={q}",
-                        _totalReceived, _totalSpawnAttempts, TotalActiveLightCount(), _totalDespawned, _totalSkippedCap, _queue.Count);
+                    int pendingSpawns, pendingDespawns;
+                    lock (_streamingLock)
+                    {
+                        pendingSpawns = _pendingSpawns.Count;
+                        pendingDespawns = _pendingDespawns.Count;
+                    }
+                    _logger.LogInformation("[Summary] received={rec} spawnAttempts={spAtt} activeLights={active} despawned={des} skippedCap={cap} queue={q} pendingSpawns={ps} pendingDespawns={pd}",
+                        _totalReceived, _totalSpawnAttempts, TotalActiveLightCount(), _totalDespawned, _totalSkippedCap, _queue.Count, pendingSpawns, pendingDespawns);
                 }
             }
             catch (OperationCanceledException) { }
@@ -496,8 +502,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         }
         _logger.LogDebug("{tag} {id} removed={count} activeLights={active}", contextTag, pointId, objects.Count, TotalActiveLightCount());
     }
-
-    private void TryCompleteOverlap(string pointId) { }
 
     private async void OnMapLoaded(string _)
     {
@@ -917,8 +921,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         }
     }
 
-    // Overlap despawn removed in simplified implementation
-
     /// <summary>
     /// Calculate squared distance for performance (avoids sqrt).
     /// </summary>
@@ -978,18 +980,13 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             var desired = new List<string>();
             foreach (var candidate in sorted)
             {
-                // Always include high priority
+                // Always include high priority (even if over cap)
                 if (candidate.IsHighPriority)
                 {
                     desired.Add(candidate.PointId);
                 }
-                // Include normal priority up to cap
+                // Include normal priority only up to cap
                 else if (desired.Count < _maxObjects)
-                {
-                    desired.Add(candidate.PointId);
-                }
-                // High priority can exceed cap if needed
-                else if (candidate.IsHighPriority)
                 {
                     desired.Add(candidate.PointId);
                 }
@@ -1328,22 +1325,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     }
 
     private static double DegreesToRadians(double deg) => deg * Math.PI / 180.0;
-
-    private void ResyncActivePointsAfterLayout()
-    {
-        int queued = 0;
-        foreach (var kv in _latestStates)
-        {
-            var ps = kv.Value;
-            if (!ps.IsOn) continue;
-            if (!_hub.TryGetLightLayout(ps.Metadata.Id, out var layout) || layout.Count == 0) continue;
-            var (objs, _) = GetPointObjects(ps.Metadata.Id);
-            if (objs.Count >= layout.Count) continue;
-            _queue.Enqueue(ps);
-            queued++;
-        }
-        if (queued > 0) _logger.LogInformation("Resync queued {count} active points for full layout spawn", queued);
-    }
 
     /// <summary>
     /// Despawn all currently active SimObjects immediately (e.g. on server disconnect) without altering cached states.
