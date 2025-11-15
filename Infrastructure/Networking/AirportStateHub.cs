@@ -130,20 +130,18 @@ internal sealed class AirportStateHub
         }
         _lastSnapshotUtc = DateTime.UtcNow;
         _lastUpdateUtc = _lastSnapshotUtc;
-        // Remove orphan states not present in snapshot (object deleted server-side)
-        var removed = 0;
-        foreach (var existing in _states.Keys.ToList())
-        {
-            if (!seen.Contains(existing))
-            {
-                if (_states.TryRemove(existing, out _)) removed++;
-            }
-        }
+        var removed = RemoveUnknownStates(seen);
+        var revertedOffline = ApplyOfflineFallbackStates(airport!, seen);
         if (removed > 0)
         {
             _logger.LogInformation("Snapshot removed {removed} stale objects for {apt}", removed, airport);
         }
-        _logger.LogInformation("STATE_SNAPSHOT applied objects={applied} removed={removed} airport={apt}", applied, removed, airport);
+        if (revertedOffline > 0)
+        {
+            _logger.LogInformation("Snapshot reverted {offline} map-only objects to offline default for {apt}", revertedOffline, airport);
+        }
+        _logger.LogInformation("STATE_SNAPSHOT applied objects={applied} removed={removed} offlineFallback={offline} airport={apt}",
+            applied, removed, revertedOffline, airport);
     }
 
     private async Task HandleInitialStateAsync(JsonElement root, CancellationToken ct)
@@ -156,11 +154,13 @@ internal sealed class AirportStateHub
         if (!data.TryGetProperty("objects", out var objects) || objects.ValueKind != JsonValueKind.Array) return;
         int count = 0;
         int ignoredUnknown = 0;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var obj in objects.EnumerateArray())
         {
             if (obj.ValueKind != JsonValueKind.Object) continue;
             var id = obj.TryGetProperty("id", out var idProp) ? idProp.GetString() : null;
             if (string.IsNullOrWhiteSpace(id)) continue;
+            seen.Add(id!);
             var on = obj.TryGetProperty("state", out var stp) && stp.ValueKind == JsonValueKind.True;
             var ts = obj.TryGetProperty("timestamp", out var tsp) && tsp.TryGetInt64(out var lts) ? lts : 0L;
             if (!_metadata.TryGetValue(id!, out var meta))
@@ -175,7 +175,13 @@ internal sealed class AirportStateHub
             try { PointStateChanged?.Invoke(ps); } catch { }
         }
         _lastUpdateUtc = DateTime.UtcNow;
+        var removed = RemoveUnknownStates(seen);
+        var revertedOffline = ApplyOfflineFallbackStates(airport!, seen);
         _logger.LogInformation("INITIAL_STATE processed {count} points (ignoredUnknown={ignored}) for {apt}", count, ignoredUnknown, airport);
+        if (revertedOffline > 0)
+        {
+            _logger.LogInformation("INITIAL_STATE reverted {offline} map-only objects to offline default for {apt}", revertedOffline, airport);
+        }
         if (ignoredUnknown > 0)
         {
             // Force snapshot sooner (maybe map changed). Bump lastSnapshot to trigger reconcile check.
@@ -386,6 +392,42 @@ internal sealed class AirportStateHub
         }
 
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+
+    private int RemoveUnknownStates(ISet<string> serverKnown)
+    {
+        var removed = 0;
+        foreach (var existing in _states.Keys.ToList())
+        {
+            if (serverKnown != null && serverKnown.Contains(existing)) continue;
+            if (_metadata.ContainsKey(existing)) continue;
+            if (_states.TryRemove(existing, out _)) removed++;
+        }
+        return removed;
+    }
+
+    private int ApplyOfflineFallbackStates(string airport, ISet<string> serverKnown)
+    {
+        if (string.IsNullOrWhiteSpace(airport)) return 0;
+        var reverted = 0;
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        foreach (var kvp in _metadata)
+        {
+            var id = kvp.Key;
+            var meta = kvp.Value;
+            if (!string.Equals(meta.AirportId, airport, StringComparison.OrdinalIgnoreCase)) continue;
+            if (serverKnown != null && serverKnown.Contains(id)) continue;
+            var offlineOn = !IsStopbar(meta.Type);
+            if (_states.TryGetValue(id, out var existing) && existing.IsOn == offlineOn)
+            {
+                continue;
+            }
+            var state = new PointState(meta, offlineOn, timestamp);
+            _states[id] = state;
+            reverted++;
+            try { PointStateChanged?.Invoke(state); } catch { }
+        }
+        return reverted;
     }
 
     private static bool IsStopbar(string? type)

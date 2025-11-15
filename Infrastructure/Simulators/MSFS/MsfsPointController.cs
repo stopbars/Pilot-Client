@@ -55,6 +55,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     private readonly List<string> _orderedWorkset = new();
     private readonly List<string> _visibilitySnapshot = new();
     private readonly List<string> _staleVisibilityIds = new();
+    private readonly List<SpawnRequest> _spawnQueue = new();
 
     private (double Lat, double Lon)? _lastCenter;
     private volatile bool _suspended;
@@ -83,6 +84,8 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     public void OnPointStateChanged(PointState state)
     {
         var pointId = state.Metadata.Id;
+        _logger.LogDebug("[PointUpdate] Received state change point={pointId} on={isOn}",
+            pointId, state.IsOn);
         _serverStates[pointId] = state;
         IncrementVersion(pointId);
         QueuePointSync(pointId);
@@ -232,7 +235,8 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             {
                 var distance = DistanceForOrdering(id, center);
                 var outside = distance >= radius && distance < double.MaxValue;
-                buffer[length++] = new WorkItem(id, distance, outside);
+                var hasSpawned = _spawnedPoints.ContainsKey(id);
+                buffer[length++] = new WorkItem(id, distance, outside, hasSpawned);
             }
 
             Array.Sort(buffer, 0, length, WorkItemComparer.Instance);
@@ -420,56 +424,47 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
         var spawned = _spawnedPoints.GetOrAdd(pointId, id => new SpawnedPoint(id));
 
+        var spawnQueue = _spawnQueue;
+        spawnQueue.Clear();
+
         for (int slot = 0; slot < layouts.Count; slot++)
         {
             if (AbortIfSuperseded(pointId, versionToken))
             {
+                spawnQueue.Clear();
                 return;
             }
 
             var layout = layouts[slot];
             var desiredState = ResolveStateId(layout, state.IsOn);
-            SpawnedLight? overlapLight = null;
-            var overlapRemoval = false;
-            if (spawned.Lights.TryGetValue(slot, out var existing))
+            spawned.Lights.TryGetValue(slot, out var existing);
+
+            if (existing != null && existing.StateId == desiredState && existing.Object.IsActive)
             {
-                if (existing.StateId == desiredState && existing.Object.IsActive)
-                {
-                    continue;
-                }
-
-                overlapRemoval = ShouldOverlapPlaceholder(existing.StateId, desiredState, layout, existing.Object.IsActive);
-                if (overlapRemoval)
-                {
-                    overlapLight = existing;
-                }
-                else
-                {
-                    await RemoveLightAsync(pointId, slot, existing, ct);
-                }
-
-                if (AbortIfSuperseded(pointId, versionToken))
-                {
-                    return;
-                }
+                continue;
             }
 
-            var simObject = await SpawnLightAsync(pointId, layout, desiredState, slot, ct);
-            if (simObject != null)
+            spawnQueue.Add(new SpawnRequest(layout, slot, desiredState, existing));
+        }
+
+        if (spawnQueue.Count > 0)
+        {
+            var updated = await SpawnBatchWithOverlapAsync(pointId, versionToken, spawnQueue, spawned, ct);
+            spawnQueue.Clear();
+
+            if (!updated)
             {
-                var light = new SpawnedLight(simObject, desiredState, slot);
-                spawned.Lights[slot] = light;
-                _objectIndex[simObject.ObjectId] = (pointId, slot);
-                if (overlapRemoval && overlapLight != null)
-                {
-                    await RemoveLightAsync(pointId, slot, overlapLight, ct);
-                }
+                return;
             }
 
             if (AbortIfSuperseded(pointId, versionToken))
             {
                 return;
             }
+        }
+        else
+        {
+            spawnQueue.Clear();
         }
 
         foreach (var extra in spawned.Lights.Keys.Where(k => k >= layouts.Count).ToList())
@@ -541,26 +536,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         {
             _objectIndex.TryRemove(light.Object.ObjectId, out _);
         }
-    }
-
-    private bool ShouldOverlapPlaceholder(int existingStateId, int desiredStateId, AirportStateHub.LightLayout layout, bool existingIsActive)
-    {
-        if (!existingIsActive)
-        {
-            return false;
-        }
-
-        var onState = ResolveStateId(layout, true);
-        var offState = ResolveStateId(layout, false);
-
-        if (onState == offState)
-        {
-            return false;
-        }
-
-        var goingOn = desiredStateId == onState && existingStateId == offState;
-        var goingOff = desiredStateId == offState && existingStateId == onState;
-        return goingOn || goingOff;
     }
 
     private async Task DespawnPointAsync(string pointId, CancellationToken ct)
@@ -820,18 +795,114 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         return $"BARS_Light_{stateId}";
     }
 
+    private readonly struct SpawnRequest
+    {
+        public SpawnRequest(AirportStateHub.LightLayout layout, int slotIndex, int desiredStateId, SpawnedLight? existing)
+        {
+            Layout = layout;
+            SlotIndex = slotIndex;
+            DesiredStateId = desiredStateId;
+            Existing = existing;
+        }
+
+        public AirportStateHub.LightLayout Layout { get; }
+        public int SlotIndex { get; }
+        public int DesiredStateId { get; }
+        public SpawnedLight? Existing { get; }
+    }
+
+    private async Task<bool> SpawnBatchWithOverlapAsync(string pointId,
+                                                        long versionToken,
+                                                        List<SpawnRequest> spawnQueue,
+                                                        SpawnedPoint spawned,
+                                                        CancellationToken ct)
+    {
+        var pendingAdds = new List<SpawnedLight>(spawnQueue.Count);
+        var stagedRemovals = new List<SpawnedLight>(spawnQueue.Count);
+
+        try
+        {
+            foreach (var request in spawnQueue)
+            {
+                if (AbortIfSuperseded(pointId, versionToken))
+                {
+                    return await RollbackPendingAsync(pointId, pendingAdds, ct);
+                }
+
+                var simObject = await SpawnLightAsync(pointId, request.Layout, request.DesiredStateId, request.SlotIndex, ct);
+                if (simObject == null)
+                {
+                    return await RollbackPendingAsync(pointId, pendingAdds, ct);
+                }
+
+                pendingAdds.Add(new SpawnedLight(simObject, request.DesiredStateId, request.SlotIndex));
+                if (request.Existing != null)
+                {
+                    stagedRemovals.Add(request.Existing);
+                }
+            }
+
+            if (AbortIfSuperseded(pointId, versionToken))
+            {
+                return await RollbackPendingAsync(pointId, pendingAdds, ct);
+            }
+
+            foreach (var newLight in pendingAdds)
+            {
+                spawned.Lights[newLight.SlotIndex] = newLight;
+                _objectIndex[newLight.Object.ObjectId] = (pointId, newLight.SlotIndex);
+            }
+
+            foreach (var oldLight in stagedRemovals)
+            {
+                await RemoveLightAsync(pointId, oldLight.SlotIndex, oldLight, ct);
+            }
+
+            return true;
+        }
+        finally
+        {
+            pendingAdds.Clear();
+            stagedRemovals.Clear();
+        }
+    }
+
+    private async Task<bool> RollbackPendingAsync(string pointId, List<SpawnedLight> pendingAdds, CancellationToken ct)
+    {
+        foreach (var pending in pendingAdds)
+        {
+            try
+            {
+                await DespawnLightAsync(pending.Object, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogTrace(ex, "[SpawnRollbackFail] point={id} slot={slot}", pointId, pending.SlotIndex);
+            }
+        }
+
+        if (pendingAdds.Count > 0)
+        {
+            QueuePointSync(pointId);
+        }
+
+        return false;
+    }
+
     private readonly struct WorkItem
     {
-        public WorkItem(string id, double distance, bool outside)
+        public WorkItem(string id, double distance, bool outside, bool hasSpawned)
         {
             Id = id;
             Distance = distance;
             Outside = outside;
+            HasSpawned = hasSpawned;
         }
 
         public string Id { get; }
         public double Distance { get; }
         public bool Outside { get; }
+        public bool HasSpawned { get; }
     }
 
     private sealed class WorkItemComparer : IComparer<WorkItem>
@@ -840,9 +911,12 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
 
         public int Compare(WorkItem x, WorkItem y)
         {
-            if (x.Outside != y.Outside)
+            var xPriority = x.Outside ? (x.HasSpawned ? 2 : 3) : (x.HasSpawned ? 0 : 1);
+            var yPriority = y.Outside ? (y.HasSpawned ? 2 : 3) : (y.HasSpawned ? 0 : 1);
+
+            if (xPriority != yPriority)
             {
-                return x.Outside ? -1 : 1;
+                return xPriority.CompareTo(yPriority);
             }
 
             return x.Distance.CompareTo(y.Distance);
