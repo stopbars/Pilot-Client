@@ -609,6 +609,12 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 Airspeed = 0
             }, tag, ct).ConfigureAwait(false);
         }
+        catch (ObjectDisposedException)
+        {
+            Volatile.Write(ref _cachedManager, null);
+            _logger.LogDebug("[SpawnFail] point={id} slot={slot} state={state} - SimConnect disposed, clearing cache", pointId, slotIndex, desiredStateId);
+            return null;
+        }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "[SpawnFail] point={id} slot={slot} state={state}", pointId, slotIndex, desiredStateId);
@@ -628,8 +634,16 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             return;
         }
 
-        await SimConnectRequestLimiter.WaitAsync(1, ct).ConfigureAwait(false);
-        await manager.RemoveObjectAsync(simObject, ct).ConfigureAwait(false);
+        try
+        {
+            await SimConnectRequestLimiter.WaitAsync(1, ct).ConfigureAwait(false);
+            await manager.RemoveObjectAsync(simObject, ct).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            Volatile.Write(ref _cachedManager, null);
+            _logger.LogDebug("[DespawnFail] objectId={id} - SimConnect disposed, clearing cache", simObject.ObjectId);
+        }
     }
 
     private async Task WaitForSpawnSlotAsync(CancellationToken ct)
@@ -769,10 +783,6 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         }
 
         var cached = Volatile.Read(ref _cachedManager);
-        if (cached != null)
-        {
-            return cached;
-        }
 
         if (_connector is not MsfsSimulatorConnector msfs)
         {
@@ -780,13 +790,25 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         }
 
         var client = MsfsConnectorClientField?.GetValue(msfs) as SimConnect.NET.SimConnectClient;
-        var manager = client?.AIObjects;
-        if (manager != null)
+        var currentManager = client?.AIObjects;
+
+        if (cached != null && currentManager != cached)
         {
-            Volatile.Write(ref _cachedManager, manager);
+            Volatile.Write(ref _cachedManager, null);
+            cached = null;
         }
 
-        return manager;
+        if (cached != null)
+        {
+            return cached;
+        }
+
+        if (currentManager != null)
+        {
+            Volatile.Write(ref _cachedManager, currentManager);
+        }
+
+        return currentManager;
     }
 
     private static string ResolveModel(int stateId)
