@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.IO;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using BARS_Client_V2.Infrastructure.Settings;
 
@@ -17,6 +19,7 @@ namespace BARS_Client_V2.Services
         public string PackageName { get; set; } = string.Empty;
         public string SubmittedXml { get; set; } = string.Empty;
         public string Notes { get; set; } = string.Empty;
+        public string Simulator { get; set; } = string.Empty;
         public DateTime SubmissionDate { get; set; }
         public string Status { get; set; } = string.Empty;
         public string RejectionReason { get; set; } = string.Empty;
@@ -34,12 +37,84 @@ namespace BARS_Client_V2.Services
         private const string API_URL = "https://v2.stopbars.com/contributions?status=approved";
         private const string SETTINGS_FILENAME = "settings.json";
         private readonly HttpClient _httpClient;
+        // Key format: "ICAO:simulator" (e.g., "YSCB:msfs2020" or "YSCB:msfs2024")
         private Dictionary<string, string> _selectedPackages;
         private static SceneryService? _instance;
+        private string _currentSimulator = "msfs2020"; // Default to 2020 - set by actual SimConnect detection
+        private string _configuredSimulator = "msfs2020"; // Which simulator the user is configuring in the UI
 
-        // Fired when a user changes the selected scenery package for an airport.
-        // Args: (icao, newPackageName)
-        public event Action<string, string>? PackageChanged;
+        // Cached packages data - fetched once, filtered locally by simulator
+        private Dictionary<string, Dictionary<string, List<string>>>? _cachedPackages;
+        private readonly SemaphoreSlim _cacheLock = new(1, 1);
+
+        // Supported simulators
+        public static readonly string[] SupportedSimulators = { "msfs2020", "msfs2024" };
+
+        /// <summary>
+        /// Gets or sets the current active simulator detected by SimConnect.
+        /// This determines which map to load when actually flying.
+        /// Valid values: "msfs2020", "msfs2024"
+        /// </summary>
+        public string CurrentSimulator
+        {
+            get => _currentSimulator;
+            set
+            {
+                var normalized = value?.ToLowerInvariant() ?? "msfs2020";
+                if (Array.IndexOf(SupportedSimulators, normalized) < 0)
+                    normalized = "msfs2020";
+
+                if (_currentSimulator != normalized)
+                {
+                    _currentSimulator = normalized;
+                    try { CurrentSimulatorChanged?.Invoke(normalized); } catch { }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets which simulator the user is configuring in the UI.
+        /// This determines which packages are shown in the airport list.
+        /// Valid values: "msfs2020", "msfs2024"
+        /// </summary>
+        public string ConfiguredSimulator
+        {
+            get => _configuredSimulator;
+            set
+            {
+                var normalized = value?.ToLowerInvariant() ?? "msfs2020";
+                if (Array.IndexOf(SupportedSimulators, normalized) < 0)
+                    normalized = "msfs2020";
+
+                if (_configuredSimulator != normalized)
+                {
+                    _configuredSimulator = normalized;
+                    try { ConfiguredSimulatorChanged?.Invoke(normalized); } catch { }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Fired when the actual connected simulator changes (detected by SimConnect).
+        /// </summary>
+        public event Action<string>? CurrentSimulatorChanged;
+
+        /// <summary>
+        /// Fired when the user changes which simulator they're configuring in the UI.
+        /// Used to refresh the airport list.
+        /// </summary>
+        public event Action<string>? ConfiguredSimulatorChanged;
+
+        // Legacy event - kept for compatibility, fires on CurrentSimulator change
+        public event Action<string>? SimulatorChanged
+        {
+            add => CurrentSimulatorChanged += value;
+            remove => CurrentSimulatorChanged -= value;
+        }
+
+        // Fired when a user changes the selected scenery package for an airport/simulator.
+        // Args: (icao, simulator, newPackageName)
+        public event Action<string, string, string>? PackageChanged;
 
         public static SceneryService Instance
         {
@@ -56,90 +131,203 @@ namespace BARS_Client_V2.Services
             _selectedPackages = LoadSelectedPackages();
         }
 
-        public async Task<Dictionary<string, List<string>>> GetAvailablePackagesAsync()
+        /// <summary>
+        /// Gets available packages organized by simulator, then by airport ICAO.
+        /// Returns: Dictionary[simulator] -> Dictionary[icao] -> List of package names
+        /// Fetches from API only once and caches the result.
+        /// </summary>
+        public async Task<Dictionary<string, Dictionary<string, List<string>>>> GetAvailablePackagesAsync()
         {
+            // Return cached data if available
+            if (_cachedPackages != null)
+            {
+                return _cachedPackages;
+            }
+
+            await _cacheLock.WaitAsync();
             try
             {
-                var response = await _httpClient.GetStringAsync(API_URL);
-
-                // Use case-insensitive JSON options
-                var options = new JsonSerializerOptions
+                // Double-check after acquiring lock
+                if (_cachedPackages != null)
                 {
-                    PropertyNameCaseInsensitive = true
-                };
-
-                var data = JsonSerializer.Deserialize<ContributionsResponse>(response, options);
-
-                var packages = new Dictionary<string, List<string>>();
-
-                // Print debug info
-                Console.WriteLine($"API Response received, contributions count: {data?.contributions?.Count ?? 0}");
-
-                if (data?.contributions != null && data.contributions.Count > 0)
-                {
-                    foreach (var contribution in data.contributions)
-                    {
-                        if (string.IsNullOrEmpty(contribution.AirportIcao) || string.IsNullOrEmpty(contribution.PackageName))
-                            continue;
-
-                        if (!packages.ContainsKey(contribution.AirportIcao))
-                        {
-                            packages[contribution.AirportIcao] = new List<string>();
-                        }
-
-                        if (!packages[contribution.AirportIcao].Contains(contribution.PackageName))
-                        {
-                            packages[contribution.AirportIcao].Add(contribution.PackageName);
-                        }
-                    }
-
-                    Console.WriteLine($"Processed contributions into {packages.Count} airports with scenery packages");
-
-                    // No need to add "Default Scenery" - the first item will be selected by default
-                    return packages;
+                    return _cachedPackages;
                 }
 
-                // If data?.contributions is null or empty, return an empty dictionary
-                Console.WriteLine("No contributions found in API response");
-                return new Dictionary<string, List<string>>();
+                var packages = new Dictionary<string, Dictionary<string, List<string>>>(StringComparer.OrdinalIgnoreCase);
+
+                // Initialize with supported simulators
+                foreach (var sim in SupportedSimulators)
+                {
+                    packages[sim] = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                }
+
+                try
+                {
+                    var response = await _httpClient.GetStringAsync(API_URL);
+
+                    // Use case-insensitive JSON options
+                    var options = new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    };
+
+                    var data = JsonSerializer.Deserialize<ContributionsResponse>(response, options);
+
+                    // Print debug info
+                    Console.WriteLine($"API Response received, contributions count: {data?.contributions?.Count ?? 0}");
+
+                    if (data?.contributions != null && data.contributions.Count > 0)
+                    {
+                        foreach (var contribution in data.contributions)
+                        {
+                            if (string.IsNullOrEmpty(contribution.AirportIcao) || string.IsNullOrEmpty(contribution.PackageName))
+                                continue;
+
+                            // Default to msfs2020 if simulator not specified
+                            var simulator = string.IsNullOrEmpty(contribution.Simulator) ? "msfs2020" : contribution.Simulator.ToLowerInvariant();
+
+                            // Ensure simulator key exists
+                            if (!packages.ContainsKey(simulator))
+                            {
+                                packages[simulator] = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                            }
+
+                            var icao = contribution.AirportIcao.ToUpperInvariant();
+
+                            if (!packages[simulator].ContainsKey(icao))
+                            {
+                                packages[simulator][icao] = new List<string>();
+                            }
+
+                            if (!packages[simulator][icao].Contains(contribution.PackageName))
+                            {
+                                packages[simulator][icao].Add(contribution.PackageName);
+                            }
+                        }
+
+                        var totalAirports = packages.Values.Sum(d => d.Count);
+                        Console.WriteLine($"Processed contributions into {totalAirports} airport/simulator combinations with scenery packages");
+                    }
+                    else
+                    {
+                        Console.WriteLine("No contributions found in API response");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error fetching scenery packages: {ex.Message}");
+                }
+
+                // Cache the result (even if empty, to avoid repeated failed fetches)
+                _cachedPackages = packages;
+                return packages;
             }
-            catch (Exception ex)
+            finally
             {
-                // Log error or handle appropriately
-                Console.WriteLine($"Error fetching scenery packages: {ex.Message}");
-                return new Dictionary<string, List<string>>();
+                _cacheLock.Release();
             }
-        }
-        public string GetSelectedPackage(string icao)
-        {
-            if (string.IsNullOrWhiteSpace(icao)) return string.Empty;
-            // Case-insensitive lookup to avoid mismatches like "yssy" vs "YSSY"
-            return _selectedPackages.TryGetValue(icao, out string? package)
-                ? package
-                : _selectedPackages.TryGetValue(icao.ToUpperInvariant(), out package)
-                    ? package
-                    : _selectedPackages.TryGetValue(icao.ToLowerInvariant(), out package)
-                        ? package
-                        : string.Empty;
         }
 
-        public void SetSelectedPackage(string icao, string packageName)
+        /// <summary>
+        /// Gets available packages for the current (detected) simulator only.
+        /// Used when loading maps for actual flight.
+        /// Returns: Dictionary[icao] -> List of package names
+        /// </summary>
+        public async Task<Dictionary<string, List<string>>> GetAvailablePackagesForCurrentSimulatorAsync()
         {
-            if (string.IsNullOrWhiteSpace(icao)) return;
-            icao = icao.Trim();
+            var all = await GetAvailablePackagesAsync();
+            return all.TryGetValue(CurrentSimulator, out var packages)
+                ? packages
+                : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Gets available packages for the configured simulator (UI toggle).
+        /// Used when displaying the airport list in the UI.
+        /// Returns: Dictionary[icao] -> List of package names
+        /// </summary>
+        public async Task<Dictionary<string, List<string>>> GetAvailablePackagesForConfiguredSimulatorAsync()
+        {
+            var all = await GetAvailablePackagesAsync();
+            return all.TryGetValue(ConfiguredSimulator, out var packages)
+                ? packages
+                : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Gets the selected package for an airport and simulator combination.
+        /// </summary>
+        /// <param name="icao">Airport ICAO code</param>
+        /// <param name="simulator">Simulator identifier (e.g., "msfs2020" or "msfs2024")</param>
+        /// <returns>The selected package name, or empty string if none selected</returns>
+        public string GetSelectedPackage(string icao, string simulator)
+        {
+            if (string.IsNullOrWhiteSpace(icao) || string.IsNullOrWhiteSpace(simulator)) return string.Empty;
+
+            var key = $"{icao.ToUpperInvariant()}:{simulator.ToLowerInvariant()}";
+            return _selectedPackages.TryGetValue(key, out string? package) ? package : string.Empty;
+        }
+
+        /// <summary>
+        /// Gets the selected package for an airport using the current simulator.
+        /// </summary>
+        /// <param name="icao">Airport ICAO code</param>
+        /// <returns>The selected package name, or empty string if none selected</returns>
+        public string GetSelectedPackage(string icao) => GetSelectedPackage(icao, CurrentSimulator);
+
+        /// <summary>
+        /// Gets the selected package for an airport across all simulators.
+        /// Returns a dictionary of simulator -> selected package name.
+        /// </summary>
+        public Dictionary<string, string> GetSelectedPackagesForAirport(string icao)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(icao)) return result;
+
+            var upperIcao = icao.ToUpperInvariant();
+            foreach (var sim in SupportedSimulators)
+            {
+                var key = $"{upperIcao}:{sim}";
+                if (_selectedPackages.TryGetValue(key, out string? package) && !string.IsNullOrEmpty(package))
+                {
+                    result[sim] = package;
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Sets the selected package for an airport and simulator combination.
+        /// </summary>
+        /// <param name="icao">Airport ICAO code</param>
+        /// <param name="simulator">Simulator identifier (e.g., "msfs2020" or "msfs2024")</param>
+        /// <param name="packageName">The package name to select</param>
+        public void SetSelectedPackage(string icao, string simulator, string packageName)
+        {
+            if (string.IsNullOrWhiteSpace(icao) || string.IsNullOrWhiteSpace(simulator)) return;
+
+            var key = $"{icao.Trim().ToUpperInvariant()}:{simulator.Trim().ToLowerInvariant()}";
             packageName = packageName?.Trim() ?? string.Empty;
+
             // Avoid redundant writes/events if unchanged
-            if (_selectedPackages.TryGetValue(icao, out var existing) &&
+            if (_selectedPackages.TryGetValue(key, out var existing) &&
                 string.Equals(existing, packageName, StringComparison.Ordinal))
             {
                 return;
             }
 
-            _selectedPackages[icao] = packageName;
+            _selectedPackages[key] = packageName;
             SaveSelectedPackages();
 
-            try { PackageChanged?.Invoke(icao, packageName); } catch { }
+            try { PackageChanged?.Invoke(icao.Trim().ToUpperInvariant(), simulator.Trim().ToLowerInvariant(), packageName); } catch { }
         }
+
+        /// <summary>
+        /// Sets the selected package for an airport using the current simulator.
+        /// </summary>
+        /// <param name="icao">Airport ICAO code</param>
+        /// <param name="packageName">The package name to select</param>
+        public void SetSelectedPackage(string icao, string packageName) => SetSelectedPackage(icao, CurrentSimulator, packageName);
         private Dictionary<string, string> LoadSelectedPackages()
         {
             SettingsFileAccess.Gate.Wait();
@@ -237,6 +425,9 @@ namespace BARS_Client_V2.Services
         private sealed class SettingsPersisted
         {
             public string? ApiToken { get; set; }
+            /// <summary>
+            /// Airport package selections. Key format: "ICAO:simulator" (e.g., "YSCB:msfs2020")
+            /// </summary>
             public Dictionary<string, string>? AirportPackages { get; set; }
         }
     }

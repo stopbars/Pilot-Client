@@ -226,13 +226,15 @@ public sealed class AirportStateHub
     /// <summary>
     /// Force reload current airport map after scenery package change.
     /// </summary>
-    private async void OnSceneryPackageChanged(string icao, string newPackage)
+    private async void OnSceneryPackageChanged(string icao, string simulator, string newPackage)
     {
         try
         {
-            // Only reload if we're currently on that airport
+            // Only reload if we're currently on that airport AND the changed simulator matches the current one
             if (!string.Equals(_mapAirport, icao, StringComparison.OrdinalIgnoreCase)) return;
-            _logger.LogInformation("Scenery package changed for {apt} -> {pkg}; reloading map", icao, newPackage);
+            if (!string.Equals(SceneryService.Instance.CurrentSimulator, simulator, StringComparison.OrdinalIgnoreCase)) return;
+
+            _logger.LogInformation("Scenery package changed for {apt} ({sim}) -> {pkg}; reloading map", icao, simulator, newPackage);
             await _mapLock.WaitAsync();
             try
             {
@@ -262,7 +264,7 @@ public sealed class AirportStateHub
         try
         {
             package = SceneryService.Instance.GetSelectedPackage(airport);
-            var all = await SceneryService.Instance.GetAvailablePackagesAsync();
+            var all = await SceneryService.Instance.GetAvailablePackagesForCurrentSimulatorAsync();
             if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
             {
                 airportPackages = pkgList.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList();
@@ -271,12 +273,12 @@ public sealed class AirportStateHub
             {
                 if (airportPackages == null || airportPackages.Count == 0)
                 {
-                    _logger.LogWarning("No packages found for airport {apt} when attempting to auto-select; aborting map load", airport);
+                    _logger.LogWarning("No packages found for airport {apt} ({sim}) when attempting to auto-select; aborting map load", airport, SceneryService.Instance.CurrentSimulator);
                     return;
                 }
                 package = airportPackages.First();
                 SceneryService.Instance.SetSelectedPackage(airport, package);
-                _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt}", package, airport);
+                _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt} ({sim})", package, airport, SceneryService.Instance.CurrentSimulator);
             }
             else
             {
@@ -314,8 +316,9 @@ public sealed class AirportStateHub
         async Task<bool> TryFetchAsync(string pkg, bool isRetry)
         {
             var safePkgInner = Uri.EscapeDataString(pkg);
-            var urlInner = $"https://v2.stopbars.com/maps/{airport}/packages/{safePkgInner}/latest";
-            _logger.LogInformation("Fetching airport XML map {apt} package={pkg} url={url} retry={retry}", airport, pkg, urlInner, isRetry);
+            var currentSim = SceneryService.Instance.CurrentSimulator;
+            var urlInner = $"https://v2.stopbars.com/maps/{airport}/packages/{safePkgInner}/latest?simulator={currentSim}";
+            _logger.LogInformation("Fetching airport XML map {apt} package={pkg} simulator={sim} url={url} retry={retry}", airport, pkg, currentSim, urlInner, isRetry);
             using var respInner = await _httpClient.GetAsync(urlInner, ct);
             if (!respInner.IsSuccessStatusCode)
             {

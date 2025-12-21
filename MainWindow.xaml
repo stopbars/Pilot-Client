@@ -18,6 +18,60 @@
         <!-- Converters -->
         <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter"/>
         <local:NullOrEmptyToVisibilityConverter x:Key="NullOrEmptyToVisibilityConverter"/>
+        <local:IndexToBoolConverter x:Key="IndexToBoolConverter"/>
+
+        <!-- Simulator Toggle RadioButton Style -->
+        <Style x:Key="SimulatorToggleRadioButton"
+               TargetType="RadioButton">
+            <Setter Property="Background"
+                    Value="Transparent"/>
+            <Setter Property="Foreground"
+                    Value="#AAAAAA"/>
+            <Setter Property="BorderThickness"
+                    Value="0"/>
+            <Setter Property="Cursor"
+                    Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="border"
+                                Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}"
+                                CornerRadius="2">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked"
+                                     Value="True">
+                                <Setter Property="Background"
+                                        Value="#007ACC"
+                                        TargetName="border"/>
+                                <Setter Property="Foreground"
+                                        Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver"
+                                     Value="True">
+                                <Setter Property="Background"
+                                        Value="#3E3E42"
+                                        TargetName="border"/>
+                            </Trigger>
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="IsMouseOver"
+                                               Value="True"/>
+                                    <Condition Property="IsChecked"
+                                               Value="True"/>
+                                </MultiTrigger.Conditions>
+                                <Setter Property="Background"
+                                        Value="#1C97EA"
+                                        TargetName="border"/>
+                            </MultiTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
 
         <!-- Animation Resources -->
         <Storyboard x:Key="FadeIn">
@@ -827,12 +881,52 @@
             </StackPanel>
         </StackPanel>
 
-        <!-- Airport List Header -->
-        <TextBlock Grid.Row="2"
-                   Text="Airport List"
-                   FontSize="16"
-                   FontWeight="SemiBold"
-                   Margin="0,0,0,5"/>
+        <!-- Simulator Toggle and Airport List Header -->
+        <Grid Grid.Row="2"
+              Margin="0,0,0,5">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Column="0"
+                       Text="Airport List"
+                       FontSize="16"
+                       FontWeight="SemiBold"
+                       VerticalAlignment="Center"/>
+
+            <!-- Simulator Toggle -->
+            <StackPanel Grid.Column="2"
+                        Orientation="Horizontal"
+                        VerticalAlignment="Center">
+                <TextBlock Text="Simulator:"
+                           Foreground="#CCCCCC"
+                           VerticalAlignment="Center"
+                           Margin="0,0,8,0"/>
+                <Border Background="#2D2D30"
+                        BorderBrush="#3E3E42"
+                        BorderThickness="1"
+                        CornerRadius="3">
+                    <StackPanel Orientation="Horizontal">
+                        <RadioButton x:Name="Sim2020Radio"
+                                     Content="2020"
+                                     Foreground="White"
+                                     Padding="10,5"
+                                     IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=0, Mode=TwoWay}"
+                                     GroupName="SimulatorToggle"
+                                     Style="{StaticResource SimulatorToggleRadioButton}"/>
+                        <RadioButton x:Name="Sim2024Radio"
+                                     Content="2024"
+                                     Foreground="White"
+                                     Padding="10,5"
+                                     IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=1, Mode=TwoWay}"
+                                     GroupName="SimulatorToggle"
+                                     Style="{StaticResource SimulatorToggleRadioButton}"/>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </Grid>
 
         <!-- Custom Airports Display using ItemsControl instead of ListView -->
         <Border Grid.Row="3"

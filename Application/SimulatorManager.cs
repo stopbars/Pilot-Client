@@ -4,6 +4,8 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using BARS_Client_V2.Domain;
+using BARS_Client_V2.Services;
+using BARS_Client_V2.Infrastructure.Simulators.Msfs;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -43,9 +45,53 @@ public sealed class SimulatorManager : BackgroundService
         {
             lock (_lock) _active = connector;
             _logger.LogInformation("Activated simulator {sim}", connector.DisplayName);
+
+            // Update SceneryService with the detected simulator version
+            UpdateCurrentSimulator(connector);
+
             return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Updates the SceneryService.CurrentSimulator based on the connected simulator.
+    /// </summary>
+    private void UpdateCurrentSimulator(ISimulatorConnector connector)
+    {
+        try
+        {
+            if (connector is MsfsSimulatorConnector msfsConnector)
+            {
+                var is2024 = msfsConnector.IsMsfs2024;
+                if (is2024 == true)
+                {
+                    SceneryService.Instance.CurrentSimulator = "msfs2024";
+                    _logger.LogInformation("Detected MSFS 2024 - setting CurrentSimulator to msfs2024");
+                }
+                else if (is2024 == false)
+                {
+                    SceneryService.Instance.CurrentSimulator = "msfs2020";
+                    _logger.LogInformation("Detected MSFS 2020 - setting CurrentSimulator to msfs2020");
+                }
+                else
+                {
+                    // Unknown - default to 2020
+                    SceneryService.Instance.CurrentSimulator = "msfs2020";
+                    _logger.LogInformation("MSFS version unknown - defaulting CurrentSimulator to msfs2020");
+                }
+            }
+            else
+            {
+                // Non-MSFS simulators default to msfs2020 for now
+                SceneryService.Instance.CurrentSimulator = "msfs2020";
+                _logger.LogInformation("Non-MSFS simulator detected - defaulting CurrentSimulator to msfs2020");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to update CurrentSimulator");
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

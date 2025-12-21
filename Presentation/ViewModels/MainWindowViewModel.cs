@@ -49,8 +49,62 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private bool _debugModeActive;
     private int _debugStateId;
     private string? _debugPointId;
+    private int _selectedSimulatorIndex; // 0 = MSFS 2020, 1 = MSFS 2024
 
     public ObservableCollection<AirportRowViewModel> Airports { get; } = new();
+
+    /// <summary>
+    /// Available simulators for the toggle.
+    /// </summary>
+    public string[] SimulatorOptions { get; } = { "MSFS 2020", "MSFS 2024" };
+
+    /// <summary>
+    /// Index of the currently selected simulator for configuration (0 = MSFS 2020, 1 = MSFS 2024).
+    /// Changing this will refresh the airport list to show packages for that simulator.
+    /// This is separate from the actual connected simulator.
+    /// </summary>
+    public int SelectedSimulatorIndex
+    {
+        get => _selectedSimulatorIndex;
+        set
+        {
+            if (value == _selectedSimulatorIndex) return;
+            _selectedSimulatorIndex = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(SelectedSimulatorDisplay));
+
+            // Update SceneryService ConfiguredSimulator (not CurrentSimulator - that's set by SimConnect)
+            var newSim = value == 1 ? "msfs2024" : "msfs2020";
+            var wasChanged = !string.Equals(SceneryService.Instance.ConfiguredSimulator, newSim, StringComparison.OrdinalIgnoreCase);
+            SceneryService.Instance.ConfiguredSimulator = newSim;
+
+            // If the event didn't fire (was already the same value), manually trigger refresh
+            if (!wasChanged)
+            {
+                _ = ForceRefreshAirportsAsync(newSim);
+            }
+            // Otherwise the ConfiguredSimulatorChanged event will trigger a refresh
+        }
+    }
+
+    private async Task ForceRefreshAirportsAsync(string simulator)
+    {
+        Status = $"Loading packages for {(simulator == "msfs2024" ? "MSFS 2024" : "MSFS 2020")}...";
+
+        // Clear the airports list to force a complete refresh
+        foreach (var row in Airports)
+        {
+            row.PropertyChanged -= AirportRowOnPropertyChanged;
+        }
+        Airports.Clear();
+
+        await RunSearchAsync(resetPage: true);
+    }
+
+    /// <summary>
+    /// Display name of the currently configured simulator (for UI).
+    /// </summary>
+    public string SelectedSimulatorDisplay => _selectedSimulatorIndex == 1 ? "MSFS 2024" : "MSFS 2020";
 
     public string ClosestAirport { get => _closestAirport; private set { if (value != _closestAirport) { _closestAirport = value; OnPropertyChanged(); } } }
 
@@ -229,6 +283,36 @@ public class MainWindowViewModel : INotifyPropertyChanged
         {
             _pointController.DebugModeChanged += OnDebugModeChanged;
         }
+
+        // Subscribe to configured simulator changes to refresh airport list when toggle changes
+        SceneryService.Instance.ConfiguredSimulatorChanged += OnConfiguredSimulatorChanged;
+    }
+
+    private void OnConfiguredSimulatorChanged(string newSimulator)
+    {
+        // Refresh the airport list when the configured simulator changes (user clicked toggle)
+        RunOnDispatcher(async () =>
+        {
+            // Update the toggle to reflect the new simulator (in case it was set programmatically)
+            var newIndex = string.Equals(newSimulator, "msfs2024", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+            if (_selectedSimulatorIndex != newIndex)
+            {
+                _selectedSimulatorIndex = newIndex;
+                OnPropertyChanged(nameof(SelectedSimulatorIndex));
+                OnPropertyChanged(nameof(SelectedSimulatorDisplay));
+            }
+
+            Status = $"Loading packages for {(newSimulator == "msfs2024" ? "MSFS 2024" : "MSFS 2020")}...";
+
+            // Clear the airports list to force a complete refresh with new simulator's data
+            foreach (var row in Airports)
+            {
+                row.PropertyChanged -= AirportRowOnPropertyChanged;
+            }
+            Airports.Clear();
+
+            await RunSearchAsync(resetPage: true);
+        });
     }
 
     public void SeedSettings(ClientSettings settings)
@@ -418,7 +502,12 @@ public class MainWindowViewModel : INotifyPropertyChanged
         var changed = false;
         var selectionChanged = false;
 
-        if (_savedPackages.TryGetValue(airport.ICAO, out var savedPackage))
+        // Use simulator-suffixed key format for consistency with SceneryService
+        // ConfiguredSimulator is used because this is for the UI display/selection
+        var configuredSim = SceneryService.Instance.ConfiguredSimulator;
+        var key = $"{airport.ICAO}:{configuredSim}";
+
+        if (_savedPackages.TryGetValue(key, out var savedPackage))
         {
             var match = airport.SceneryPackages.FirstOrDefault(p => string.Equals(p.Name, savedPackage, StringComparison.Ordinal));
             if (match != null)
@@ -433,14 +522,14 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
                 if (selectionChanged)
                 {
-                    try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, match.Name); }
+                    try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, configuredSim, match.Name); }
                     catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
                 }
 
                 return changed;
             }
 
-            _savedPackages.Remove(airport.ICAO);
+            _savedPackages.Remove(key);
             changed = true;
         }
 
@@ -456,15 +545,15 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 finally { _suppressSelectionNotifications = false; }
             }
 
-            if (!_savedPackages.TryGetValue(airport.ICAO, out var existing) || !string.Equals(existing, defaultPackage.Name, StringComparison.Ordinal))
+            if (!_savedPackages.TryGetValue(key, out var existing) || !string.Equals(existing, defaultPackage.Name, StringComparison.Ordinal))
             {
-                _savedPackages[airport.ICAO] = defaultPackage.Name;
+                _savedPackages[key] = defaultPackage.Name;
                 changed = true;
             }
 
             if (selectionChanged)
             {
-                try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, defaultPackage.Name); }
+                try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, configuredSim, defaultPackage.Name); }
                 catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
             }
         }
@@ -530,9 +619,13 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
         if (e.PropertyName == nameof(AirportRowViewModel.SelectedPackage) && sender is AirportRowViewModel row && row.SelectedPackage != null)
         {
-            _savedPackages[row.ICAO] = row.SelectedPackage.Name;
+            // Use simulator-suffixed key format for consistency with SceneryService
+            // ConfiguredSimulator is used because this is for the UI selection
+            var configuredSim = SceneryService.Instance.ConfiguredSimulator;
+            var key = $"{row.ICAO}:{configuredSim}";
+            _savedPackages[key] = row.SelectedPackage.Name;
             // Fire and forget save to persist selection quickly without blocking UI
-            try { SceneryService.Instance.SetSelectedPackage(row.ICAO, row.SelectedPackage.Name); }
+            try { SceneryService.Instance.SetSelectedPackage(row.ICAO, configuredSim, row.SelectedPackage.Name); }
             catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
             try { await PersistSettingsAsync(); StartupTrace.Write($"PersistSettingsAsync after selection {row.ICAO}"); }
             catch (Exception ex) { LogLines.Add(ex.Message); StartupTrace.Write($"PersistSettingsAsync error: {ex.Message}"); }

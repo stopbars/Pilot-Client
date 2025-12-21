@@ -8,14 +8,20 @@ using System.Threading;
 using System.Threading.Tasks;
 using BARS_Client_V2.Application;
 using BARS_Client_V2.Domain;
+using BARS_Client_V2.Services;
 
 namespace BARS_Client_V2.Infrastructure.Networking;
 
-// Fetches approved contributions and builds a list of airports with their available scenery packages.
+// Fetches approved contributions once and caches them. Filters by simulator locally.
 internal sealed class HttpAirportRepository : IAirportRepository
 {
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly JsonSerializerOptions _jsonOptions;
+
+    // Cached contributions data - fetched once, filtered locally by simulator
+    private List<ContributionDto>? _cachedContributions;
+    private Dictionary<string, string>? _cachedAirportNames;
+    private readonly SemaphoreSlim _cacheLock = new(1, 1);
 
     public HttpAirportRepository(IHttpClientFactory httpClientFactory)
     {
@@ -38,25 +44,62 @@ internal sealed class HttpAirportRepository : IAirportRepository
         DateTime submissionDate,
         string status,
         string? rejectionReason,
-        DateTime? decisionDate
+        DateTime? decisionDate,
+        string? simulator  // "msfs2020" or "msfs2024".
     );
 
     private sealed record ContributionsResponse(List<ContributionDto> contributions, long total, int page, long limit, int totalPages);
 
+    /// <summary>
+    /// Ensures contributions are fetched and cached. Only fetches from API once.
+    /// </summary>
+    private async Task EnsureCacheLoadedAsync(CancellationToken ct)
+    {
+        if (_cachedContributions != null) return;
+
+        await _cacheLock.WaitAsync(ct);
+        try
+        {
+            if (_cachedContributions != null) return; // Double-check after acquiring lock
+
+            var client = _httpClientFactory.CreateClient();
+            using var req = new HttpRequestMessage(HttpMethod.Get, "https://v2.stopbars.com/contributions?status=approved");
+            using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            resp.EnsureSuccessStatusCode();
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            var data = await JsonSerializer.DeserializeAsync<ContributionsResponse>(stream, _jsonOptions, ct)
+                       ?? new ContributionsResponse(new List<ContributionDto>(), 0, 1, 0, 0);
+
+            _cachedContributions = data.contributions;
+
+            // Pre-fetch airport names for all contributions
+            var allIcaos = _cachedContributions
+                .Select(c => c.airportIcao.Trim().ToUpperInvariant())
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+            _cachedAirportNames = await FetchAirportNamesAsync(client, allIcaos, ct);
+        }
+        finally
+        {
+            _cacheLock.Release();
+        }
+    }
+
     public async Task<(IReadOnlyList<Airport> Items, int TotalCount)> SearchAsync(string? search, int page, int pageSize, CancellationToken ct = default)
     {
-        // We fetch the full approved list (server default limit is huge per provided sample) and do client side paging.
-        // If the endpoint later supports server-side paging + filtering we can shift to query params.
-        var client = _httpClientFactory.CreateClient();
-        using var req = new HttpRequestMessage(HttpMethod.Get, "https://v2.stopbars.com/contributions?status=approved");
-        using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-        resp.EnsureSuccessStatusCode();
-        await using var stream = await resp.Content.ReadAsStreamAsync(ct);
-        var data = await JsonSerializer.DeserializeAsync<ContributionsResponse>(stream, _jsonOptions, ct)
-                   ?? new ContributionsResponse(new List<ContributionDto>(), 0, 1, 0, 0);
+        // Ensure data is cached (fetched only once)
+        await EnsureCacheLoadedAsync(ct);
 
-        // Group by airport -> collect distinct package names
-        var grouped = data.contributions
+        // Get the configured simulator from SceneryService to filter packages (UI toggle selection)
+        var configuredSimulator = SceneryService.Instance.ConfiguredSimulator;
+
+        // Group by airport -> collect distinct package names for the configured simulator only
+        var grouped = _cachedContributions!
+            .Where(c =>
+            {
+                // Default to "msfs2020" if simulator is null or empty (matches SceneryService behavior)
+                var sim = string.IsNullOrWhiteSpace(c.simulator) ? "msfs2020" : c.simulator.Trim().ToLowerInvariant();
+                return string.Equals(sim, configuredSimulator, StringComparison.OrdinalIgnoreCase);
+            })
             .GroupBy(c => c.airportIcao.Trim().ToUpperInvariant())
             .Select(g => new
             {
@@ -70,12 +113,10 @@ internal sealed class HttpAirportRepository : IAirportRepository
             })
             .ToList();
 
-        var airportNames = await FetchAirportNamesAsync(client, grouped.Select(g => g.ICAO), ct);
-
         var airports = grouped
             .Select(g =>
             {
-                airportNames.TryGetValue(g.ICAO, out var name);
+                _cachedAirportNames!.TryGetValue(g.ICAO, out var name);
                 return new Airport(g.ICAO, name, g.Packages);
             })
             .ToList();
