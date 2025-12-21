@@ -17,11 +17,28 @@ using SimConnect.NET.AI;
 namespace BARS_Client_V2.Infrastructure.Simulators.Msfs;
 
 /// <summary>
+/// Event args for debug mode state changes.
+/// </summary>
+public sealed class DebugModeChangedEventArgs : EventArgs
+{
+    public bool IsDebugMode { get; }
+    public int CurrentStateId { get; }
+    public string? ClosestPointId { get; }
+
+    public DebugModeChangedEventArgs(bool isDebugMode, int currentStateId, string? closestPointId)
+    {
+        IsDebugMode = isDebugMode;
+        CurrentStateId = currentStateId;
+        ClosestPointId = closestPointId;
+    }
+}
+
+/// <summary>
 /// Distance-based point controller that keeps MSFS SimObjects in sync with the server state
 /// within a visibility radius around the aircraft. Server state is the sole source of truth;
 /// spawned state simply mirrors whichever objects are currently inside the visibility bubble.
 /// </summary>
-internal sealed class MsfsPointController : BackgroundService, IPointStateListener
+public sealed class MsfsPointController : BackgroundService, IPointStateListener
 {
     private readonly ILogger<MsfsPointController> _logger;
     private readonly AirportStateHub _hub;
@@ -60,6 +77,25 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     private (double Lat, double Lon)? _lastCenter;
     private volatile bool _suspended;
 
+    // Debug mode fields
+    private static readonly int[] DebugStateSequence = { 0, 1, 2, 3, 4, 5, 6, 7, 20, 21, 22, 23, 24, 25, 26, 27 };
+    private readonly object _debugLock = new();
+    private volatile bool _debugMode;
+    private string? _debugPointId;
+    private int _debugStateIndex;
+    private DateTime _debugNextCycleUtc = DateTime.MinValue;
+    private readonly ConcurrentDictionary<string, PointState> _frozenStates = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Raised when debug mode is toggled or the debug state changes.
+    /// </summary>
+    public event EventHandler<DebugModeChangedEventArgs>? DebugModeChanged;
+
+    /// <summary>
+    /// Gets whether debug mode is currently active.
+    /// </summary>
+    public bool IsDebugMode => _debugMode;
+
     public MsfsPointController(IEnumerable<ISimulatorConnector> connectors,
                                ILogger<MsfsPointController> logger,
                                AirportStateHub hub,
@@ -86,6 +122,15 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
         var pointId = state.Metadata.Id;
         _logger.LogDebug("[PointUpdate] Received state change point={pointId} on={isOn}",
             pointId, state.IsOn);
+
+        // In debug mode, freeze all incoming state updates
+        if (_debugMode)
+        {
+            _frozenStates[pointId] = state;
+            _logger.LogDebug("[PointUpdate] Debug mode active, freezing state for point={pointId}", pointId);
+            return;
+        }
+
         _serverStates[pointId] = state;
         IncrementVersion(pointId);
         QueuePointSync(pointId);
@@ -106,6 +151,172 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
             QueuePointSync(kv.Key);
         }
         _logger.LogInformation("[Resume] Distance controller resumed; queued resync={count}", _serverStates.Count);
+    }
+
+    /// <summary>
+    /// Toggles debug/test mode. When enabled, freezes network state updates and cycles
+    /// the closest point through all possible light states (0-7, 20-27).
+    /// </summary>
+    public void ToggleDebugMode()
+    {
+        lock (_debugLock)
+        {
+            _debugMode = !_debugMode;
+
+            if (_debugMode)
+            {
+                _logger.LogInformation("[DebugMode] Enabled - freezing network updates");
+                _debugStateIndex = 0;
+                _debugNextCycleUtc = DateTime.MinValue;
+                _frozenStates.Clear();
+
+                // Find the closest point to the player
+                var flight = _simManager.LatestState;
+                if (flight != null)
+                {
+                    _debugPointId = FindClosestPointId(flight.Latitude, flight.Longitude);
+                    _logger.LogInformation("[DebugMode] Closest point: {pointId}", _debugPointId ?? "(none)");
+                }
+                else
+                {
+                    _debugPointId = null;
+                }
+
+                RaiseDebugModeChanged();
+            }
+            else
+            {
+                _logger.LogInformation("[DebugMode] Disabled - restoring network state");
+
+                // Apply all frozen states that accumulated during debug mode
+                foreach (var kv in _frozenStates)
+                {
+                    _serverStates[kv.Key] = kv.Value;
+                    IncrementVersion(kv.Key);
+                    QueuePointSync(kv.Key);
+                }
+                _frozenStates.Clear();
+
+                // Also re-sync the debug point to its proper state
+                if (_debugPointId != null)
+                {
+                    IncrementVersion(_debugPointId);
+                    QueuePointSync(_debugPointId);
+                }
+
+                _debugPointId = null;
+                RaiseDebugModeChanged();
+            }
+        }
+    }
+
+    private string? FindClosestPointId(double lat, double lon)
+    {
+        string? closestId = null;
+        double closestDistance = double.MaxValue;
+
+        foreach (var kv in _serverStates)
+        {
+            var meta = kv.Value.Metadata;
+            var dist = DistanceMeters(lat, lon, meta.Latitude, meta.Longitude);
+            if (dist < closestDistance)
+            {
+                closestDistance = dist;
+                closestId = kv.Key;
+            }
+        }
+
+        return closestId;
+    }
+
+    private void RaiseDebugModeChanged()
+    {
+        var currentStateId = _debugMode && _debugStateIndex < DebugStateSequence.Length
+            ? DebugStateSequence[_debugStateIndex]
+            : 0;
+        try
+        {
+            DebugModeChanged?.Invoke(this, new DebugModeChangedEventArgs(_debugMode, currentStateId, _debugPointId));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[DebugMode] Event handler error");
+        }
+    }
+
+    private async Task ProcessDebugCycleAsync(CancellationToken ct)
+    {
+        if (!_debugMode || string.IsNullOrEmpty(_debugPointId))
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        if (now < _debugNextCycleUtc)
+        {
+            return;
+        }
+
+        // Cycle to next state
+        lock (_debugLock)
+        {
+            _debugStateIndex = (_debugStateIndex + 1) % DebugStateSequence.Length;
+            _debugNextCycleUtc = now.AddMilliseconds(_options.DebugCycleIntervalMs);
+        }
+
+        var targetStateId = DebugStateSequence[_debugStateIndex];
+        _logger.LogInformation("[DebugMode] Cycling point {pointId} to state {state} ({index}/{total})",
+            _debugPointId, targetStateId, _debugStateIndex + 1, DebugStateSequence.Length);
+
+        // Force respawn the debug point with the new state
+        await ForceDebugSpawnAsync(_debugPointId, targetStateId, ct);
+
+        RaiseDebugModeChanged();
+    }
+
+    private async Task ForceDebugSpawnAsync(string pointId, int stateId, CancellationToken ct)
+    {
+        if (!_serverStates.TryGetValue(pointId, out var state))
+        {
+            return;
+        }
+
+        var layouts = GetLayouts(pointId, state);
+        if (layouts.Count == 0)
+        {
+            return;
+        }
+
+        var spawned = _spawnedPoints.GetOrAdd(pointId, id => new SpawnedPoint(id));
+
+        for (int slot = 0; slot < layouts.Count; slot++)
+        {
+            var layout = layouts[slot];
+            spawned.Lights.TryGetValue(slot, out var existing);
+
+            // Remove existing light if present
+            if (existing != null)
+            {
+                try
+                {
+                    await DespawnLightAsync(existing.Object, ct);
+                    _objectIndex.TryRemove(existing.Object.ObjectId, out _);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogTrace(ex, "[DebugMode] Failed to despawn existing light for slot {slot}", slot);
+                }
+            }
+
+            // Spawn with the debug state
+            var simObject = await SpawnLightAsync(pointId, layout, stateId, slot, ct);
+            if (simObject != null)
+            {
+                var newLight = new SpawnedLight(simObject, stateId, slot);
+                spawned.Lights[slot] = newLight;
+                _objectIndex[simObject.ObjectId] = (pointId, slot);
+            }
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -132,6 +343,14 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
                 var flight = _simManager.LatestState;
                 if (flight == null)
                 {
+                    await Task.Delay(_options.IdleDelayMs, stoppingToken);
+                    continue;
+                }
+
+                // Handle debug mode cycling
+                if (_debugMode)
+                {
+                    await ProcessDebugCycleAsync(stoppingToken);
                     await Task.Delay(_options.IdleDelayMs, stoppingToken);
                     continue;
                 }
@@ -968,7 +1187,7 @@ internal sealed class MsfsPointController : BackgroundService, IPointStateListen
     }
 }
 
-internal sealed class MsfsPointControllerOptions
+public sealed class MsfsPointControllerOptions
 {
     public double VisibilityRadiusMeters { get; init; } = 500;
     public double VisibilityHysteresisMeters { get; init; } = 200;
@@ -979,4 +1198,8 @@ internal sealed class MsfsPointControllerOptions
     public int DisconnectedDelayMs { get; init; } = 500;
     public int ErrorBackoffMs { get; init; } = 250;
     public double SpawnAltitudeFeet { get; init; } = 0;
+    /// <summary>
+    /// Interval in milliseconds between debug mode state cycles. Default 1 second.
+    /// </summary>
+    public int DebugCycleIntervalMs { get; init; } = 1000;
 }

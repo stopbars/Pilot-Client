@@ -16,7 +16,7 @@ using BARS_Client_V2.Services;
 
 namespace BARS_Client_V2.Infrastructure.Networking;
 
-internal sealed class AirportStateHub
+public sealed class AirportStateHub
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<AirportStateHub> _logger;

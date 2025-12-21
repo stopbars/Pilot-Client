@@ -70,7 +70,15 @@ namespace BARS_Client_V2
                         return new BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController(connectors, logger, hub, simManager, null);
                     });
                     services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>());
-                    services.AddSingleton<MainWindowViewModel>();
+                    services.AddSingleton<MainWindowViewModel>(sp =>
+                    {
+                        var simManager = sp.GetRequiredService<SimulatorManager>();
+                        var nearestService = sp.GetRequiredService<INearestAirportService>();
+                        var airportRepo = sp.GetRequiredService<IAirportRepository>();
+                        var settingsStore = sp.GetRequiredService<ISettingsStore>();
+                        var pointController = sp.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>();
+                        return new MainWindowViewModel(simManager, nearestService, airportRepo, settingsStore, pointController);
+                    });
                     services.AddTransient<MainWindow>();
                 })
                 .Build();

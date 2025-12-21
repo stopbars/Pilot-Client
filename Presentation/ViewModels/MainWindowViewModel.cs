@@ -12,12 +12,14 @@ using BARS_Client_V2.Application;
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Services;
 using BARS_Client_V2.Infrastructure.Diagnostics;
+using BARS_Client_V2.Infrastructure.Simulators.Msfs;
 
 namespace BARS_Client_V2.Presentation.ViewModels;
 
 public class MainWindowViewModel : INotifyPropertyChanged
 {
     private readonly SimulatorManager _simManager;
+    private readonly MsfsPointController? _pointController;
     private readonly DispatcherTimer _uiPoll;
     private readonly DispatcherTimer _serverTimer;
     private readonly DispatcherTimer _searchDebounce;
@@ -44,6 +46,9 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private bool _serverOfflineMode;
     private ClientSettings? _preloadedSettings;
     private bool _initializationStarted;
+    private bool _debugModeActive;
+    private int _debugStateId;
+    private string? _debugPointId;
 
     public ObservableCollection<AirportRowViewModel> Airports { get; } = new();
 
@@ -90,6 +95,53 @@ public class MainWindowViewModel : INotifyPropertyChanged
     public string ServerStatusDetail { get; private set; } = ""; // optional reason
     public double Latitude { get => _latitude; set { if (value != _latitude) { _latitude = value; OnPropertyChanged(); } } }
     public double Longitude { get => _longitude; set { if (value != _longitude) { _longitude = value; OnPropertyChanged(); } } }
+
+    /// <summary>
+    /// Indicates whether debug/test mode is currently active.
+    /// </summary>
+    public bool DebugModeActive
+    {
+        get => _debugModeActive;
+        private set
+        {
+            if (value != _debugModeActive)
+            {
+                _debugModeActive = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(DebugModeText));
+                OnPropertyChanged(nameof(DebugModeVisibility));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Current debug state ID being displayed.
+    /// </summary>
+    public int DebugStateId
+    {
+        get => _debugStateId;
+        private set
+        {
+            if (value != _debugStateId)
+            {
+                _debugStateId = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(DebugModeText));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Text to display when debug mode is active.
+    /// </summary>
+    public string DebugModeText => _debugModeActive
+        ? $"DEBUG MODE - State: {_debugStateId} (Press Ctrl+Shift+D to disable)"
+        : string.Empty;
+
+    /// <summary>
+    /// Visibility of the debug mode indicator.
+    /// </summary>
+    public string DebugModeVisibility => _debugModeActive ? "Visible" : "Collapsed";
 
     public ObservableCollection<string> LogLines { get; } = new();
 
@@ -146,11 +198,13 @@ public class MainWindowViewModel : INotifyPropertyChanged
     public ICommand NextPageCommand { get; }
     public ICommand PrevPageCommand { get; }
     public ICommand SaveTokenCommand { get; }
+    public ICommand ToggleDebugModeCommand { get; }
 
-    public MainWindowViewModel(SimulatorManager simManager, INearestAirportService nearestService, IAirportRepository airportRepository, ISettingsStore settingsStore)
+    public MainWindowViewModel(SimulatorManager simManager, INearestAirportService nearestService, IAirportRepository airportRepository, ISettingsStore settingsStore, MsfsPointController? pointController = null)
     {
         StartupTrace.Write("MainWindowViewModel ctor");
         _simManager = simManager;
+        _pointController = pointController;
         _nearestService = nearestService;
         _airportRepo = airportRepository;
         _settingsStore = settingsStore;
@@ -168,6 +222,13 @@ public class MainWindowViewModel : INotifyPropertyChanged
         NextPageCommand = new DelegateCommand(async _ => { CurrentPage++; await RunSearchAsync(); }, _ => CanChangePage(+1));
         PrevPageCommand = new DelegateCommand(async _ => { CurrentPage--; await RunSearchAsync(); }, _ => CanChangePage(-1));
         SaveTokenCommand = new DelegateCommand(async _ => await SaveSettingsAsync(), _ => CanSaveToken());
+        ToggleDebugModeCommand = new DelegateCommand(_ => { ToggleDebugMode(); return Task.CompletedTask; });
+
+        // Subscribe to debug mode changes
+        if (_pointController != null)
+        {
+            _pointController.DebugModeChanged += OnDebugModeChanged;
+        }
     }
 
     public void SeedSettings(ClientSettings settings)
@@ -650,6 +711,32 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
     private void OnPropertyChanged([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+    /// <summary>
+    /// Toggles debug/test mode for light state cycling.
+    /// </summary>
+    public void ToggleDebugMode()
+    {
+        _pointController?.ToggleDebugMode();
+    }
+
+    private void OnDebugModeChanged(object? sender, DebugModeChangedEventArgs e)
+    {
+        RunOnDispatcher(() =>
+        {
+            DebugModeActive = e.IsDebugMode;
+            DebugStateId = e.CurrentStateId;
+            _debugPointId = e.ClosestPointId;
+            if (e.IsDebugMode)
+            {
+                Status = $"Debug Mode: Testing point {e.ClosestPointId ?? "(none)"}";
+            }
+            else
+            {
+                Status = "Ready";
+            }
+        });
+    }
 
     private static string? SanitizeToken(string? raw)
     {

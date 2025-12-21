@@ -718,6 +718,29 @@
             </StackPanel>
         </Grid>
 
+        <!-- Debug Mode Indicator -->
+        <Border Grid.Row="0"
+                Margin="0,0,0,0"
+                Background="#CC0000"
+                CornerRadius="4"
+                Padding="10,5"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                Visibility="{Binding DebugModeVisibility}">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="⚠"
+                           FontSize="14"
+                           Foreground="White"
+                           Margin="0,0,8,0"
+                           VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding DebugModeText}"
+                           FontWeight="Bold"
+                           FontSize="12"
+                           Foreground="White"
+                           VerticalAlignment="Center"/>
+            </StackPanel>
+        </Border>
+
         <!-- API Token and Search in vertical layout -->
         <StackPanel Grid.Row="1"
                     Margin="0,0,0,15">
