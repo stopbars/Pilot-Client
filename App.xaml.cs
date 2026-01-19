@@ -145,6 +145,7 @@ namespace BARS_Client_V2
                     return;
                 }
                 pointController.Suspend();
+                vm.NotifyServerDisconnected(reason);
             };
             wsMgr.Connected += () => pointController.Resume();
             StartupTrace.Write("Event wiring complete");

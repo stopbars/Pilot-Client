@@ -11,8 +11,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
 using BARS_Client_V2.Domain;
+using BARS_Client_V2.Infrastructure.Simulators.Msfs;
 using Microsoft.Extensions.Logging;
 using BARS_Client_V2.Services;
+using BARS_Client_V2.Application;
 
 namespace BARS_Client_V2.Infrastructure.Networking;
 
@@ -20,6 +22,7 @@ public sealed class AirportStateHub
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<AirportStateHub> _logger;
+    private readonly SimulatorManager _simManager;
     private readonly ConcurrentDictionary<string, PointMetadata> _metadata = new(); // pointId -> metadata
     private readonly ConcurrentDictionary<string, PointState> _states = new(); // pointId -> current state
     private readonly ConcurrentDictionary<string, List<LightLayout>> _layouts = new(); // pointId -> lights
@@ -33,10 +36,11 @@ public sealed class AirportStateHub
     private DateTime _lastSnapshotRequestUtc = DateTime.MinValue;
     private readonly TimeSpan _snapshotRequestMinInterval = TimeSpan.FromSeconds(20);
 
-    public AirportStateHub(IHttpClientFactory httpFactory, ILogger<AirportStateHub> logger)
+    public AirportStateHub(IHttpClientFactory httpFactory, ILogger<AirportStateHub> logger, SimulatorManager simManager)
     {
         _httpClient = httpFactory.CreateClient();
         _logger = logger;
+        _simManager = simManager;
         _reconcileTimer = new Timer(_ => ReconcileLoop(), null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
         // React to scenery package changes while connected so users don't need to restart the client.
         try { SceneryService.Instance.PackageChanged += OnSceneryPackageChanged; } catch { }
@@ -52,6 +56,19 @@ public sealed class AirportStateHub
         if (_layouts.TryGetValue(id, out var list)) { lights = list; return true; }
         lights = Array.Empty<LightLayout>();
         return false;
+    }
+
+    private string GetRunningSimulatorId()
+    {
+        var active = _simManager.ActiveConnector;
+        if (active is MsfsSimulatorConnector msfsConnector)
+        {
+            var is2024 = msfsConnector.IsMsfs2024;
+            if (is2024 == true) return "msfs2024";
+            if (is2024 == false) return "msfs2020";
+        }
+
+        return SceneryService.Instance.CurrentSimulator;
     }
 
     public async Task ProcessAsync(string json, CancellationToken ct = default)
@@ -73,6 +90,9 @@ public sealed class AirportStateHub
                     break;
                 case "STATE_UPDATE":
                     HandleStateUpdate(root);
+                    break;
+                case "MULTI_STATE_UPDATE":
+                    HandleMultiStateUpdate(root);
                     break;
                 case "HEARTBEAT_ACK":
                     break;
@@ -208,6 +228,35 @@ public sealed class AirportStateHub
         try { PointStateChanged?.Invoke(ps); } catch { }
     }
 
+    private void HandleMultiStateUpdate(JsonElement root)
+    {
+        if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
+        if (!data.TryGetProperty("updates", out var updates) || updates.ValueKind != JsonValueKind.Array) return;
+        var ts = root.TryGetProperty("timestamp", out var tsp) && tsp.TryGetInt64(out var lts) ? lts : 0L;
+        var anyApplied = false;
+        foreach (var update in updates.EnumerateArray())
+        {
+            if (update.ValueKind != JsonValueKind.Object) continue;
+            var id = update.TryGetProperty("objectId", out var idProp) ? idProp.GetString() : null;
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            var on = update.TryGetProperty("state", out var stp) && stp.ValueKind == JsonValueKind.True;
+            if (!_metadata.TryGetValue(id!, out var meta))
+            {
+                // Skip updates for unknown objects rather than creating placeholder at (0,0)
+                _logger.LogTrace("Skipping update for unknown object {id}", id);
+                continue;
+            }
+            var ps = new PointState(meta, on, ts);
+            _states[id!] = ps;
+            anyApplied = true;
+            try { PointStateChanged?.Invoke(ps); } catch { }
+        }
+        if (anyApplied)
+        {
+            _lastUpdateUtc = DateTime.UtcNow;
+        }
+    }
+
     public async Task EnsureMapLoadedAsync(string airport, CancellationToken ct = default)
     {
         if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return;
@@ -232,7 +281,8 @@ public sealed class AirportStateHub
         {
             // Only reload if we're currently on that airport AND the changed simulator matches the current one
             if (!string.Equals(_mapAirport, icao, StringComparison.OrdinalIgnoreCase)) return;
-            if (!string.Equals(SceneryService.Instance.CurrentSimulator, simulator, StringComparison.OrdinalIgnoreCase)) return;
+            var runningSim = GetRunningSimulatorId();
+            if (!string.Equals(runningSim, simulator, StringComparison.OrdinalIgnoreCase)) return;
 
             _logger.LogInformation("Scenery package changed for {apt} ({sim}) -> {pkg}; reloading map", icao, simulator, newPackage);
             await _mapLock.WaitAsync();
@@ -263,9 +313,12 @@ public sealed class AirportStateHub
         List<string>? airportPackages = null; // cache list for fallback retry
         try
         {
-            package = SceneryService.Instance.GetSelectedPackage(airport);
-            var all = await SceneryService.Instance.GetAvailablePackagesForCurrentSimulatorAsync();
-            if (all.TryGetValue(airport, out var pkgList) && pkgList.Count > 0)
+            var runningSim = GetRunningSimulatorId();
+            package = SceneryService.Instance.GetSelectedPackage(airport, runningSim);
+            var all = await SceneryService.Instance.GetAvailablePackagesAsync();
+            if (all.TryGetValue(runningSim, out var packagesForSim) &&
+                packagesForSim.TryGetValue(airport, out var pkgList) &&
+                pkgList.Count > 0)
             {
                 airportPackages = pkgList.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList();
             }
@@ -273,12 +326,12 @@ public sealed class AirportStateHub
             {
                 if (airportPackages == null || airportPackages.Count == 0)
                 {
-                    _logger.LogWarning("No packages found for airport {apt} ({sim}) when attempting to auto-select; aborting map load", airport, SceneryService.Instance.CurrentSimulator);
+                    _logger.LogWarning("No packages found for airport {apt} ({sim}) when attempting to auto-select; aborting map load", airport, runningSim);
                     return;
                 }
                 package = airportPackages.First();
-                SceneryService.Instance.SetSelectedPackage(airport, package);
-                _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt} ({sim})", package, airport, SceneryService.Instance.CurrentSimulator);
+                SceneryService.Instance.SetSelectedPackage(airport, runningSim, package);
+                _logger.LogInformation("Auto-selected first package '{pkg}' for airport {apt} ({sim})", package, airport, runningSim);
             }
             else
             {
@@ -302,7 +355,7 @@ public sealed class AirportStateHub
                         var fallback = airportPackages.First();
                         _logger.LogWarning("Previously selected package '{old}' for {apt} no longer available; falling back to '{fb}'", originalSelection, airport, fallback);
                         package = fallback;
-                        try { SceneryService.Instance.SetSelectedPackage(airport, package); } catch { }
+                        try { SceneryService.Instance.SetSelectedPackage(airport, runningSim, package); } catch { }
                     }
                 }
             }
@@ -316,7 +369,7 @@ public sealed class AirportStateHub
         async Task<bool> TryFetchAsync(string pkg, bool isRetry)
         {
             var safePkgInner = Uri.EscapeDataString(pkg);
-            var currentSim = SceneryService.Instance.CurrentSimulator;
+            var currentSim = GetRunningSimulatorId();
             var urlInner = $"https://v2.stopbars.com/maps/{airport}/packages/{safePkgInner}/latest?simulator={currentSim}";
             _logger.LogInformation("Fetching airport XML map {apt} package={pkg} simulator={sim} url={url} retry={retry}", airport, pkg, currentSim, urlInner, isRetry);
             using var respInner = await _httpClient.GetAsync(urlInner, ct);
@@ -329,7 +382,7 @@ public sealed class AirportStateHub
                     if (!string.Equals(first, pkg, StringComparison.OrdinalIgnoreCase))
                     {
                         _logger.LogInformation("Retrying map fetch with fallback first package '{fb}' for {apt}", first, airport);
-                        try { SceneryService.Instance.SetSelectedPackage(airport, first); } catch { }
+                        try { SceneryService.Instance.SetSelectedPackage(airport, GetRunningSimulatorId(), first); } catch { }
                         package = first;
                         return await TryFetchAsync(first, true);
                     }

@@ -169,7 +169,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
 
     private async Task ConnectAsync(string icao, string token, CancellationToken ct)
     {
-        await DisconnectAsync("Switching airport/token");
+        await DisconnectAsync("Processing");
         var uri = new Uri($"wss://v2.stopbars.com/connect?airport={icao.ToUpperInvariant()}&key={token}");
         var ws = new ClientWebSocket();
         try

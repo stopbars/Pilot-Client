@@ -802,6 +802,44 @@ public class MainWindowViewModel : INotifyPropertyChanged
         });
     }
 
+    public void NotifyServerDisconnected(string? reason)
+    {
+        RunOnDispatcher(() =>
+        {
+            if (_serverOfflineMode)
+            {
+                return;
+            }
+
+            ServerConnected = false;
+
+            var detail = NormalizeDisconnectDetail(reason);
+            if (!string.Equals(ServerStatusDetail, detail, StringComparison.Ordinal))
+            {
+                ServerStatusDetail = detail;
+                OnPropertyChanged(nameof(ServerStatusDetail));
+            }
+
+            OnPropertyChanged(nameof(ServerStatusText));
+            OnPropertyChanged(nameof(ServerStatusColor));
+        });
+    }
+
+    private static string NormalizeDisconnectDetail(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            return string.Empty;
+        }
+
+        if (reason.Contains("token", StringComparison.OrdinalIgnoreCase))
+        {
+            return reason;
+        }
+
+        return string.Empty;
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
     private void OnPropertyChanged([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
