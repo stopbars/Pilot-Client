@@ -955,45 +955,72 @@
                 </Grid>
 
                 <!-- Items -->
-                <ScrollViewer VerticalScrollBarVisibility="Hidden"
-                              HorizontalScrollBarVisibility="Disabled">
-                    <ItemsControl x:Name="AirportsItemsControl"
-                                  Margin="0"
-                                  ItemsSource="{Binding Airports}">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <Border Style="{StaticResource AirportRowEntranceStyle}"
-                                        BorderThickness="0,0,0,1"
-                                        BorderBrush="#3E3E42"
-                                        Background="Transparent">
-                                    <Grid>
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="80"/>
-                                            <ColumnDefinition Width="*"/>
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Grid.Column="0"
-                                                   Text="{Binding ICAO}"
-                                                   Foreground="White"
-                                                   FontWeight="Bold"
-                                                   Padding="8,8,5,8"
-                                                   VerticalAlignment="Center"/>
-                                        <Border Grid.Column="1"
-                                                Padding="5,5"
-                                                HorizontalAlignment="Stretch">
-                                            <ComboBox HorizontalAlignment="Stretch"
-                                                      MinWidth="460"
-                                                      ItemsSource="{Binding SceneryPackages}"
-                                                      SelectedItem="{Binding SelectedPackage, Mode=TwoWay}"
-                                                      DisplayMemberPath="Name"
-                                                      Style="{StaticResource ListViewComboBoxStyle}"
-                                                      ItemContainerStyle="{StaticResource DarkComboBoxItem}"/>
-                                        </Border>
-                                    </Grid>
-                                </Border>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                </ScrollViewer>
+                <Grid>
+                    <ScrollViewer VerticalScrollBarVisibility="Hidden"
+                                  HorizontalScrollBarVisibility="Disabled">
+                        <ItemsControl x:Name="AirportsItemsControl"
+                                      Margin="0"
+                                      ItemsSource="{Binding Airports}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Style="{StaticResource AirportRowEntranceStyle}"
+                                            BorderThickness="0,0,0,1"
+                                            BorderBrush="#3E3E42"
+                                            Background="Transparent">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="80"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0"
+                                                       Text="{Binding ICAO}"
+                                                       Foreground="White"
+                                                       FontWeight="Bold"
+                                                       Padding="8,8,5,8"
+                                                       VerticalAlignment="Center"/>
+                                            <Border Grid.Column="1"
+                                                    Padding="5,5"
+                                                    HorizontalAlignment="Stretch">
+                                                <ComboBox HorizontalAlignment="Stretch"
+                                                          MinWidth="460"
+                                                          ItemsSource="{Binding SceneryPackages}"
+                                                          SelectedItem="{Binding SelectedPackage, Mode=TwoWay}"
+                                                          DisplayMemberPath="Name"
+                                                          Style="{StaticResource ListViewComboBoxStyle}"
+                                                          ItemContainerStyle="{StaticResource DarkComboBoxItem}"/>
+                                            </Border>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+
+                    <TextBlock Text="No airports or packages found"
+                               Foreground="#AAAAAA"
+                               FontStyle="Italic"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility"
+                                        Value="Collapsed"/>
+                                <Style.Triggers>
+                                    <MultiDataTrigger>
+                                        <MultiDataTrigger.Conditions>
+                                            <Condition Binding="{Binding Airports.Count}"
+                                                    Value="0"/>
+                                            <Condition Binding="{Binding IsBusy}"
+                                                    Value="False"/>
+                                        </MultiDataTrigger.Conditions>
+                                        <Setter Property="Visibility"
+                                                Value="Visible"/>
+                                    </MultiDataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </Grid>
             </DockPanel>
         </Border>
 
