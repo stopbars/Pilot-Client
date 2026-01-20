@@ -745,9 +745,9 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
             if (isOffline)
             {
-                if (!string.Equals(ServerStatusDetail, "Not connected to VATSIM", StringComparison.Ordinal))
+                if (!string.Equals(ServerStatusDetail, "No VATSIM Connection", StringComparison.Ordinal))
                 {
-                    ServerStatusDetail = "Not connected to VATSIM";
+                    ServerStatusDetail = "No VATSIM Connection";
                     OnPropertyChanged(nameof(ServerStatusDetail));
                 }
             }
@@ -769,9 +769,9 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 {
                     ServerConnected = false;
                 }
-                if (!string.Equals(ServerStatusDetail, "Not connected to VATSIM", StringComparison.Ordinal))
+                if (!string.Equals(ServerStatusDetail, "No VATSIM Connection", StringComparison.Ordinal))
                 {
-                    ServerStatusDetail = "Not connected to VATSIM";
+                    ServerStatusDetail = "No VATSIM Connection";
                     OnPropertyChanged(nameof(ServerStatusDetail));
                 }
                 OnPropertyChanged(nameof(ServerStatusText));
@@ -794,7 +794,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             ServerStatusDetail = code switch
             {
                 401 => "Invalid API token",
-                403 => "Not connected to VATSIM",
+                403 => "No VATSIM Connection",
                 _ => "Server unavailable"
             };
             OnPropertyChanged(nameof(ServerStatusDetail));
