@@ -72,7 +72,7 @@ if (-not $SkipBuild) {
         -p:DebugType=portable
 }
 
-$publishDir = Join-Path (Split-Path $projectPath -Parent) "bin\\$Configuration\\net8.0-windows\\$Runtime\\publish"
+$publishDir = Join-Path (Split-Path $projectPath -Parent) "bin\\$Configuration\\net10.0-windows7.0\\$Runtime\\publish"
 if (-not (Test-Path $publishDir)) { throw "Publish directory not found: $publishDir" }
 
 # Staging folder versioned
