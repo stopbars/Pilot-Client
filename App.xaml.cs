@@ -1,6 +1,10 @@
 ﻿using System;
 using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -20,6 +24,8 @@ namespace BARS_Client_V2
 {
     public partial class App : System.Windows.Application
     {
+        private const string SingleInstanceMutexName = "Global\\Pilot-Client-SingleInstance";
+        private const string SingleInstancePipeName = "Pilot-Client-SingleInstance-Pipe";
         private IHost? _host;
         private TaskbarIcon? _taskbarIcon;
         private MainWindow? _mainWindow;
@@ -32,10 +38,25 @@ namespace BARS_Client_V2
         private bool _suppressStateChanged;
         private bool _startupDiscordPresenceEnabled = true;
         private CancellationTokenRegistration _applicationStoppingRegistration;
+        private Mutex? _singleInstanceMutex;
+        private bool _ownsSingleInstanceMutex;
+        private CancellationTokenSource? _singleInstancePipeCts;
+        private Task? _singleInstancePipeTask;
 
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
+            if (!TryAcquireSingleInstanceMutex())
+            {
+                MessageBox.Show("BARS client already running.", "BARS Client", MessageBoxButton.OK, MessageBoxImage.Information);
+                if (!TryNotifyExistingInstance())
+                {
+                    TryActivateExistingInstance();
+                }
+                Shutdown();
+                return;
+            }
+            StartSingleInstancePipeServer();
             StartupTrace.Reset();
             StartupTrace.Write("OnStartup begin");
             _host = Host.CreateDefaultBuilder()
@@ -244,9 +265,193 @@ namespace BARS_Client_V2
                 StartupTrace.Write("Host disposed");
             }
             DisposeTaskbarIcon();
+            StopSingleInstancePipeServer();
+            ReleaseSingleInstanceMutex();
             base.OnExit(e);
             StartupTrace.Write("OnExit complete");
         }
+
+        private bool TryAcquireSingleInstanceMutex()
+        {
+            try
+            {
+                _singleInstanceMutex = new Mutex(true, SingleInstanceMutexName, out var createdNew);
+                _ownsSingleInstanceMutex = createdNew;
+                return createdNew;
+            }
+            catch
+            {
+                _ownsSingleInstanceMutex = false;
+                _singleInstanceMutex = null;
+                return true;
+            }
+        }
+
+        private void StartSingleInstancePipeServer()
+        {
+            _singleInstancePipeCts = new CancellationTokenSource();
+            _singleInstancePipeTask = Task.Run(() => SingleInstancePipeServerLoopAsync(_singleInstancePipeCts.Token));
+        }
+
+        private void StopSingleInstancePipeServer()
+        {
+            if (_singleInstancePipeCts == null)
+            {
+                return;
+            }
+
+            try
+            {
+                _singleInstancePipeCts.Cancel();
+            }
+            catch
+            {
+                // Best-effort shutdown.
+            }
+            finally
+            {
+                _singleInstancePipeCts.Dispose();
+                _singleInstancePipeCts = null;
+                _singleInstancePipeTask = null;
+            }
+        }
+
+        private async Task SingleInstancePipeServerLoopAsync(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    await using var server = new NamedPipeServerStream(
+                        SingleInstancePipeName,
+                        PipeDirection.In,
+                        1,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous);
+
+                    await server.WaitForConnectionAsync(token).ConfigureAwait(false);
+                    using var reader = new StreamReader(server);
+                    var message = await reader.ReadLineAsync().ConfigureAwait(false);
+
+                    if (string.Equals(message, "SHOW", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Dispatcher?.BeginInvoke(new Action(() =>
+                        {
+                            RestoreMainWindowFromTray();
+                            if (MainWindow != null)
+                            {
+                                if (MainWindow.WindowState == WindowState.Minimized)
+                                {
+                                    MainWindow.WindowState = WindowState.Normal;
+                                }
+                                MainWindow.Activate();
+                            }
+                        }));
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    StartupTrace.Write($"Single-instance pipe server error: {ex.Message}");
+                    try
+                    {
+                        await Task.Delay(500, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        private static bool TryNotifyExistingInstance()
+        {
+            try
+            {
+                using var client = new NamedPipeClientStream(".", SingleInstancePipeName, PipeDirection.Out);
+                client.Connect(250);
+                using var writer = new StreamWriter(client) { AutoFlush = true };
+                writer.WriteLine("SHOW");
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void ReleaseSingleInstanceMutex()
+        {
+            if (_singleInstanceMutex == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (_ownsSingleInstanceMutex)
+                {
+                    _singleInstanceMutex.ReleaseMutex();
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+            finally
+            {
+                _singleInstanceMutex.Dispose();
+                _singleInstanceMutex = null;
+                _ownsSingleInstanceMutex = false;
+            }
+        }
+
+        private static void TryActivateExistingInstance()
+        {
+            try
+            {
+                var current = Process.GetCurrentProcess();
+                var processes = Process.GetProcessesByName(current.ProcessName)
+                    .Where(p => p.Id != current.Id)
+                    .ToArray();
+
+                foreach (var process in processes)
+                {
+                    var handle = process.MainWindowHandle;
+                    if (handle == IntPtr.Zero)
+                    {
+                        continue;
+                    }
+
+                    if (IsIconic(handle))
+                    {
+                        ShowWindow(handle, SwRestore);
+                    }
+
+                    SetForegroundWindow(handle);
+                    break;
+                }
+            }
+            catch
+            {
+                // Best-effort activation.
+            }
+        }
+
+        private const int SwRestore = 9;
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
 
         private void OnHostApplicationStopping()
         {
