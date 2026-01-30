@@ -20,6 +20,79 @@
         <local:NullOrEmptyToVisibilityConverter x:Key="NullOrEmptyToVisibilityConverter"/>
         <local:IndexToBoolConverter x:Key="IndexToBoolConverter"/>
 
+        <Style x:Key="ToggleSwitchStyle"
+               TargetType="CheckBox">
+            <Setter Property="Cursor"
+                    Value="Hand"/>
+            <Setter Property="ForceCursor"
+                    Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Grid x:Name="templateRoot">
+                            <Border x:Name="track"
+                                    Width="40"
+                                    Height="20"
+                                    CornerRadius="10"
+                                    Background="#555555"
+                                    BorderThickness="0"/>
+                            <Border x:Name="thumb"
+                                    Width="16"
+                                    Height="16"
+                                    CornerRadius="8"
+                                    Background="White"
+                                    HorizontalAlignment="Left"
+                                    Margin="2,0,0,0"
+                                    VerticalAlignment="Center"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked"
+                                     Value="True">
+                                <Setter TargetName="thumb"
+                                        Property="Margin"
+                                        Value="22,0,0,0"/>
+                                <Setter TargetName="track"
+                                        Property="Background"
+                                        Value="#007ACC"/>
+                            </Trigger>
+                            <EventTrigger RoutedEvent="CheckBox.Checked">
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <ThicknessAnimation Storyboard.TargetName="thumb"
+                                                            Storyboard.TargetProperty="Margin"
+                                                            From="2,0,0,0"
+                                                            To="22,0,0,0"
+                                                            Duration="0:0:0.2"
+                                                            FillBehavior="Stop">
+                                            <ThicknessAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </ThicknessAnimation.EasingFunction>
+                                        </ThicknessAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </EventTrigger>
+                            <EventTrigger RoutedEvent="CheckBox.Unchecked">
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <ThicknessAnimation Storyboard.TargetName="thumb"
+                                                            Storyboard.TargetProperty="Margin"
+                                                            From="22,0,0,0"
+                                                            To="2,0,0,0"
+                                                            Duration="0:0:0.2"
+                                                            FillBehavior="Stop">
+                                            <ThicknessAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </ThicknessAnimation.EasingFunction>
+                                        </ThicknessAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </EventTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- Simulator Toggle RadioButton Style -->
         <Style x:Key="SimulatorToggleRadioButton"
                TargetType="RadioButton">
@@ -795,6 +868,29 @@
             </StackPanel>
         </Border>
 
+        <!-- MSFS Restart Banner -->
+        <Border Grid.Row="0"
+                Margin="0,0,0,0"
+                Background="#FF8C00"
+                CornerRadius="4"
+                Padding="10,5"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                Visibility="{Binding MsfsNeedsRestartVisibility}">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="ℹ"
+                           FontSize="14"
+                           Foreground="White"
+                           Margin="0,0,8,0"
+                           VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding MsfsNeedsRestartText}"
+                           FontWeight="Bold"
+                           FontSize="12"
+                           Foreground="White"
+                           VerticalAlignment="Center"/>
+            </StackPanel>
+        </Border>
+
         <!-- API Token and Search in vertical layout -->
         <StackPanel Grid.Row="1"
                     Margin="0,0,0,15">
@@ -941,6 +1037,7 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="80"/>
                         <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="70"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0"
                                Text="ICAO"
@@ -952,6 +1049,12 @@
                                Foreground="White"
                                Padding="5,5"
                                FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="2"
+                               Text="Removals"
+                               Foreground="White"
+                               Padding="5,5"
+                               FontWeight="SemiBold"
+                               HorizontalAlignment="Center"/>
                 </Grid>
 
                 <!-- Items -->
@@ -971,6 +1074,7 @@
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="80"/>
                                                 <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="70"/>
                                             </Grid.ColumnDefinitions>
                                             <TextBlock Grid.Column="0"
                                                        Text="{Binding ICAO}"
@@ -982,13 +1086,19 @@
                                                     Padding="5,5"
                                                     HorizontalAlignment="Stretch">
                                                 <ComboBox HorizontalAlignment="Stretch"
-                                                          MinWidth="460"
+                                                          MinWidth="380"
                                                           ItemsSource="{Binding SceneryPackages}"
                                                           SelectedItem="{Binding SelectedPackage, Mode=TwoWay}"
                                                           DisplayMemberPath="Name"
                                                           Style="{StaticResource ListViewComboBoxStyle}"
                                                           ItemContainerStyle="{StaticResource DarkComboBoxItem}"/>
                                             </Border>
+                                            <CheckBox Grid.Column="2"
+                                                      IsChecked="{Binding SceneryRemovalEnabled, Mode=TwoWay}"
+                                                      HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center"
+                                                      ToolTip="Toggle scenery removals for this airport"
+                                                      Style="{StaticResource ToggleSwitchStyle}"/>
                                         </Grid>
                                     </Border>
                                 </DataTemplate>
@@ -1009,9 +1119,9 @@
                                     <MultiDataTrigger>
                                         <MultiDataTrigger.Conditions>
                                             <Condition Binding="{Binding Airports.Count}"
-                                                    Value="0"/>
+                                                       Value="0"/>
                                             <Condition Binding="{Binding IsBusy}"
-                                                    Value="False"/>
+                                                       Value="False"/>
                                         </MultiDataTrigger.Conditions>
                                         <Setter Property="Visibility"
                                                 Value="Visible"/>

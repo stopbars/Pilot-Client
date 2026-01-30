@@ -27,7 +27,10 @@ internal sealed class JsonSettingsStore : ISettingsStore
     {
         public string? ApiToken { get; set; }
         public Dictionary<string, string>? AirportPackages { get; set; }
+        public Dictionary<string, bool>? SceneryRemovalToggles { get; set; }
         public bool AutoMinimizeOnStart { get; set; }
+        public string? Msfs2020RemovalsEtag { get; set; }
+        public string? Msfs2024RemovalsEtag { get; set; }
     }
 
     public JsonSettingsStore()
@@ -71,7 +74,7 @@ internal sealed class JsonSettingsStore : ISettingsStore
             }
 
             StartupTrace.Write("JsonSettingsStore.LoadAsync success");
-            return new ClientSettings(token, p.AirportPackages ?? new(), p.AutoMinimizeOnStart);
+            return new ClientSettings(token, p.AirportPackages ?? new(), p.SceneryRemovalToggles ?? new(), p.AutoMinimizeOnStart, p.Msfs2020RemovalsEtag, p.Msfs2024RemovalsEtag);
         }
         catch
         {
@@ -94,7 +97,10 @@ internal sealed class JsonSettingsStore : ISettingsStore
             var p = new Persisted
             {
                 AirportPackages = settings.AirportPackages != null ? new Dictionary<string, string>(settings.AirportPackages) : new(),
-                AutoMinimizeOnStart = settings.AutoMinimizeOnStart
+                SceneryRemovalToggles = settings.SceneryRemovalToggles != null ? new Dictionary<string, bool>(settings.SceneryRemovalToggles) : new(),
+                AutoMinimizeOnStart = settings.AutoMinimizeOnStart,
+                Msfs2020RemovalsEtag = settings.Msfs2020RemovalsEtag,
+                Msfs2024RemovalsEtag = settings.Msfs2024RemovalsEtag
             };
 
             if (!string.IsNullOrWhiteSpace(settings.ApiToken))

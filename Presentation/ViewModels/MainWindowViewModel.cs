@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Linq;
 using System.Threading;
@@ -50,6 +51,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private int _debugStateId;
     private string? _debugPointId;
     private int _selectedSimulatorIndex; // 0 = MSFS 2020, 1 = MSFS 2024
+    private string? _msfsNeedsRestartSim;
 
     public ObservableCollection<AirportRowViewModel> Airports { get; } = new();
 
@@ -116,7 +118,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     public string OnGroundText => OnGround ? "On Ground" : "Airborne";
     public string SimulatorName { get => _simulatorName; set { if (value != _simulatorName) { _simulatorName = value; OnPropertyChanged(); } } }
-    public bool SimulatorConnected { get => _simConnected; set { if (value != _simConnected) { _simConnected = value; OnPropertyChanged(); OnPropertyChanged(nameof(SimulatorConnectionText)); OnPropertyChanged(nameof(SimulatorStatusColor)); } } }
+    public bool SimulatorConnected { get => _simConnected; set { if (value != _simConnected) { _simConnected = value; if (!value) _msfsNeedsRestartSim = null; OnPropertyChanged(); OnPropertyChanged(nameof(SimulatorConnectionText)); OnPropertyChanged(nameof(SimulatorStatusColor)); OnPropertyChanged(nameof(MsfsNeedsRestartVisibility)); OnPropertyChanged(nameof(MsfsNeedsRestartText)); } } }
     public string SimulatorConnectionText => SimulatorConnected ? "Connected" : "Disconnected";
     public string SimulatorStatusColor => SimulatorConnected ? "LimeGreen" : "Gray";
     public bool ServerConnected
@@ -196,6 +198,28 @@ public class MainWindowViewModel : INotifyPropertyChanged
     /// Visibility of the debug mode indicator.
     /// </summary>
     public string DebugModeVisibility => _debugModeActive ? "Visible" : "Collapsed";
+
+    /// <summary>
+    /// Visibility of the MSFS restart banner.
+    /// </summary>
+    public string MsfsNeedsRestartVisibility => !string.IsNullOrEmpty(_msfsNeedsRestartSim) ? "Visible" : "Collapsed";
+
+    /// <summary>
+    /// Text for the MSFS restart banner.
+    /// </summary>
+    public string MsfsNeedsRestartText => string.IsNullOrEmpty(_msfsNeedsRestartSim)
+        ? string.Empty
+        : $"Restart {(_msfsNeedsRestartSim == "msfs2024" ? "MSFS 2024" : "MSFS 2020")} for removal changes to apply";
+
+    private void SetMsfsNeedsRestart(string simulator)
+    {
+        if (_msfsNeedsRestartSim != simulator)
+        {
+            _msfsNeedsRestartSim = simulator;
+            OnPropertyChanged(nameof(MsfsNeedsRestartVisibility));
+            OnPropertyChanged(nameof(MsfsNeedsRestartText));
+        }
+    }
 
     public ObservableCollection<string> LogLines { get; } = new();
 
@@ -315,9 +339,16 @@ public class MainWindowViewModel : INotifyPropertyChanged
         });
     }
 
-    public void SeedSettings(ClientSettings settings)
+    private HashSet<string>? _removalsUpdatedSims;
+    private string? _msfs2020RemovalsEtag;
+    private string? _msfs2024RemovalsEtag;
+
+    public void SeedSettings(ClientSettings settings, HashSet<string>? removalsUpdatedSims = null)
     {
         _preloadedSettings = settings;
+        _removalsUpdatedSims = removalsUpdatedSims;
+        _msfs2020RemovalsEtag = settings.Msfs2020RemovalsEtag;
+        _msfs2024RemovalsEtag = settings.Msfs2024RemovalsEtag;
         _autoMinimizeOnStart = settings.AutoMinimizeOnStart;
         OnPropertyChanged(nameof(AutoMinimizeOnStart));
     }
@@ -339,6 +370,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
         else
         {
             settings = await _settingsStore.LoadAsync();
+            _msfs2020RemovalsEtag = settings.Msfs2020RemovalsEtag;
+            _msfs2024RemovalsEtag = settings.Msfs2024RemovalsEtag;
         }
         if (_autoMinimizeOnStart != settings.AutoMinimizeOnStart)
         {
@@ -353,7 +386,24 @@ public class MainWindowViewModel : INotifyPropertyChanged
         _savedPackages = settings.AirportPackages != null
             ? new Dictionary<string, string>(settings.AirportPackages, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        _savedRemovalToggles = settings.SceneryRemovalToggles != null
+            ? new Dictionary<string, bool>(settings.SceneryRemovalToggles, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         StartupTrace.Write($"InitializeAsync settings loaded; packages={_savedPackages.Count}");
+
+        if (_removalsUpdatedSims != null && _removalsUpdatedSims.Count > 0)
+        {
+            var runningSim = GetRunningMsfsSim();
+            if (runningSim != null && _removalsUpdatedSims.Contains(runningSim))
+            {
+                SetMsfsNeedsRestart(runningSim);
+            }
+            _removalsUpdatedSims = null;
+        }
+
+        _ = SceneryService.Instance.SyncAllRemovalStatesAsync(_savedPackages, _savedRemovalToggles)
+            .ContinueWith(t => { var runningSim = GetRunningMsfsSim(); if (runningSim != null && t.Result.Contains(runningSim)) RunOnDispatcher(() => SetMsfsNeedsRestart(runningSim)); });
+
         await RefreshFromStateAsync();
         StartupTrace.Write("InitializeAsync state refreshed");
         await RunSearchAsync(resetPage: true);
@@ -361,6 +411,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     }
 
     private IDictionary<string, string> _savedPackages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private IDictionary<string, bool> _savedRemovalToggles = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
     private bool _suppressSelectionNotifications;
 
     private bool CanChangePage(int delta)
@@ -502,8 +553,6 @@ public class MainWindowViewModel : INotifyPropertyChanged
         var changed = false;
         var selectionChanged = false;
 
-        // Use simulator-suffixed key format for consistency with SceneryService
-        // ConfiguredSimulator is used because this is for the UI display/selection
         var configuredSim = SceneryService.Instance.ConfiguredSimulator;
         var key = $"{airport.ICAO}:{configuredSim}";
 
@@ -526,6 +575,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
                     catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
                 }
 
+                SyncRemovalToggle(row, airport.ICAO, configuredSim, match.Name);
                 return changed;
             }
 
@@ -556,9 +606,25 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, configuredSim, defaultPackage.Name); }
                 catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
             }
+
+            SyncRemovalToggle(row, airport.ICAO, configuredSim, defaultPackage.Name);
         }
 
         return changed;
+    }
+
+    private void SyncRemovalToggle(AirportRowViewModel row, string icao, string simulator, string packageName)
+    {
+        var toggleKey = $"{icao}:{simulator}:{packageName}";
+        var enabled = !_savedRemovalToggles.TryGetValue(toggleKey, out var saved) || saved;
+        if (row.SceneryRemovalEnabled != enabled)
+        {
+            _suppressSelectionNotifications = true;
+            try { row.SceneryRemovalEnabled = enabled; }
+            finally { _suppressSelectionNotifications = false; }
+        }
+
+        _ = SceneryService.Instance.ApplySceneryRemovalAsync(icao, simulator, packageName, enabled);
     }
 
     private void ScheduleSearch(bool resetPage)
@@ -617,17 +683,35 @@ public class MainWindowViewModel : INotifyPropertyChanged
             return;
         }
 
-        if (e.PropertyName == nameof(AirportRowViewModel.SelectedPackage) && sender is AirportRowViewModel row && row.SelectedPackage != null)
+        if (sender is not AirportRowViewModel row) return;
+        var configuredSim = SceneryService.Instance.ConfiguredSimulator;
+
+        if (e.PropertyName == nameof(AirportRowViewModel.SelectedPackage) && row.SelectedPackage != null)
         {
-            // Use simulator-suffixed key format for consistency with SceneryService
-            // ConfiguredSimulator is used because this is for the UI selection
-            var configuredSim = SceneryService.Instance.ConfiguredSimulator;
             var key = $"{row.ICAO}:{configuredSim}";
             _savedPackages[key] = row.SelectedPackage.Name;
-            // Fire and forget save to persist selection quickly without blocking UI
             try { SceneryService.Instance.SetSelectedPackage(row.ICAO, configuredSim, row.SelectedPackage.Name); }
             catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
+
+            if (row.SceneryRemovalEnabled)
+            {
+                var changed = await SceneryService.Instance.ApplySceneryRemovalAsync(row.ICAO, configuredSim, row.SelectedPackage.Name, true);
+                if (changed) { var runningSim = GetRunningMsfsSim(); if (runningSim != null && string.Equals(runningSim, configuredSim, StringComparison.OrdinalIgnoreCase)) SetMsfsNeedsRestart(runningSim); }
+            }
+
             try { await PersistSettingsAsync(); StartupTrace.Write($"PersistSettingsAsync after selection {row.ICAO}"); }
+            catch (Exception ex) { LogLines.Add(ex.Message); StartupTrace.Write($"PersistSettingsAsync error: {ex.Message}"); }
+        }
+        else if (e.PropertyName == nameof(AirportRowViewModel.SceneryRemovalEnabled))
+        {
+            var packageName = row.SelectedPackage?.Name ?? string.Empty;
+            var toggleKey = $"{row.ICAO}:{configuredSim}:{packageName}";
+            _savedRemovalToggles[toggleKey] = row.SceneryRemovalEnabled;
+
+            var changed = await SceneryService.Instance.ApplySceneryRemovalAsync(row.ICAO, configuredSim, packageName, row.SceneryRemovalEnabled);
+            if (changed) { var runningSim = GetRunningMsfsSim(); if (runningSim != null && string.Equals(runningSim, configuredSim, StringComparison.OrdinalIgnoreCase)) SetMsfsNeedsRestart(runningSim); }
+
+            try { await PersistSettingsAsync(); StartupTrace.Write($"PersistSettingsAsync after toggle {row.ICAO}"); }
             catch (Exception ex) { LogLines.Add(ex.Message); StartupTrace.Write($"PersistSettingsAsync error: {ex.Message}"); }
         }
     }
@@ -897,6 +981,11 @@ public class MainWindowViewModel : INotifyPropertyChanged
     {
         try { await RefreshFromStateAsync(); }
         catch (Exception ex) { LogLines.Add(ex.Message); }
+
+        if (!string.IsNullOrEmpty(_msfsNeedsRestartSim) && !IsMsfsRunning())
+        {
+            SetMsfsNeedsRestart(string.Empty);
+        }
     }
 
     private void ServerTimerOnTick(object? sender, EventArgs e)
@@ -921,7 +1010,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
         try
         {
             var copy = new Dictionary<string, string>(_savedPackages, StringComparer.OrdinalIgnoreCase);
-            await _settingsStore.SaveAsync(new ClientSettings(ApiToken, copy, _autoMinimizeOnStart));
+            var togglesCopy = new Dictionary<string, bool>(_savedRemovalToggles, StringComparer.OrdinalIgnoreCase);
+            await _settingsStore.SaveAsync(new ClientSettings(ApiToken, copy, togglesCopy, _autoMinimizeOnStart, _msfs2020RemovalsEtag, _msfs2024RemovalsEtag));
             StartupTrace.Write("PersistSettingsAsync save complete");
         }
         finally
@@ -942,16 +1032,40 @@ public class MainWindowViewModel : INotifyPropertyChanged
             action();
         }
     }
+
+    private static bool IsMsfsRunning() => GetRunningMsfsSim() != null;
+
+    /// <summary>
+    /// Returns the identifier of the currently running MSFS simulator, or null if none is running.
+    /// Returns "msfs2024" for MSFS 2024 or "msfs2020" for MSFS 2020.
+    /// </summary>
+    private static string? GetRunningMsfsSim()
+    {
+        try
+        {
+            if (Process.GetProcessesByName("FlightSimulator2024").Length > 0)
+                return "msfs2024";
+            if (Process.GetProcessesByName("FlightSimulator").Length > 0)
+                return "msfs2020";
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
 
 public sealed class AirportRowViewModel : INotifyPropertyChanged
 {
     private BARS_Client_V2.Domain.Airport _airport;
     private BARS_Client_V2.Domain.SceneryPackage? _selected;
+    private bool _sceneryRemovalEnabled = true;
     public string ICAO => _airport.ICAO;
     public string? Name => _airport.Name;
     public IReadOnlyList<BARS_Client_V2.Domain.SceneryPackage> SceneryPackages => _airport.SceneryPackages;
     public BARS_Client_V2.Domain.SceneryPackage? SelectedPackage { get => _selected; set { if (value != _selected) { _selected = value; OnPropertyChanged(); } } }
+    public bool SceneryRemovalEnabled { get => _sceneryRemovalEnabled; set { if (value != _sceneryRemovalEnabled) { _sceneryRemovalEnabled = value; OnPropertyChanged(); } } }
     public AirportRowViewModel(BARS_Client_V2.Domain.Airport airport) { _airport = airport; }
     public bool IsEquivalentTo(BARS_Client_V2.Domain.Airport airport) =>
         string.Equals(_airport.ICAO, airport.ICAO, StringComparison.OrdinalIgnoreCase)

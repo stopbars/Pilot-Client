@@ -4,6 +4,7 @@ using System.Linq;
 using System.Net.Http;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using BARS_Client_V2.Infrastructure.Settings;
@@ -46,6 +47,7 @@ namespace BARS_Client_V2.Services
         // Cached packages data - fetched once, filtered locally by simulator
         private Dictionary<string, Dictionary<string, List<string>>>? _cachedPackages;
         private readonly SemaphoreSlim _cacheLock = new(1, 1);
+        private readonly SemaphoreSlim _removalGate = new(1, 1);
 
         // Supported simulators
         public static readonly string[] SupportedSimulators = { "msfs2020", "msfs2024" };
@@ -328,6 +330,184 @@ namespace BARS_Client_V2.Services
         /// <param name="icao">Airport ICAO code</param>
         /// <param name="packageName">The package name to select</param>
         public void SetSelectedPackage(string icao, string packageName) => SetSelectedPackage(icao, CurrentSimulator, packageName);
+
+        /// <summary>
+        /// Syncs all removal folder BGL states to match persisted settings.
+        /// Called on startup to ensure filesystem matches expected state.
+        /// Only applies to airports that have an explicit package selection saved.
+        /// Returns a set of simulator identifiers that had files actually modified.
+        /// </summary>
+        public async Task<HashSet<string>> SyncAllRemovalStatesAsync(IDictionary<string, string> savedPackages, IDictionary<string, bool> savedToggles)
+        {
+            await _removalGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                return await Task.Run(() =>
+                {
+                    var changedSims = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var sim in SupportedSimulators)
+                    {
+                        var communityPath = TryResolveCommunityPath(sim);
+                        if (string.IsNullOrWhiteSpace(communityPath)) continue;
+
+                        var removalsRoot = Path.Combine(communityPath, "bars-removals", "Scenery", "removals");
+                        if (!Directory.Exists(removalsRoot)) continue;
+
+                        foreach (var icaoDir in Directory.EnumerateDirectories(removalsRoot))
+                        {
+                            var icao = Path.GetFileName(icaoDir)?.ToUpperInvariant();
+                            if (string.IsNullOrEmpty(icao)) continue;
+
+                            var packageKey = $"{icao}:{sim}";
+                            if (!savedPackages.TryGetValue(packageKey, out var selectedPackage) || string.IsNullOrWhiteSpace(selectedPackage))
+                            {
+                                continue;
+                            }
+
+                            var toggleKey = $"{icao}:{sim}:{selectedPackage}";
+                            var enabled = !savedToggles.TryGetValue(toggleKey, out var toggled) || toggled;
+
+                            if (ApplyRemovalState(icaoDir, icao, selectedPackage, enabled))
+                            {
+                                changedSims.Add(sim);
+                            }
+                        }
+                    }
+                    return changedSims;
+                }).ConfigureAwait(false);
+            }
+            finally
+            {
+                _removalGate.Release();
+            }
+        }
+
+        public async Task<bool> ApplySceneryRemovalAsync(string icao, string simulator, string packageName, bool enabled)
+        {
+            if (string.IsNullOrWhiteSpace(icao) || string.IsNullOrWhiteSpace(simulator))
+            {
+                return false;
+            }
+
+            var normalizedSim = simulator.Trim().ToLowerInvariant();
+            var normalizedIcao = icao.Trim().ToUpperInvariant();
+            var normalizedPackage = packageName?.Trim() ?? string.Empty;
+
+            var communityPath = TryResolveCommunityPath(normalizedSim);
+            if (string.IsNullOrWhiteSpace(communityPath))
+            {
+                return false;
+            }
+
+            var removalsPath = Path.Combine(communityPath, "bars-removals", "Scenery", "removals", normalizedIcao);
+            if (!Directory.Exists(removalsPath))
+            {
+                return false;
+            }
+
+            await _removalGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                return await Task.Run(() => ApplyRemovalState(removalsPath, normalizedIcao, normalizedPackage, enabled)).ConfigureAwait(false);
+            }
+            finally
+            {
+                _removalGate.Release();
+            }
+        }
+
+        private static bool ApplyRemovalState(string removalsPath, string icao, string packageName, bool enabled)
+        {
+            var anyChanged = false;
+            var normalizedPackageName = packageName?.Replace(' ', '-') ?? string.Empty;
+            var expectedBase = string.IsNullOrWhiteSpace(normalizedPackageName)
+                ? string.Empty
+                : $"{normalizedPackageName}_{icao}";
+
+            foreach (var file in Directory.EnumerateFiles(removalsPath))
+            {
+                var fileName = Path.GetFileName(file);
+                if (string.IsNullOrEmpty(fileName))
+                {
+                    continue;
+                }
+
+                var isDisabled = fileName.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase);
+                var candidatePath = isDisabled ? file[..^".disabled".Length] : file;
+
+                if (!candidatePath.EndsWith(".bgl", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var baseName = Path.GetFileNameWithoutExtension(candidatePath);
+                var shouldEnable = enabled && !string.IsNullOrEmpty(expectedBase)
+                    && string.Equals(baseName, expectedBase, StringComparison.OrdinalIgnoreCase);
+
+                if (shouldEnable)
+                {
+                    if (isDisabled)
+                    {
+                        if (File.Exists(candidatePath))
+                        {
+                            File.Delete(file);
+                        }
+                        else
+                        {
+                            File.Move(file, candidatePath);
+                        }
+                        anyChanged = true;
+                    }
+                }
+                else
+                {
+                    if (!isDisabled)
+                    {
+                        var target = file + ".disabled";
+                        if (File.Exists(target))
+                        {
+                            File.Delete(file);
+                        }
+                        else
+                        {
+                            File.Move(file, target);
+                        }
+                        anyChanged = true;
+                    }
+                }
+            }
+            return anyChanged;
+        }
+
+        private static string? TryResolveCommunityPath(string simulator)
+        {
+            try
+            {
+                var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) ?? string.Empty;
+                var settingsPath = Path.Combine(root, "BARS", "Installer", SETTINGS_FILENAME);
+                if (!File.Exists(settingsPath))
+                {
+                    return null;
+                }
+
+                var json = File.ReadAllText(settingsPath);
+                var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                var settings = JsonSerializer.Deserialize<InstallerSettings>(json, options);
+                var pilotClient = settings?.PilotClient;
+                if (pilotClient == null)
+                {
+                    return null;
+                }
+
+                return simulator.Equals("msfs2024", StringComparison.OrdinalIgnoreCase)
+                    ? pilotClient.Msfs2024Path
+                    : pilotClient.Msfs2020Path;
+            }
+            catch
+            {
+                return null;
+            }
+        }
         private Dictionary<string, string> LoadSelectedPackages()
         {
             SettingsFileAccess.Gate.Wait();
@@ -429,6 +609,25 @@ namespace BARS_Client_V2.Services
             /// Airport package selections. Key format: "ICAO:simulator" (e.g., "YSCB:msfs2020")
             /// </summary>
             public Dictionary<string, string>? AirportPackages { get; set; }
+            /// <summary>
+            /// Scenery removal toggle states. Key format: "ICAO:simulator:package"
+            /// </summary>
+            public Dictionary<string, bool>? SceneryRemovalToggles { get; set; }
+        }
+
+        private sealed class InstallerSettings
+        {
+            [JsonPropertyName("Pilot-Client")]
+            public InstallerClientSettings? PilotClient { get; set; }
+        }
+
+        private sealed class InstallerClientSettings
+        {
+            [JsonPropertyName("msfs2020Path")]
+            public string? Msfs2020Path { get; set; }
+
+            [JsonPropertyName("msfs2024Path")]
+            public string? Msfs2024Path { get; set; }
         }
     }
 }

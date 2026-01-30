@@ -9,7 +9,13 @@ public interface ISettingsStore
     Task SaveAsync(ClientSettings settings);
 }
 
-public sealed record ClientSettings(string? ApiToken, IDictionary<string, string>? AirportPackages = null, bool AutoMinimizeOnStart = false)
+public sealed record ClientSettings(
+    string? ApiToken,
+    IDictionary<string, string>? AirportPackages = null,
+    IDictionary<string, bool>? SceneryRemovalToggles = null,
+    bool AutoMinimizeOnStart = false,
+    string? Msfs2020RemovalsEtag = null,
+    string? Msfs2024RemovalsEtag = null)
 {
-    public static ClientSettings Empty => new(null, new Dictionary<string, string>(), false);
+    public static ClientSettings Empty => new(null, new Dictionary<string, string>(), new Dictionary<string, bool>(), false, null, null);
 }

@@ -73,6 +73,7 @@ namespace BARS_Client_V2
                     services.AddSingleton<ISimulatorConnector, Infrastructure.Simulators.Msfs.MsfsSimulatorConnector>();
                     services.AddSingleton<IAirportRepository, Infrastructure.Networking.HttpAirportRepository>();
                     services.AddSingleton<ISettingsStore, Infrastructure.Settings.JsonSettingsStore>();
+                    services.AddSingleton<RemovalsUpdateService>();
                     services.AddSingleton<SimulatorManager>();
                     services.AddHostedService(sp => sp.GetRequiredService<SimulatorManager>()); // background stream
                     services.AddHttpClient();
@@ -118,18 +119,34 @@ namespace BARS_Client_V2
             _discordPresenceService = _host.Services.GetRequiredService<DiscordPresenceService>();
             _startupDiscordPresenceEnabled = _discordPresenceService.IsEnabled;
             ClientSettings startupSettings;
+            HashSet<string>? removalsUpdatedSims = null;
             try
             {
                 StartupTrace.Write("Preloading client settings");
                 var settingsStore = _host.Services.GetRequiredService<ISettingsStore>();
                 startupSettings = settingsStore.LoadAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+
+                StartupTrace.Write("Checking for removals updates");
+                try
+                {
+                    var removalsService = _host.Services.GetRequiredService<RemovalsUpdateService>();
+                    var removalsResult = removalsService.CheckAndUpdateRemovalsAsync(startupSettings)
+                        .ConfigureAwait(false).GetAwaiter().GetResult();
+                    startupSettings = removalsResult.Settings;
+                    removalsUpdatedSims = removalsResult.UpdatedSimulators;
+                    StartupTrace.Write($"Removals update check complete, updated sims: {string.Join(", ", removalsUpdatedSims)}");
+                }
+                catch (Exception removalsEx)
+                {
+                    StartupTrace.Write($"Removals update check failed: {removalsEx.Message}");
+                }
             }
             catch (Exception ex)
             {
                 StartupTrace.Write($"Preloading client settings failed: {ex.Message}");
                 startupSettings = ClientSettings.Empty;
             }
-            vm.SeedSettings(startupSettings);
+            vm.SeedSettings(startupSettings, removalsUpdatedSims);
             _mainWindowViewModel = vm;
             _mainWindowViewModel.PropertyChanged += MainWindowViewModelOnPropertyChanged;
             _startupAutoMinimizeRequested = startupSettings.AutoMinimizeOnStart;
