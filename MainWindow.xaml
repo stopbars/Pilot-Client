@@ -847,18 +847,79 @@
 
         <!-- Debug Mode Indicator -->
         <Border Grid.Row="0"
-                Margin="0,0,0,0"
+                Margin="0,4,0,0"
                 Background="#CC0000"
                 CornerRadius="4"
                 Padding="10,5"
                 HorizontalAlignment="Right"
                 VerticalAlignment="Top"
-                Visibility="{Binding DebugModeVisibility}">
+                RenderTransformOrigin="1,0">
+            <Border.RenderTransform>
+                <ScaleTransform ScaleX="1" ScaleY="1"/>
+            </Border.RenderTransform>
+            <Border.Style>
+                <Style TargetType="Border">
+                    <Setter Property="Opacity" Value="0"/>
+                    <Setter Property="Visibility" Value="Collapsed"/>
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding DebugModeActive}" Value="True">
+                            <DataTrigger.EnterActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetProperty="Visibility">
+                                            <DiscreteObjectKeyFrame KeyTime="0:0:0" Value="{x:Static Visibility.Visible}"/>
+                                        </ObjectAnimationUsingKeyFrames>
+                                        <DoubleAnimation Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.2">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.ScaleX" To="1" From="0.9" Duration="0:0:0.2">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.ScaleY" To="1" From="0.9" Duration="0:0:0.2">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </DataTrigger.EnterActions>
+                            <DataTrigger.ExitActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.15">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseIn"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.ScaleX" To="0.9" Duration="0:0:0.15">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseIn"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.ScaleY" To="0.9" Duration="0:0:0.15">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseIn"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetProperty="Visibility">
+                                            <DiscreteObjectKeyFrame KeyTime="0:0:0.15" Value="{x:Static Visibility.Collapsed}"/>
+                                        </ObjectAnimationUsingKeyFrames>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </DataTrigger.ExitActions>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Border.Style>
             <StackPanel Orientation="Horizontal">
                 <TextBlock Text="⚠"
                            FontSize="14"
                            Foreground="White"
-                           Margin="0,0,8,0"
+                           Margin="0,-2,8,0"
                            VerticalAlignment="Center"/>
                 <TextBlock Text="{Binding DebugModeText}"
                            FontWeight="Bold"
