@@ -50,6 +50,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private bool _debugModeActive;
     private int _debugStateId;
     private string? _debugPointId;
+    private string _debugModeTextCache = string.Empty;
     private int _selectedSimulatorIndex; // 0 = MSFS 2020, 1 = MSFS 2024
     private string? _msfsNeedsRestartSim;
 
@@ -118,7 +119,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     public string OnGroundText => OnGround ? "On Ground" : "Airborne";
     public string SimulatorName { get => _simulatorName; set { if (value != _simulatorName) { _simulatorName = value; OnPropertyChanged(); } } }
-    public bool SimulatorConnected { get => _simConnected; set { if (value != _simConnected) { _simConnected = value; if (!value) _msfsNeedsRestartSim = null; OnPropertyChanged(); OnPropertyChanged(nameof(SimulatorConnectionText)); OnPropertyChanged(nameof(SimulatorStatusColor)); OnPropertyChanged(nameof(MsfsNeedsRestartVisibility)); OnPropertyChanged(nameof(MsfsNeedsRestartText)); } } }
+    public bool SimulatorConnected { get => _simConnected; set { if (value != _simConnected) { _simConnected = value; if (!value) { _msfsNeedsRestartSim = null; if (_debugModeActive) DebugModeActive = false; } OnPropertyChanged(); OnPropertyChanged(nameof(SimulatorConnectionText)); OnPropertyChanged(nameof(SimulatorStatusColor)); OnPropertyChanged(nameof(MsfsNeedsRestartVisibility)); OnPropertyChanged(nameof(MsfsNeedsRestartText)); } } }
     public string SimulatorConnectionText => SimulatorConnected ? "Connected" : "Disconnected";
     public string SimulatorStatusColor => SimulatorConnected ? "LimeGreen" : "Gray";
     public bool ServerConnected
@@ -164,7 +165,14 @@ public class MainWindowViewModel : INotifyPropertyChanged
             {
                 _debugModeActive = value;
                 OnPropertyChanged();
-                OnPropertyChanged(nameof(DebugModeText));
+                
+                if (value)
+                {
+                    // Immediately update text when turning on
+                    UpdateDebugModeText();
+                }
+                // Text clears on next enable, not on disable (prevents text vanishing mid-animation)
+                
                 OnPropertyChanged(nameof(DebugModeVisibility));
             }
         }
@@ -182,7 +190,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             {
                 _debugStateId = value;
                 OnPropertyChanged();
-                OnPropertyChanged(nameof(DebugModeText));
+                UpdateDebugModeText();
             }
         }
     }
@@ -190,9 +198,16 @@ public class MainWindowViewModel : INotifyPropertyChanged
     /// <summary>
     /// Text to display when debug mode is active.
     /// </summary>
-    public string DebugModeText => _debugModeActive
-        ? $"DEBUG MODE - State: {_debugStateId} (Press Ctrl+Shift+D to disable)"
-        : string.Empty;
+    public string DebugModeText => _debugModeTextCache;
+    
+    private void UpdateDebugModeText()
+    {
+        // Only update when active to prevent text flash during fade-out
+        if (!_debugModeActive) return;
+
+        _debugModeTextCache = $"Debug Mode  —  State: {_debugStateId}";
+        OnPropertyChanged(nameof(DebugModeText));
+    }
 
     /// <summary>
     /// Visibility of the debug mode indicator.
@@ -932,6 +947,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     /// </summary>
     public void ToggleDebugMode()
     {
+        if (!SimulatorConnected) return;
         _pointController?.ToggleDebugMode();
     }
 
