@@ -52,6 +52,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
     private readonly ConcurrentDictionary<string, SpawnedPoint> _spawnedPoints = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, IReadOnlyList<AirportStateHub.LightLayout>> _layoutCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _updateVersions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, AlternatingTransition> _alternatingTransitions = new(StringComparer.Ordinal);
     private readonly Channel<string> _pendingUpdates = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
     {
         AllowSynchronousContinuations = false,
@@ -76,6 +77,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
 
     private (double Lat, double Lon)? _lastCenter;
     private volatile bool _suspended;
+    private volatile string? _currentAirportIcao;
 
     // Debug mode fields
     private static readonly int[] DebugStateSequence = { 0, 1, 2, 3, 4, 5, 6, 7, 20, 21, 22, 23, 24, 25, 26, 27 };
@@ -110,6 +112,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
                      ?? connectors.First();
 
         _hub.PointStateChanged += OnPointStateChanged;
+        _hub.MultiPointStateChanged += OnMultiPointStateChanged;
         _hub.MapLoaded += OnMapLoaded;
 
         _perSpawnInterval = _options.SpawnRatePerSecond <= 0
@@ -132,8 +135,59 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
         }
 
         _serverStates[pointId] = state;
+        _alternatingTransitions.TryRemove(pointId, out _);
         IncrementVersion(pointId);
         QueuePointSync(pointId);
+    }
+
+    private void OnMultiPointStateChanged(IReadOnlyList<PointState> updates)
+    {
+        if (updates == null || updates.Count == 0)
+        {
+            return;
+        }
+
+        var airportIcao = _currentAirportIcao;
+        if (string.IsNullOrWhiteSpace(airportIcao) || !airportIcao.StartsWith("Y", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var hasStopbarOff = updates.Any(p => IsStopbarType(p.Metadata.Type) && !p.IsOn);
+        var hasLeadonOn = updates.Any(p => IsLeadonType(p.Metadata.Type) && p.IsOn);
+        var hasStopbarOn = updates.Any(p => IsStopbarType(p.Metadata.Type) && p.IsOn);
+        var hasLeadonOff = updates.Any(p => IsLeadonType(p.Metadata.Type) && !p.IsOn);
+
+        var enableLeadonPattern = hasStopbarOff && hasLeadonOn;
+        var disableLeadonPattern = hasStopbarOn && hasLeadonOff;
+        if (!enableLeadonPattern && !disableLeadonPattern)
+        {
+            return;
+        }
+
+        var transitionUntil = DateTime.UtcNow.AddMilliseconds(_options.MultiStateTransitionDelayMs);
+        foreach (var state in updates)
+        {
+            var type = state.Metadata.Type;
+            var isStopbar = IsStopbarType(type);
+            var isLeadon = IsLeadonType(type);
+            if (!isStopbar && !isLeadon)
+            {
+                continue;
+            }
+
+            var shouldAnimate = enableLeadonPattern
+                ? (isStopbar && !state.IsOn) || (isLeadon && state.IsOn)
+                : (isStopbar && state.IsOn) || (isLeadon && !state.IsOn);
+            if (!shouldAnimate)
+            {
+                continue;
+            }
+
+            _alternatingTransitions[state.Metadata.Id] = new AlternatingTransition(state.IsOn, transitionUntil);
+            QueuePointSync(state.Metadata.Id);
+            ScheduleTransitionFinalize(state.Metadata.Id, transitionUntil);
+        }
     }
 
     public void Suspend()
@@ -655,7 +709,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
             }
 
             var layout = layouts[slot];
-            var desiredState = ResolveStateId(layout, state.IsOn);
+            var desiredState = ResolveStateId(layout, ResolveAlternatingTargetState(pointId, state.IsOn, slot));
             spawned.Lights.TryGetValue(slot, out var existing);
 
             if (existing != null && existing.StateId == desiredState && existing.Object.IsActive)
@@ -739,6 +793,42 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
         }
 
         return 0;
+    }
+
+    private bool ResolveAlternatingTargetState(string pointId, bool finalIsOn, int slotIndex)
+    {
+        if (!_alternatingTransitions.TryGetValue(pointId, out var transition))
+        {
+            return finalIsOn;
+        }
+
+        if (DateTime.UtcNow >= transition.PhaseTwoUtc)
+        {
+            _alternatingTransitions.TryRemove(pointId, out _);
+            return finalIsOn;
+        }
+
+        var firstHalfEnabled = (slotIndex & 1) == 0;
+        return transition.FinalIsOn ? firstHalfEnabled : !firstHalfEnabled;
+    }
+
+    private void ScheduleTransitionFinalize(string pointId, DateTime phaseTwoUtc)
+    {
+        _ = Task.Run(async () =>
+        {
+            var delay = phaseTwoUtc - DateTime.UtcNow;
+            if (delay > TimeSpan.Zero)
+            {
+                try { await Task.Delay(delay).ConfigureAwait(false); }
+                catch { return; }
+            }
+
+            if (_alternatingTransitions.TryGetValue(pointId, out var transition) &&
+                transition.PhaseTwoUtc <= DateTime.UtcNow)
+            {
+                QueuePointSync(pointId);
+            }
+        });
     }
 
     private async Task RemoveLightAsync(string pointId, int slot, SpawnedLight light, CancellationToken ct)
@@ -963,6 +1053,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
     {
         try
         {
+            _currentAirportIcao = airport?.Trim().ToUpperInvariant();
             _layoutCache.Clear();
             lock (_visibilityLock)
             {
@@ -1034,6 +1125,27 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
     {
         if (stateId < 0) stateId = 0;
         return $"BARS_Light_{stateId}";
+    }
+
+    private static bool IsStopbarType(string? type)
+    {
+        if (string.IsNullOrWhiteSpace(type))
+        {
+            return false;
+        }
+
+        return type.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0 &&
+               type.IndexOf("BAR", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool IsLeadonType(string? type)
+    {
+        if (string.IsNullOrWhiteSpace(type))
+        {
+            return false;
+        }
+
+        return type.IndexOf("LEAD", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private readonly struct SpawnRequest
@@ -1185,6 +1297,8 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
         public int StateId { get; }
         public int SlotIndex { get; }
     }
+
+    private readonly record struct AlternatingTransition(bool FinalIsOn, DateTime PhaseTwoUtc);
 }
 
 public sealed class MsfsPointControllerOptions
@@ -1198,6 +1312,7 @@ public sealed class MsfsPointControllerOptions
     public int DisconnectedDelayMs { get; init; } = 500;
     public int ErrorBackoffMs { get; init; } = 250;
     public double SpawnAltitudeFeet { get; init; } = 0;
+    public int MultiStateTransitionDelayMs { get; init; } = 1000;
     /// <summary>
     /// Interval in milliseconds between debug mode state cycles. Default 1 second.
     /// </summary>

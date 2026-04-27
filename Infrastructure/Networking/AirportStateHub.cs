@@ -48,6 +48,7 @@ public sealed class AirportStateHub
 
     public event Action<string>? MapLoaded; // airport
     public event Action<PointState>? PointStateChanged; // fired for initial + updates
+    public event Action<IReadOnlyList<PointState>>? MultiPointStateChanged; // fired once per MULTI_STATE_UPDATE packet
     public event Action<string, string>? OutboundPacketRequested; // (airport, rawJson)
 
     public bool TryGetPoint(string id, out PointState state) => _states.TryGetValue(id, out state!);
@@ -234,6 +235,7 @@ public sealed class AirportStateHub
         if (!data.TryGetProperty("updates", out var updates) || updates.ValueKind != JsonValueKind.Array) return;
         var ts = root.TryGetProperty("timestamp", out var tsp) && tsp.TryGetInt64(out var lts) ? lts : 0L;
         var anyApplied = false;
+        List<PointState>? appliedStates = null;
         foreach (var update in updates.EnumerateArray())
         {
             if (update.ValueKind != JsonValueKind.Object) continue;
@@ -249,11 +251,17 @@ public sealed class AirportStateHub
             var ps = new PointState(meta, on, ts);
             _states[id!] = ps;
             anyApplied = true;
+            appliedStates ??= new List<PointState>();
+            appliedStates.Add(ps);
             try { PointStateChanged?.Invoke(ps); } catch { }
         }
         if (anyApplied)
         {
             _lastUpdateUtc = DateTime.UtcNow;
+            if (appliedStates != null && appliedStates.Count > 0)
+            {
+                try { MultiPointStateChanged?.Invoke(appliedStates); } catch { }
+            }
         }
     }
 

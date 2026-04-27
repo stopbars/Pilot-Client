@@ -51,18 +51,19 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private int _debugStateId;
     private string? _debugPointId;
     private string _debugModeTextCache = string.Empty;
-    private int _selectedSimulatorIndex; // 0 = MSFS 2020, 1 = MSFS 2024
+    private int _selectedSimulatorIndex; // 0 = MSFS 2024, 1 = MSFS 2020
     private string? _msfsNeedsRestartSim;
+    private const int ApiTokenLength = 69;
 
     public ObservableCollection<AirportRowViewModel> Airports { get; } = new();
 
     /// <summary>
     /// Available simulators for the toggle.
     /// </summary>
-    public string[] SimulatorOptions { get; } = { "MSFS 2020", "MSFS 2024" };
+    public string[] SimulatorOptions { get; } = { "MSFS 2024", "MSFS 2020" };
 
     /// <summary>
-    /// Index of the currently selected simulator for configuration (0 = MSFS 2020, 1 = MSFS 2024).
+    /// Index of the currently selected simulator for configuration (0 = MSFS 2024, 1 = MSFS 2020).
     /// Changing this will refresh the airport list to show packages for that simulator.
     /// This is separate from the actual connected simulator.
     /// </summary>
@@ -77,7 +78,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(SelectedSimulatorDisplay));
 
             // Update SceneryService ConfiguredSimulator (not CurrentSimulator - that's set by SimConnect)
-            var newSim = value == 1 ? "msfs2024" : "msfs2020";
+            var newSim = value == 0 ? "msfs2024" : "msfs2020";
             var wasChanged = !string.Equals(SceneryService.Instance.ConfiguredSimulator, newSim, StringComparison.OrdinalIgnoreCase);
             SceneryService.Instance.ConfiguredSimulator = newSim;
 
@@ -107,7 +108,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     /// <summary>
     /// Display name of the currently configured simulator (for UI).
     /// </summary>
-    public string SelectedSimulatorDisplay => _selectedSimulatorIndex == 1 ? "MSFS 2024" : "MSFS 2020";
+    public string SelectedSimulatorDisplay => _selectedSimulatorIndex == 0 ? "MSFS 2024" : "MSFS 2020";
 
     public string ClosestAirport { get => _closestAirport; private set { if (value != _closestAirport) { _closestAirport = value; OnPropertyChanged(); } } }
 
@@ -266,10 +267,12 @@ public class MainWindowViewModel : INotifyPropertyChanged
             {
                 _apiToken = sanitized;
                 OnPropertyChanged();
+                OnPropertyChanged(nameof(ApiTokenValidationMessage));
                 (SaveTokenCommand as DelegateCommand)?.RaiseCanExecuteChanged();
             }
         }
     }
+    public string? ApiTokenValidationMessage => GetApiTokenValidationMessage(ApiToken);
     public string Status { get => _status; private set { if (value != _status) { _status = value; OnPropertyChanged(); } } }
     public bool IsBusy { get => _isBusy; private set { if (value != _isBusy) { _isBusy = value; OnPropertyChanged(); } } }
     public bool AutoMinimizeOnStart
@@ -333,7 +336,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         RunOnDispatcher(async () =>
         {
             // Update the toggle to reflect the new simulator (in case it was set programmatically)
-            var newIndex = string.Equals(newSimulator, "msfs2024", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+            var newIndex = string.Equals(newSimulator, "msfs2024", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
             if (_selectedSimulatorIndex != newIndex)
             {
                 _selectedSimulatorIndex = newIndex;
@@ -397,6 +400,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         _originalApiToken = SanitizeToken(settings.ApiToken);
         _apiToken = _originalApiToken; // set backing field directly to avoid redundant raise
         OnPropertyChanged(nameof(ApiToken));
+        OnPropertyChanged(nameof(ApiTokenValidationMessage));
         (SaveTokenCommand as DelegateCommand)?.RaiseCanExecuteChanged();
         _savedPackages = settings.AirportPackages != null
             ? new Dictionary<string, string>(settings.AirportPackages, StringComparer.OrdinalIgnoreCase)
@@ -671,13 +675,14 @@ public class MainWindowViewModel : INotifyPropertyChanged
             {
                 _apiToken = resanitized;
                 OnPropertyChanged(nameof(ApiToken));
+                OnPropertyChanged(nameof(ApiTokenValidationMessage));
                 (SaveTokenCommand as DelegateCommand)?.RaiseCanExecuteChanged();
             }
         }
 
         if (!IsValidToken(ApiToken))
         {
-            Status = "API Token must start with 'BARS_'";
+            Status = ApiTokenValidationMessage ?? "API tokens start with BARS_.";
             LogLines.Add(Status);
             StartupTrace.Write("SaveSettingsAsync invalid token");
             return;
@@ -980,7 +985,41 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private static bool IsValidToken(string? token)
     {
         if (string.IsNullOrEmpty(token)) return true; // Allow empty token (user may clear it)
-        return token.StartsWith("BARS_", StringComparison.Ordinal);
+        return token.StartsWith("BARS_", StringComparison.Ordinal) && token.Length == ApiTokenLength;
+    }
+
+    private static string? GetApiTokenValidationMessage(string? token)
+    {
+        if (string.IsNullOrEmpty(token) || IsValidToken(token)) return null;
+
+        if (LooksLikeJwt(token))
+        {
+            return "This looks like a v1 token. Enter a BARS_ API token.";
+        }
+
+        if (token.StartsWith("BARS_", StringComparison.Ordinal) && token.Length != ApiTokenLength)
+        {
+            return "API tokens must be 69 characters long.";
+        }
+
+        return "API tokens start with BARS_.";
+    }
+
+    private static bool LooksLikeJwt(string token)
+    {
+        var segments = token.Split('.');
+        return segments.Length == 3
+            && segments.All(segment => segment.Length > 0 && segment.All(IsBase64JwtCharacter));
+    }
+
+    private static bool IsBase64JwtCharacter(char character)
+    {
+        return char.IsLetterOrDigit(character)
+            || character == '-'
+            || character == '_'
+            || character == '+'
+            || character == '/'
+            || character == '=';
     }
 
     private bool CanSaveToken()

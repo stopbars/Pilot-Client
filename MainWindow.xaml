@@ -967,6 +967,7 @@
                     <Grid Grid.Column="0">
                         <PasswordBox x:Name="ApiTokenPasswordBox"
                                      behaviors:PasswordBoxAssistant.BindPassword="True"
+                                     behaviors:PasswordBoxAssistant.RemoveWhitespace="True"
                                      behaviors:PasswordBoxAssistant.BoundPassword="{Binding ApiToken, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
                         <TextBlock Text="Enter BARS API Token Here"
                                    Margin="5,0,0,0"
@@ -982,6 +983,29 @@
                             Margin="5,0,0,0"
                             Command="{Binding SaveTokenCommand}"/>
                 </Grid>
+                <TextBlock Text="{Binding ApiTokenValidationMessage}"
+                           Foreground="#F4B183"
+                           Margin="0,5,0,0"
+                           TextWrapping="Wrap">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Visibility"
+                                    Value="Visible"/>
+                            <Style.Triggers>
+                                <Trigger Property="Text"
+                                         Value="">
+                                    <Setter Property="Visibility"
+                                            Value="Collapsed"/>
+                                </Trigger>
+                                <Trigger Property="Text"
+                                         Value="{x:Null}">
+                                    <Setter Property="Visibility"
+                                            Value="Collapsed"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
             </StackPanel>
 
             <!-- Airport Search -->
@@ -1066,15 +1090,15 @@
                         BorderThickness="1"
                         CornerRadius="3">
                     <StackPanel Orientation="Horizontal">
-                        <RadioButton x:Name="Sim2020Radio"
-                                     Content="2020"
+                        <RadioButton x:Name="Sim2024Radio"
+                                     Content="2024"
                                      Foreground="White"
                                      Padding="10,5"
                                      IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=0, Mode=TwoWay}"
                                      GroupName="SimulatorToggle"
                                      Style="{StaticResource SimulatorToggleRadioButton}"/>
-                        <RadioButton x:Name="Sim2024Radio"
-                                     Content="2024"
+                        <RadioButton x:Name="Sim2020Radio"
+                                     Content="2020"
                                      Foreground="White"
                                      Padding="10,5"
                                      IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=1, Mode=TwoWay}"

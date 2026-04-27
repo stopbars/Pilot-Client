@@ -42,7 +42,7 @@ namespace BARS_Client_V2.Services
         private Dictionary<string, string> _selectedPackages;
         private static SceneryService? _instance;
         private string _currentSimulator = "msfs2020"; // Default to 2020 - set by actual SimConnect detection
-        private string _configuredSimulator = "msfs2020"; // Which simulator the user is configuring in the UI
+        private string _configuredSimulator = "msfs2024"; // Which simulator the user is configuring in the UI
 
         // Cached packages data - fetched once, filtered locally by simulator
         private Dictionary<string, Dictionary<string, List<string>>>? _cachedPackages;
@@ -84,9 +84,9 @@ namespace BARS_Client_V2.Services
             get => _configuredSimulator;
             set
             {
-                var normalized = value?.ToLowerInvariant() ?? "msfs2020";
+                var normalized = value?.ToLowerInvariant() ?? "msfs2024";
                 if (Array.IndexOf(SupportedSimulators, normalized) < 0)
-                    normalized = "msfs2020";
+                    normalized = "msfs2024";
 
                 if (_configuredSimulator != normalized)
                 {
