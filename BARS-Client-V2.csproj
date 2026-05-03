@@ -10,9 +10,9 @@
     <ApplicationIcon>appicon.ico</ApplicationIcon>
     <AssemblyName>BARS Client</AssemblyName>
     <Name>BARS Client</Name>
-    <Version>0.0.1</Version>
-    <FileVersion>0.0.1</FileVersion>
-    <AssemblyVersion>0.0.1</AssemblyVersion>
+    <Version>0.0.2</Version>
+    <FileVersion>0.0.2</FileVersion>
+    <AssemblyVersion>0.0.2</AssemblyVersion>
     <PackageId>BARS-Client</PackageId>
     <SelfContained>false</SelfContained>
     <PublishReadyToRun>true</PublishReadyToRun>
