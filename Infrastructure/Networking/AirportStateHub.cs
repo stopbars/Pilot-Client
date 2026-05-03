@@ -9,6 +9,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml;
 using System.Xml.Linq;
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Infrastructure.Simulators.Msfs;
@@ -35,6 +36,8 @@ public sealed class AirportStateHub
     private volatile bool _requestInFlight;
     private DateTime _lastSnapshotRequestUtc = DateTime.MinValue;
     private readonly TimeSpan _snapshotRequestMinInterval = TimeSpan.FromSeconds(20);
+    private volatile bool _testingMode;
+    private string? _testingAirport;
 
     public AirportStateHub(IHttpClientFactory httpFactory, ILogger<AirportStateHub> logger, SimulatorManager simManager)
     {
@@ -50,6 +53,10 @@ public sealed class AirportStateHub
     public event Action<PointState>? PointStateChanged; // fired for initial + updates
     public event Action<IReadOnlyList<PointState>>? MultiPointStateChanged; // fired once per MULTI_STATE_UPDATE packet
     public event Action<string, string>? OutboundPacketRequested; // (airport, rawJson)
+    public event Action<TestingModeChangedEventArgs>? TestingModeChanged;
+
+    public bool IsTestingMode => _testingMode;
+    public string? TestingAirport => _testingAirport;
 
     public bool TryGetPoint(string id, out PointState state) => _states.TryGetValue(id, out state!);
     public bool TryGetLightLayout(string id, out IReadOnlyList<LightLayout> lights)
@@ -74,6 +81,11 @@ public sealed class AirportStateHub
 
     public async Task ProcessAsync(string json, CancellationToken ct = default)
     {
+        if (_testingMode)
+        {
+            return;
+        }
+
         try
         {
             using var doc = JsonDocument.Parse(json);
@@ -115,6 +127,7 @@ public sealed class AirportStateHub
     /// <param name="objectId">Bars object id of the stopbar line that was crossed.</param>
     public void SendStopbarCrossing(string objectId)
     {
+        if (_testingMode) return;
         if (string.IsNullOrWhiteSpace(objectId)) return;
         var packet = JsonSerializer.Serialize(new { type = "STOPBAR_CROSSING", data = new { objectId = objectId } });
         try { OutboundPacketRequested?.Invoke(_mapAirport ?? string.Empty, packet); } catch { }
@@ -267,6 +280,11 @@ public sealed class AirportStateHub
 
     public async Task EnsureMapLoadedAsync(string airport, CancellationToken ct = default)
     {
+        if (_testingMode)
+        {
+            return;
+        }
+
         if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return;
         await _mapLock.WaitAsync(ct);
         try
@@ -280,6 +298,79 @@ public sealed class AirportStateHub
         }
     }
 
+    public async Task LoadTestingMapAsync(string airport, string barsXml, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(airport) || airport.Length != 4 || !airport.All(char.IsLetterOrDigit))
+        {
+            throw new ArgumentException("Testing map response did not include a valid ICAO.", nameof(airport));
+        }
+
+        if (string.IsNullOrWhiteSpace(barsXml))
+        {
+            throw new ArgumentException("Testing map response did not include BARS XML.", nameof(barsXml));
+        }
+
+        var normalizedAirport = airport.Trim().ToUpperInvariant();
+        var document = ParseBarsXmlSecure(barsXml);
+
+        await _mapLock.WaitAsync(ct);
+        try
+        {
+            _testingMode = true;
+            _testingAirport = normalizedAirport;
+            _metadata.Clear();
+            _layouts.Clear();
+            _states.Clear();
+            _lastSnapshotUtc = DateTime.MaxValue;
+            _lastUpdateUtc = DateTime.UtcNow;
+            _lastSnapshotRequestUtc = DateTime.MaxValue;
+
+            ParseMap(document, normalizedAirport);
+            _mapAirport = normalizedAirport;
+
+            try { MapLoaded?.Invoke(normalizedAirport); } catch { }
+
+            var applied = ApplyTestingModeStates(normalizedAirport);
+            _logger.LogInformation("Testing mode loaded map {apt}; seeded testing states for {count} objects", normalizedAirport, applied);
+        }
+        finally
+        {
+            _mapLock.Release();
+        }
+
+        try { TestingModeChanged?.Invoke(new TestingModeChangedEventArgs(true, normalizedAirport)); } catch { }
+    }
+
+    public async Task EndTestingModeAsync(CancellationToken ct = default)
+    {
+        await _mapLock.WaitAsync(ct);
+        try
+        {
+            if (!_testingMode)
+            {
+                return;
+            }
+
+            _testingMode = false;
+            _testingAirport = null;
+            _mapAirport = null;
+            _metadata.Clear();
+            _layouts.Clear();
+            _states.Clear();
+            _lastSnapshotUtc = DateTime.MinValue;
+            _lastUpdateUtc = DateTime.MinValue;
+            _lastSnapshotRequestUtc = DateTime.MinValue;
+        }
+        finally
+        {
+            _mapLock.Release();
+        }
+
+        try { TestingModeChanged?.Invoke(new TestingModeChangedEventArgs(false, null)); } catch { }
+        try { MapLoaded?.Invoke(string.Empty); } catch { }
+        _logger.LogInformation("Testing mode ended");
+    }
+
     /// <summary>
     /// Force reload current airport map after scenery package change.
     /// </summary>
@@ -287,6 +378,7 @@ public sealed class AirportStateHub
     {
         try
         {
+            if (_testingMode) return;
             // Only reload if we're currently on that airport AND the changed simulator matches the current one
             if (!string.Equals(_mapAirport, icao, StringComparison.OrdinalIgnoreCase)) return;
             var runningSim = GetRunningSimulatorId();
@@ -494,6 +586,25 @@ public sealed class AirportStateHub
         return reverted;
     }
 
+    private int ApplyTestingModeStates(string airport)
+    {
+        if (string.IsNullOrWhiteSpace(airport)) return 0;
+        var applied = 0;
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        foreach (var kvp in _metadata)
+        {
+            var id = kvp.Key;
+            var meta = kvp.Value;
+            if (!string.Equals(meta.AirportId, airport, StringComparison.OrdinalIgnoreCase)) continue;
+            var state = new PointState(meta, true, timestamp);
+            _states[id] = state;
+            applied++;
+            try { PointStateChanged?.Invoke(state); } catch { }
+        }
+
+        return applied;
+    }
+
     private static bool IsStopbar(string? type)
     {
         if (string.IsNullOrWhiteSpace(type)) return false;
@@ -576,6 +687,20 @@ public sealed class AirportStateHub
         _logger.LogInformation("Parsed map {apt} BarsObjects={raw} uniquePoints={uniq} duplicatesMerged={dups} lights={lights}", airport, barsObjectElements, uniquePointIds, duplicateMerged, lightCount);
     }
 
+    private static XDocument ParseBarsXmlSecure(string xml)
+    {
+        var settings = new XmlReaderSettings
+        {
+            DtdProcessing = DtdProcessing.Prohibit,
+            XmlResolver = null,
+            MaxCharactersInDocument = 10_000_000
+        };
+
+        using var stringReader = new System.IO.StringReader(xml);
+        using var xmlReader = XmlReader.Create(stringReader, settings);
+        return XDocument.Load(xmlReader, LoadOptions.None);
+    }
+
     private bool TryParseLatLon(string? csv, out double lat, out double lon)
     {
         lat = lon = 0;
@@ -593,6 +718,7 @@ public sealed class AirportStateHub
     {
         try
         {
+            if (_testingMode) return;
             if (_mapAirport == null) return; // not connected yet
             var now = DateTime.UtcNow;
             var sinceUpdate = now - _lastUpdateUtc;
@@ -609,6 +735,7 @@ public sealed class AirportStateHub
 
     private Task RequestSnapshotAsync(string airport)
     {
+        if (_testingMode) return Task.CompletedTask;
         if (_requestInFlight) return Task.CompletedTask;
         if ((DateTime.UtcNow - _lastSnapshotRequestUtc) < _snapshotRequestMinInterval) return Task.CompletedTask;
         _requestInFlight = true;
@@ -626,4 +753,6 @@ public sealed class AirportStateHub
         }
         return Task.CompletedTask;
     }
+
+    public sealed record TestingModeChangedEventArgs(bool IsTestingMode, string? Airport);
 }

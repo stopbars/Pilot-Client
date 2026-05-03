@@ -114,6 +114,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
         _hub.PointStateChanged += OnPointStateChanged;
         _hub.MultiPointStateChanged += OnMultiPointStateChanged;
         _hub.MapLoaded += OnMapLoaded;
+        _hub.TestingModeChanged += OnTestingModeChanged;
 
         _perSpawnInterval = _options.SpawnRatePerSecond <= 0
             ? TimeSpan.Zero
@@ -1067,6 +1068,20 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "[MapReload] Failed to reset controller for {apt}", airport);
+        }
+    }
+
+    private void OnTestingModeChanged(AirportStateHub.TestingModeChangedEventArgs e)
+    {
+        if (!e.IsTestingMode)
+        {
+            return;
+        }
+
+        _logger.LogInformation("[TestingMode] Enabled - queued loaded points for distance-based sync");
+        foreach (var pointId in _serverStates.Keys)
+        {
+            QueuePointSync(pointId);
         }
     }
 

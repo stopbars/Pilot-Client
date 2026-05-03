@@ -848,7 +848,6 @@
         <!-- Debug Mode Indicator -->
         <Border Grid.Row="0"
                 Margin="0,4,0,0"
-                Background="#CC0000"
                 CornerRadius="4"
                 Padding="10,5"
                 HorizontalAlignment="Right"
@@ -859,9 +858,13 @@
             </Border.RenderTransform>
             <Border.Style>
                 <Style TargetType="Border">
+                    <Setter Property="Background" Value="#CC0000"/>
                     <Setter Property="Opacity" Value="0"/>
                     <Setter Property="Visibility" Value="Collapsed"/>
                     <Style.Triggers>
+                        <DataTrigger Binding="{Binding IsTestingModeActive}" Value="True">
+                            <Setter Property="Background" Value="#EAB308"/>
+                        </DataTrigger>
                         <DataTrigger Binding="{Binding DebugModeActive}" Value="True">
                             <DataTrigger.EnterActions>
                                 <BeginStoryboard>
@@ -926,6 +929,54 @@
                            FontSize="12"
                            Foreground="White"
                            VerticalAlignment="Center"/>
+                <Button Command="{Binding EndActiveModeCommand}"
+                        Width="18"
+                        Height="18"
+                        Margin="8,0,0,0"
+                        Padding="0"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Foreground="White"
+                        Cursor="Hand"
+                        Focusable="False"
+                        ToolTip="End testing mode">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Setter Property="Opacity" Value="0.82"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="Button">
+                                        <Border Background="{TemplateBinding Background}"
+                                                CornerRadius="9">
+                                            <ContentPresenter HorizontalAlignment="Center"
+                                                              VerticalAlignment="Center"/>
+                                        </Border>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Opacity" Value="1"/>
+                                    <Setter Property="Background" Value="#26FFFFFF"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter Property="Background" Value="#40FFFFFF"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                    <Viewbox Width="13"
+                             Height="13">
+                        <Canvas Width="14"
+                                Height="14">
+                            <Path Data="M 3 3 L 11 11 M 11 3 L 3 11"
+                                  Stroke="White"
+                                  StrokeThickness="2.2"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"/>
+                        </Canvas>
+                    </Viewbox>
+                </Button>
             </StackPanel>
         </Border>
 

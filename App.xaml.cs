@@ -42,14 +42,19 @@ namespace BARS_Client_V2
         private bool _ownsSingleInstanceMutex;
         private CancellationTokenSource? _singleInstancePipeCts;
         private Task? _singleInstancePipeTask;
+        private string? _pendingProtocolUrl;
 
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
+            var startupProtocolUrl = GetTestingProtocolUrl(e.Args);
             if (!TryAcquireSingleInstanceMutex())
             {
-                MessageBox.Show("BARS client already running.", "BARS Client", MessageBoxButton.OK, MessageBoxImage.Information);
-                if (!TryNotifyExistingInstance())
+                if (string.IsNullOrWhiteSpace(startupProtocolUrl))
+                {
+                    MessageBox.Show("BARS client already running.", "BARS Client", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                if (!TryNotifyExistingInstance(startupProtocolUrl))
                 {
                     TryActivateExistingInstance();
                 }
@@ -83,6 +88,7 @@ namespace BARS_Client_V2
                     services.AddSingleton<BARS_Client_V2.Services.DiscordPresenceService>();
                     services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Services.DiscordPresenceService>());
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
+                    services.AddSingleton<BARS_Client_V2.Services.TestingModeService>();
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>(sp =>
                     {
                         var connectors = sp.GetServices<ISimulatorConnector>();
@@ -99,7 +105,8 @@ namespace BARS_Client_V2
                         var airportRepo = sp.GetRequiredService<IAirportRepository>();
                         var settingsStore = sp.GetRequiredService<ISettingsStore>();
                         var pointController = sp.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>();
-                        return new MainWindowViewModel(simManager, nearestService, airportRepo, settingsStore, pointController);
+                        var hub = sp.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
+                        return new MainWindowViewModel(simManager, nearestService, airportRepo, settingsStore, pointController, hub);
                     });
                     services.AddTransient<MainWindow>();
                 })
@@ -170,13 +177,19 @@ namespace BARS_Client_V2
                 {
                     pointController.Resume();
                 }
-                else if (!wsMgr.IsConnected)
+                else if (!wsMgr.IsConnected && !hub.IsTestingMode)
                 {
                     pointController.Suspend();
                 }
             };
             wsMgr.Disconnected += reason =>
             {
+                if (hub.IsTestingMode)
+                {
+                    pointController.Resume();
+                    return;
+                }
+
                 if (wsMgr.IsOfflineMode)
                 {
                     pointController.Resume();
@@ -186,6 +199,17 @@ namespace BARS_Client_V2
                 vm.NotifyServerDisconnected(reason);
             };
             wsMgr.Connected += () => pointController.Resume();
+            hub.TestingModeChanged += e =>
+            {
+                if (e.IsTestingMode)
+                {
+                    pointController.Resume();
+                }
+                else if (!wsMgr.IsConnected && !wsMgr.IsOfflineMode)
+                {
+                    pointController.Suspend();
+                }
+            };
             StartupTrace.Write("Event wiring complete");
 
             ConfigureTaskbarIcon(mainWindow);
@@ -242,6 +266,10 @@ namespace BARS_Client_V2
                     }
                 });
             }
+
+            ProcessTestingProtocolUrl(startupProtocolUrl);
+            ProcessTestingProtocolUrl(_pendingProtocolUrl);
+            _pendingProtocolUrl = null;
         }
 
         protected override async void OnExit(ExitEventArgs e)
@@ -350,7 +378,24 @@ namespace BARS_Client_V2
                     using var reader = new StreamReader(server);
                     var message = await reader.ReadLineAsync().ConfigureAwait(false);
 
-                    if (string.Equals(message, "SHOW", StringComparison.OrdinalIgnoreCase))
+                    if (message != null && message.StartsWith("URL ", StringComparison.Ordinal))
+                    {
+                        var protocolUrl = message[4..];
+                        Dispatcher?.BeginInvoke(new Action(() =>
+                        {
+                            RestoreMainWindowFromTray();
+                            if (MainWindow != null)
+                            {
+                                if (MainWindow.WindowState == WindowState.Minimized)
+                                {
+                                    MainWindow.WindowState = WindowState.Normal;
+                                }
+                                MainWindow.Activate();
+                            }
+                            ProcessTestingProtocolUrl(protocolUrl);
+                        }));
+                    }
+                    else if (string.Equals(message, "SHOW", StringComparison.OrdinalIgnoreCase))
                     {
                         Dispatcher?.BeginInvoke(new Action(() =>
                         {
@@ -385,20 +430,85 @@ namespace BARS_Client_V2
             }
         }
 
-        private static bool TryNotifyExistingInstance()
+        private static bool TryNotifyExistingInstance(string? protocolUrl = null)
         {
             try
             {
                 using var client = new NamedPipeClientStream(".", SingleInstancePipeName, PipeDirection.Out);
                 client.Connect(250);
                 using var writer = new StreamWriter(client) { AutoFlush = true };
-                writer.WriteLine("SHOW");
+                writer.WriteLine(string.IsNullOrWhiteSpace(protocolUrl) ? "SHOW" : $"URL {protocolUrl}");
                 return true;
             }
             catch
             {
                 return false;
             }
+        }
+
+        private static string? GetTestingProtocolUrl(string[]? args)
+        {
+            if (args == null || args.Length == 0)
+            {
+                return null;
+            }
+
+            foreach (var arg in args)
+            {
+                if (string.IsNullOrWhiteSpace(arg) || arg.Any(char.IsControl))
+                {
+                    continue;
+                }
+
+                if (Uri.TryCreate(arg, UriKind.Absolute, out var uri) &&
+                    string.Equals(uri.Scheme, "bars", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(uri.Host, "test", StringComparison.OrdinalIgnoreCase))
+                {
+                    return arg;
+                }
+            }
+
+            return null;
+        }
+
+        private void ProcessTestingProtocolUrl(string? protocolUrl)
+        {
+            if (string.IsNullOrWhiteSpace(protocolUrl))
+            {
+                return;
+            }
+
+            if (_host == null)
+            {
+                _pendingProtocolUrl = protocolUrl;
+                return;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var testingMode = _host.Services.GetRequiredService<TestingModeService>();
+                    await testingMode.HandleProtocolUrlAsync(protocolUrl).ConfigureAwait(false);
+                    Dispatcher?.BeginInvoke(new Action(() =>
+                    {
+                        RestoreMainWindowFromTray();
+                        MainWindow?.Activate();
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    StartupTrace.Write($"Testing protocol error: {ex.Message}");
+                    Dispatcher?.BeginInvoke(new Action(() =>
+                    {
+                        MessageBox.Show(
+                            ex.Message,
+                            "BARS Testing Mode",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Warning);
+                    }));
+                }
+            });
         }
 
         private void ReleaseSingleInstanceMutex()

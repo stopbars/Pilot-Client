@@ -61,7 +61,15 @@ internal sealed class AirportWebSocketManager : BackgroundService
     {
         hub.OutboundPacketRequested += (airport, rawJson) =>
         {
+            if (hub.IsTestingMode) return;
             try { _ = SendRawAsync(rawJson); } catch { }
+        };
+        hub.TestingModeChanged += e =>
+        {
+            if (e.IsTestingMode)
+            {
+                try { _ = DisconnectAsync("Testing mode active"); } catch { }
+            }
         };
         _stateHub = hub;
     }
@@ -87,6 +95,14 @@ internal sealed class AirportWebSocketManager : BackgroundService
 
     private async Task EvaluateAsync(CancellationToken ct)
     {
+        if (_stateHub?.IsTestingMode == true)
+        {
+            SetDesiredAirport(null);
+            DeactivateOfflineMode();
+            await DisconnectAsync("Testing mode active");
+            return;
+        }
+
         var flight = _simManager.LatestState;
         var connector = _simManager.ActiveConnector;
         if (flight == null || connector == null || !connector.IsConnected)

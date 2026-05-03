@@ -1,4 +1,5 @@
-﻿using System.Windows;
+﻿using System.Reflection;
+using System.Windows;
 using System.Windows.Input;
 using BARS_Client_V2.Presentation.ViewModels;
 
@@ -10,6 +11,7 @@ public partial class MainWindow : Window
     {
         // Ignore this error in vscode.
         InitializeComponent();
+        Title = $"BARS Client - v{GetAppVersion()}";
 
         // Register keybinding for debug mode toggle (Ctrl+Shift+D)
         var debugModeBinding = new KeyBinding(
@@ -17,6 +19,24 @@ public partial class MainWindow : Window
             Key.D,
             ModifierKeys.Control | ModifierKeys.Shift);
         InputBindings.Add(debugModeBinding);
+    }
+
+    private static string GetAppVersion()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var informationalVersion = assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion;
+
+        if (!string.IsNullOrWhiteSpace(informationalVersion))
+        {
+            return informationalVersion.Split('+', 2)[0];
+        }
+
+        var version = assembly.GetName().Version;
+        return version == null
+            ? "0.0.0"
+            : $"{version.Major}.{version.Minor}.{version.Build}";
     }
 
     private sealed class DebugModeCommand : ICommand

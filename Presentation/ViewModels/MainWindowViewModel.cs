@@ -13,6 +13,7 @@ using BARS_Client_V2.Application;
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Services;
 using BARS_Client_V2.Infrastructure.Diagnostics;
+using BARS_Client_V2.Infrastructure.Networking;
 using BARS_Client_V2.Infrastructure.Simulators.Msfs;
 
 namespace BARS_Client_V2.Presentation.ViewModels;
@@ -21,6 +22,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 {
     private readonly SimulatorManager _simManager;
     private readonly MsfsPointController? _pointController;
+    private readonly AirportStateHub? _stateHub;
     private readonly DispatcherTimer _uiPoll;
     private readonly DispatcherTimer _serverTimer;
     private readonly DispatcherTimer _searchDebounce;
@@ -48,8 +50,10 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private ClientSettings? _preloadedSettings;
     private bool _initializationStarted;
     private bool _debugModeActive;
+    private bool _testingModeActive;
     private int _debugStateId;
     private string? _debugPointId;
+    private string? _testingAirport;
     private string _debugModeTextCache = string.Empty;
     private int _selectedSimulatorIndex; // 0 = MSFS 2024, 1 = MSFS 2020
     private string? _msfsNeedsRestartSim;
@@ -159,15 +163,20 @@ public class MainWindowViewModel : INotifyPropertyChanged
     /// </summary>
     public bool DebugModeActive
     {
-        get => _debugModeActive;
+        get => _debugModeActive || _testingModeActive;
         private set
         {
+            var wasActive = DebugModeActive;
             if (value != _debugModeActive)
             {
                 _debugModeActive = value;
-                OnPropertyChanged();
-                
-                if (value)
+
+                if (DebugModeActive != wasActive)
+                {
+                    OnPropertyChanged();
+                }
+
+                if (DebugModeActive)
                 {
                     // Immediately update text when turning on
                     UpdateDebugModeText();
@@ -204,7 +213,14 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private void UpdateDebugModeText()
     {
         // Only update when active to prevent text flash during fade-out
-        if (!_debugModeActive) return;
+        if (!DebugModeActive) return;
+
+        if (_testingModeActive)
+        {
+            _debugModeTextCache = "Testing Mode";
+            OnPropertyChanged(nameof(DebugModeText));
+            return;
+        }
 
         _debugModeTextCache = $"Debug Mode  —  State: {_debugStateId}";
         OnPropertyChanged(nameof(DebugModeText));
@@ -213,7 +229,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
     /// <summary>
     /// Visibility of the debug mode indicator.
     /// </summary>
-    public string DebugModeVisibility => _debugModeActive ? "Visible" : "Collapsed";
+    public string DebugModeVisibility => DebugModeActive ? "Visible" : "Collapsed";
+    public bool IsTestingModeActive => _testingModeActive;
 
     /// <summary>
     /// Visibility of the MSFS restart banner.
@@ -295,12 +312,14 @@ public class MainWindowViewModel : INotifyPropertyChanged
     public ICommand PrevPageCommand { get; }
     public ICommand SaveTokenCommand { get; }
     public ICommand ToggleDebugModeCommand { get; }
+    public ICommand EndActiveModeCommand { get; }
 
-    public MainWindowViewModel(SimulatorManager simManager, INearestAirportService nearestService, IAirportRepository airportRepository, ISettingsStore settingsStore, MsfsPointController? pointController = null)
+    public MainWindowViewModel(SimulatorManager simManager, INearestAirportService nearestService, IAirportRepository airportRepository, ISettingsStore settingsStore, MsfsPointController? pointController = null, AirportStateHub? stateHub = null)
     {
         StartupTrace.Write("MainWindowViewModel ctor");
         _simManager = simManager;
         _pointController = pointController;
+        _stateHub = stateHub;
         _nearestService = nearestService;
         _airportRepo = airportRepository;
         _settingsStore = settingsStore;
@@ -319,11 +338,17 @@ public class MainWindowViewModel : INotifyPropertyChanged
         PrevPageCommand = new DelegateCommand(async _ => { CurrentPage--; await RunSearchAsync(); }, _ => CanChangePage(-1));
         SaveTokenCommand = new DelegateCommand(async _ => await SaveSettingsAsync(), _ => CanSaveToken());
         ToggleDebugModeCommand = new DelegateCommand(_ => { ToggleDebugMode(); return Task.CompletedTask; });
+        EndActiveModeCommand = new DelegateCommand(async _ => await EndActiveModeAsync(), _ => DebugModeActive);
 
         // Subscribe to debug mode changes
         if (_pointController != null)
         {
             _pointController.DebugModeChanged += OnDebugModeChanged;
+        }
+
+        if (stateHub != null)
+        {
+            stateHub.TestingModeChanged += OnTestingModeChanged;
         }
 
         // Subscribe to configured simulator changes to refresh airport list when toggle changes
@@ -952,8 +977,24 @@ public class MainWindowViewModel : INotifyPropertyChanged
     /// </summary>
     public void ToggleDebugMode()
     {
+        if (_testingModeActive) return;
         if (!SimulatorConnected) return;
         _pointController?.ToggleDebugMode();
+    }
+
+    private async Task EndActiveModeAsync()
+    {
+        if (_testingModeActive && _stateHub != null)
+        {
+            Status = "Ending Testing Mode...";
+            await _stateHub.EndTestingModeAsync();
+            return;
+        }
+
+        if (_debugModeActive)
+        {
+            _pointController?.ToggleDebugMode();
+        }
     }
 
     private void OnDebugModeChanged(object? sender, DebugModeChangedEventArgs e)
@@ -971,6 +1012,35 @@ public class MainWindowViewModel : INotifyPropertyChanged
             {
                 Status = "Ready";
             }
+
+            (EndActiveModeCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+        });
+    }
+
+    private void OnTestingModeChanged(AirportStateHub.TestingModeChangedEventArgs e)
+    {
+        RunOnDispatcher(() =>
+        {
+            var wasActive = DebugModeActive;
+            _testingModeActive = e.IsTestingMode;
+            _testingAirport = e.Airport;
+
+            if (DebugModeActive != wasActive)
+            {
+                OnPropertyChanged(nameof(DebugModeActive));
+            }
+
+            if (DebugModeActive)
+            {
+                UpdateDebugModeText();
+            }
+
+            OnPropertyChanged(nameof(DebugModeVisibility));
+            OnPropertyChanged(nameof(IsTestingModeActive));
+            (EndActiveModeCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+            Status = e.IsTestingMode
+                ? $"Testing Mode: Loaded {e.Airport ?? "airport"} contribution"
+                : "Ready";
         });
     }
 
