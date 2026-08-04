@@ -7,6 +7,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using BARS_Client_V2.Application;
 using BARS_Client_V2.Infrastructure.Networking;
+using BARS_Client_V2.Infrastructure.Simulators.Msfs;
+using BARS_Client_V2.Infrastructure.Simulators.XPlane;
 
 namespace BARS_Client_V2.Services;
 
@@ -137,7 +139,7 @@ internal sealed class DiscordPresenceService : BackgroundService
         bool hasFlightData = latest != null;
         bool simConnected = connectorConnected && hasFlightData;
         bool? is2024 = null;
-        if (connector is BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsSimulatorConnector msfsConn)
+        if (connector is MsfsSimulatorConnector msfsConn)
         {
             is2024 = msfsConn.IsMsfs2024;
             if (connectorConnected)
@@ -145,11 +147,20 @@ internal sealed class DiscordPresenceService : BackgroundService
                 simCode = is2024 == true ? "MSFS 2024" : (is2024 == false ? "MSFS 2020" : "MSFS");
             }
         }
+        else if (connector is XPlaneSimulatorConnector && connectorConnected)
+        {
+            simCode = "X-Plane 12";
+        }
 
         string? smallKey = null;
         if (simConnected)
         {
-            if (is2024 == true) smallKey = "msfs2024"; else if (is2024 == false) smallKey = "msfs2020"; else smallKey = "msfs2020"; // default/fallback
+            smallKey = connector switch
+            {
+                XPlaneSimulatorConnector => "xplane",
+                MsfsSimulatorConnector when is2024 == true => "msfs2024",
+                _ => "msfs2020"
+            };
         }
         string? smallText = simConnected ? simCode : null;
 

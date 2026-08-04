@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Services;
 using BARS_Client_V2.Infrastructure.Simulators.Msfs;
+using BARS_Client_V2.Infrastructure.Simulators.XPlane;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -34,9 +36,10 @@ public sealed class SimulatorManager : BackgroundService
         if (connector == null) return false;
         if (connector == _active && connector.IsConnected) return true;
 
-        if (_active != null && _active.IsConnected)
+        if (_active != null)
         {
             try { await _active.DisconnectAsync(ct); } catch (Exception ex) { _logger.LogWarning(ex, "Error disconnecting previous simulator"); }
+            lock (_lock) _active = null;
         }
 
         ClearLatestState();
@@ -83,9 +86,10 @@ public sealed class SimulatorManager : BackgroundService
             }
             else
             {
-                // Non-MSFS simulators default to msfs2020 for now
-                SceneryService.Instance.CurrentSimulator = "msfs2020";
-                _logger.LogInformation("Non-MSFS simulator detected - defaulting CurrentSimulator to msfs2020");
+                SceneryService.Instance.CurrentSimulator = connector is XPlaneSimulatorConnector
+                    ? "xplane"
+                    : "msfs2020";
+                _logger.LogInformation("Detected simulator {simulatorId}", SceneryService.Instance.CurrentSimulator);
             }
         }
         catch (Exception ex)
@@ -96,31 +100,16 @@ public sealed class SimulatorManager : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var first = _connectors.FirstOrDefault();
-        if (first != null)
-        {
-            await ActivateAsync(first.SimulatorId, stoppingToken);
-        }
-
         while (!stoppingToken.IsCancellationRequested)
         {
             var active = ActiveConnector;
             if (active == null || !active.IsConnected)
             {
                 ClearLatestState();
-                // Attempt reconnect periodically when disconnected
-                if (first != null)
+                if (!await TryActivateAvailableAsync(stoppingToken))
                 {
-                    try
-                    {
-                        await ActivateAsync(first.SimulatorId, stoppingToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "Reconnect attempt failed");
-                    }
+                    await Task.Delay(2000, stoppingToken);
                 }
-                await Task.Delay(2000, stoppingToken);
                 continue;
             }
             try
@@ -137,6 +126,68 @@ public sealed class SimulatorManager : BackgroundService
                 // small backoff
                 await Task.Delay(2000, stoppingToken);
             }
+        }
+    }
+
+    private async Task<bool> TryActivateAvailableAsync(CancellationToken ct)
+    {
+        var candidates = _connectors
+            .Where(IsSimulatorProcessRunning)
+            .OrderBy(c => c.SimulatorId, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        foreach (var connector in candidates)
+        {
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            attempt.CancelAfter(TimeSpan.FromSeconds(5));
+            try
+            {
+                if (await ActivateAsync(connector.SimulatorId, attempt.Token))
+                {
+                    return true;
+                }
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogDebug("Simulator connection attempt timed out for {sim}", connector.DisplayName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Simulator connection attempt failed for {sim}", connector.DisplayName);
+            }
+        }
+        return false;
+    }
+
+    private static bool IsSimulatorProcessRunning(ISimulatorConnector connector)
+    {
+        try
+        {
+            if (connector is XPlaneSimulatorConnector)
+            {
+                return IsProcessRunning("X-Plane");
+            }
+            if (connector is MsfsSimulatorConnector)
+            {
+                return IsProcessRunning("FlightSimulator2024") ||
+                       IsProcessRunning("FlightSimulator");
+            }
+        }
+        catch
+        {
+        }
+        return false;
+    }
+
+    private static bool IsProcessRunning(string processName)
+    {
+        var processes = Process.GetProcessesByName(processName);
+        try
+        {
+            return processes.Length > 0;
+        }
+        finally
+        {
+            foreach (var process in processes) process.Dispose();
         }
     }
 

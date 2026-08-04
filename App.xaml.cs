@@ -76,6 +76,9 @@ namespace BARS_Client_V2
                 .ConfigureServices(services =>
                 {
                     services.AddSingleton<ISimulatorConnector, Infrastructure.Simulators.Msfs.MsfsSimulatorConnector>();
+                    services.AddSingleton<Infrastructure.Simulators.XPlane.XPlaneSimulatorConnector>();
+                    services.AddSingleton<ISimulatorConnector>(sp =>
+                        sp.GetRequiredService<Infrastructure.Simulators.XPlane.XPlaneSimulatorConnector>());
                     services.AddSingleton<IAirportRepository, Infrastructure.Networking.HttpAirportRepository>();
                     services.AddSingleton<ISettingsStore, Infrastructure.Settings.JsonSettingsStore>();
                     services.AddSingleton<RemovalsUpdateService>();
@@ -98,6 +101,9 @@ namespace BARS_Client_V2
                         return new BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController(connectors, logger, hub, simManager, null);
                     });
                     services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>());
+                    services.AddSingleton<BARS_Client_V2.Infrastructure.Simulators.XPlane.XPlanePointController>();
+                    services.AddHostedService(sp =>
+                        sp.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.XPlane.XPlanePointController>());
                     services.AddSingleton<MainWindowViewModel>(sp =>
                     {
                         var simManager = sp.GetRequiredService<SimulatorManager>();
