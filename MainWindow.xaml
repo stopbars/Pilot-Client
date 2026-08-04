@@ -1003,6 +1003,48 @@
             </StackPanel>
         </Border>
 
+        <!-- X-Plane Restart Banner -->
+        <Border Grid.Row="0"
+                Margin="0,0,0,0"
+                Background="#FF8C00"
+                CornerRadius="4"
+                Padding="10,5"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                Visibility="{Binding XPlaneNeedsRestartVisibility}">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="ℹ"
+                           FontSize="14"
+                           Foreground="White"
+                           Margin="0,0,8,0"
+                           VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding XPlaneRestartText}"
+                           FontWeight="Bold"
+                           FontSize="12"
+                            Foreground="White"
+                            VerticalAlignment="Center"/>
+                <Button Content="Retry now"
+                        Command="{Binding RetryXPlaneRemovalSyncCommand}"
+                        Visibility="{Binding XPlaneRetryVisibility}"
+                        Margin="10,0,0,0"
+                        Padding="8,2"
+                        Background="Transparent"
+                        BorderBrush="White"
+                        BorderThickness="1"
+                        Foreground="White"
+                        Cursor="Hand"/>
+                <Button Content="Dismiss"
+                        Command="{Binding DismissXPlaneRestartCommand}"
+                        Margin="10,0,0,0"
+                        Padding="8,2"
+                        Background="Transparent"
+                        BorderBrush="White"
+                        BorderThickness="1"
+                        Foreground="White"
+                        Cursor="Hand"/>
+            </StackPanel>
+        </Border>
+
         <!-- API Token and Search in vertical layout -->
         <StackPanel Grid.Row="1"
                     Margin="0,0,0,15">
@@ -1155,6 +1197,13 @@
                                      IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=1, Mode=TwoWay}"
                                      GroupName="SimulatorToggle"
                                      Style="{StaticResource SimulatorToggleRadioButton}"/>
+                        <RadioButton x:Name="XPlaneRadio"
+                                     Content="X-Plane"
+                                     Foreground="White"
+                                     Padding="10,5"
+                                     IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=2, Mode=TwoWay}"
+                                     GroupName="SimulatorToggle"
+                                     Style="{StaticResource SimulatorToggleRadioButton}"/>
                     </StackPanel>
                 </Border>
             </StackPanel>
@@ -1231,6 +1280,7 @@
                                             </Border>
                                             <CheckBox Grid.Column="2"
                                                       IsChecked="{Binding SceneryRemovalEnabled, Mode=TwoWay}"
+                                                      IsEnabled="{Binding SceneryRemovalAvailable}"
                                                       HorizontalAlignment="Center"
                                                       VerticalAlignment="Center"
                                                       ToolTip="Toggle scenery removals for this airport"
