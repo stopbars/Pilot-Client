@@ -7,37 +7,17 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using BARS_Client_V2.Infrastructure.Networking;
 using BARS_Client_V2.Infrastructure.Settings;
+using BARS_Client_V2.Infrastructure.Simulators.XPlane;
 
 namespace BARS_Client_V2.Services
 {
-    public class SceneryContribution
-    {
-        public string Id { get; set; } = string.Empty;
-        public string UserId { get; set; } = string.Empty;
-        public string UserDisplayName { get; set; } = string.Empty;
-        public string AirportIcao { get; set; } = string.Empty;
-        public string PackageName { get; set; } = string.Empty;
-        public string SubmittedXml { get; set; } = string.Empty;
-        public string Notes { get; set; } = string.Empty;
-        public string Simulator { get; set; } = string.Empty;
-        public DateTime SubmissionDate { get; set; }
-        public string Status { get; set; } = string.Empty;
-        public string RejectionReason { get; set; } = string.Empty;
-        public DateTime? DecisionDate { get; set; }
-    }
-
-    public class ContributionsResponse
-    {
-        // Initialize to empty list to satisfy non-nullable warning
-        public List<SceneryContribution> contributions { get; set; } = new();
-    }
-
     public class SceneryService
     {
-        private const string API_URL = "https://v2.stopbars.com/contributions?status=approved";
         private const string SETTINGS_FILENAME = "settings.json";
         private readonly HttpClient _httpClient;
+        private readonly XPlaneLocalRemovalsService _xplaneRemovals;
         // Key format: "ICAO:simulator" (e.g., "YSCB:msfs2020" or "YSCB:msfs2024")
         private Dictionary<string, string> _selectedPackages;
         private static SceneryService? _instance;
@@ -50,12 +30,12 @@ namespace BARS_Client_V2.Services
         private readonly SemaphoreSlim _removalGate = new(1, 1);
 
         // Supported simulators
-        public static readonly string[] SupportedSimulators = { "msfs2020", "msfs2024" };
+        public static readonly string[] SupportedSimulators = { "msfs2020", "msfs2024", "xplane" };
 
         /// <summary>
-        /// Gets or sets the current active simulator detected by SimConnect.
+        /// Gets or sets the current active simulator detected by its connector.
         /// This determines which map to load when actually flying.
-        /// Valid values: "msfs2020", "msfs2024"
+        /// Valid values: "msfs2020", "msfs2024", "xplane"
         /// </summary>
         public string CurrentSimulator
         {
@@ -77,7 +57,7 @@ namespace BARS_Client_V2.Services
         /// <summary>
         /// Gets or sets which simulator the user is configuring in the UI.
         /// This determines which packages are shown in the airport list.
-        /// Valid values: "msfs2020", "msfs2024"
+        /// Valid values: "msfs2020", "msfs2024", "xplane"
         /// </summary>
         public string ConfiguredSimulator
         {
@@ -130,6 +110,7 @@ namespace BARS_Client_V2.Services
         private SceneryService()
         {
             _httpClient = new HttpClient();
+            _xplaneRemovals = new XPlaneLocalRemovalsService(_httpClient);
             _selectedPackages = LoadSelectedPackages();
         }
 
@@ -163,64 +144,37 @@ namespace BARS_Client_V2.Services
                     packages[sim] = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
                 }
 
-                try
+                var contributions = await ApprovedContributionsCache
+                    .GetAsync(_httpClient)
+                    .ConfigureAwait(false);
+                foreach (var contribution in contributions)
                 {
-                    var response = await _httpClient.GetStringAsync(API_URL);
-
-                    // Use case-insensitive JSON options
-                    var options = new JsonSerializerOptions
+                    if (string.IsNullOrWhiteSpace(contribution.AirportIcao) ||
+                        string.IsNullOrWhiteSpace(contribution.PackageName))
                     {
-                        PropertyNameCaseInsensitive = true
-                    };
-
-                    var data = JsonSerializer.Deserialize<ContributionsResponse>(response, options);
-
-                    // Print debug info
-                    Console.WriteLine($"API Response received, contributions count: {data?.contributions?.Count ?? 0}");
-
-                    if (data?.contributions != null && data.contributions.Count > 0)
-                    {
-                        foreach (var contribution in data.contributions)
-                        {
-                            if (string.IsNullOrEmpty(contribution.AirportIcao) || string.IsNullOrEmpty(contribution.PackageName))
-                                continue;
-
-                            // Default to msfs2020 if simulator not specified
-                            var simulator = string.IsNullOrEmpty(contribution.Simulator) ? "msfs2020" : contribution.Simulator.ToLowerInvariant();
-
-                            // Ensure simulator key exists
-                            if (!packages.ContainsKey(simulator))
-                            {
-                                packages[simulator] = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-                            }
-
-                            var icao = contribution.AirportIcao.ToUpperInvariant();
-
-                            if (!packages[simulator].ContainsKey(icao))
-                            {
-                                packages[simulator][icao] = new List<string>();
-                            }
-
-                            if (!packages[simulator][icao].Contains(contribution.PackageName))
-                            {
-                                packages[simulator][icao].Add(contribution.PackageName);
-                            }
-                        }
-
-                        var totalAirports = packages.Values.Sum(d => d.Count);
-                        Console.WriteLine($"Processed contributions into {totalAirports} airport/simulator combinations with scenery packages");
+                        continue;
                     }
-                    else
+
+                    var simulator = string.IsNullOrWhiteSpace(contribution.Simulator)
+                        ? "msfs2020"
+                        : contribution.Simulator.ToLowerInvariant();
+                    if (!packages.TryGetValue(simulator, out var airports))
                     {
-                        Console.WriteLine("No contributions found in API response");
+                        airports = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                        packages[simulator] = airports;
+                    }
+                    var icao = contribution.AirportIcao.ToUpperInvariant();
+                    if (!airports.TryGetValue(icao, out var names))
+                    {
+                        names = [];
+                        airports[icao] = names;
+                    }
+                    if (!names.Contains(contribution.PackageName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        names.Add(contribution.PackageName);
                     }
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error fetching scenery packages: {ex.Message}");
-                }
 
-                // Cache the result (even if empty, to avoid repeated failed fetches)
                 _cachedPackages = packages;
                 return packages;
             }
@@ -342,10 +296,14 @@ namespace BARS_Client_V2.Services
             await _removalGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                return await Task.Run(() =>
+                var xplaneChanged = await SyncXPlaneRemovalStatesCoreAsync(savedPackages, savedToggles)
+                    .ConfigureAwait(false);
+
+                var changedSims = await Task.Run(() =>
                 {
                     var changedSims = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var sim in SupportedSimulators)
+                    foreach (var sim in SupportedSimulators.Where(sim =>
+                                 !sim.Equals("xplane", StringComparison.OrdinalIgnoreCase)))
                     {
                         var communityPath = TryResolveCommunityPath(sim);
                         if (string.IsNullOrWhiteSpace(communityPath)) continue;
@@ -375,11 +333,68 @@ namespace BARS_Client_V2.Services
                     }
                     return changedSims;
                 }).ConfigureAwait(false);
+                if (xplaneChanged) changedSims.Add("xplane");
+                return changedSims;
             }
             finally
             {
                 _removalGate.Release();
             }
+        }
+
+        public async Task<bool> SyncXPlaneRemovalStatesAsync(
+            IDictionary<string, string> savedPackages,
+            IDictionary<string, bool> savedToggles)
+        {
+            await _removalGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                return await SyncXPlaneRemovalStatesCoreAsync(savedPackages, savedToggles)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                _removalGate.Release();
+            }
+        }
+
+        private async Task<bool> SyncXPlaneRemovalStatesCoreAsync(
+            IDictionary<string, string> savedPackages,
+            IDictionary<string, bool> savedToggles)
+        {
+            var changed = false;
+            var refreshMetadata = true;
+            foreach (var selection in savedPackages.Where(item =>
+                         item.Key.EndsWith(":xplane", StringComparison.OrdinalIgnoreCase)))
+            {
+                var separator = selection.Key.IndexOf(':');
+                if (separator <= 0 || string.IsNullOrWhiteSpace(selection.Value)) continue;
+                var icao = selection.Key[..separator];
+                var toggleKey = $"{icao}:xplane:{selection.Value}";
+                var enabled = !savedToggles.TryGetValue(toggleKey, out var toggled) || toggled;
+                var artifact = await FindXPlaneContributionAsync(
+                        icao,
+                        selection.Value,
+                        refreshMetadata)
+                    .ConfigureAwait(false);
+                refreshMetadata = false;
+                // Enabled removals are refreshed once per launch so a newly
+                // published artifact cannot be hidden by an older local patch.
+                if (!enabled && _xplaneRemovals.IsStateApplied(icao, enabled))
+                {
+                    continue;
+                }
+                changed |= await _xplaneRemovals
+                    .ApplyAsync(
+                        icao,
+                        selection.Value,
+                        enabled,
+                        artifact?.RemovalArtifactKey,
+                        artifact?.ArtifactIdentity,
+                        artifact?.ArtifactGenerationId)
+                    .ConfigureAwait(false);
+            }
+            return changed;
         }
 
         public async Task<bool> ApplySceneryRemovalAsync(string icao, string simulator, string packageName, bool enabled)
@@ -392,6 +407,32 @@ namespace BARS_Client_V2.Services
             var normalizedSim = simulator.Trim().ToLowerInvariant();
             var normalizedIcao = icao.Trim().ToUpperInvariant();
             var normalizedPackage = packageName?.Trim() ?? string.Empty;
+
+            if (normalizedSim.Equals("xplane", StringComparison.OrdinalIgnoreCase))
+            {
+                await _removalGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    var artifact = await FindXPlaneContributionAsync(
+                            normalizedIcao,
+                            normalizedPackage,
+                            forceRefresh: enabled)
+                        .ConfigureAwait(false);
+                    return await _xplaneRemovals
+                        .ApplyAsync(
+                            normalizedIcao,
+                            normalizedPackage,
+                            enabled,
+                            artifact?.RemovalArtifactKey,
+                            artifact?.ArtifactIdentity,
+                            artifact?.ArtifactGenerationId)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    _removalGate.Release();
+                }
+            }
 
             var communityPath = TryResolveCommunityPath(normalizedSim);
             if (string.IsNullOrWhiteSpace(communityPath))
@@ -414,6 +455,26 @@ namespace BARS_Client_V2.Services
             {
                 _removalGate.Release();
             }
+        }
+
+        public Task<bool> ApplyXPlaneTestingRemovalsAsync(
+            string icao,
+            string removalJson,
+            CancellationToken cancellationToken = default) =>
+            _xplaneRemovals.ApplyTestingArtifactAsync(icao, removalJson, cancellationToken);
+
+        private async Task<ApprovedContributionMetadata?> FindXPlaneContributionAsync(
+            string icao,
+            string packageName,
+            bool forceRefresh = false)
+        {
+            var contributions = await ApprovedContributionsCache
+                .GetAsync(_httpClient, forceRefresh)
+                .ConfigureAwait(false);
+            return contributions.FirstOrDefault(item =>
+                string.Equals(item.Simulator, "xplane", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(item.AirportIcao, icao, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(item.PackageName, packageName, StringComparison.Ordinal));
         }
 
         private static bool ApplyRemovalState(string removalsPath, string icao, string packageName, bool enabled)
@@ -499,9 +560,11 @@ namespace BARS_Client_V2.Services
                     return null;
                 }
 
-                return simulator.Equals("msfs2024", StringComparison.OrdinalIgnoreCase)
-                    ? pilotClient.Msfs2024Path
-                    : pilotClient.Msfs2020Path;
+                if (simulator.Equals("msfs2024", StringComparison.OrdinalIgnoreCase))
+                    return pilotClient.Msfs2024Path;
+                if (simulator.Equals("msfs2020", StringComparison.OrdinalIgnoreCase))
+                    return pilotClient.Msfs2020Path;
+                return null;
             }
             catch
             {

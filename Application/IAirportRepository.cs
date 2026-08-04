@@ -8,4 +8,5 @@ namespace BARS_Client_V2.Application;
 public interface IAirportRepository
 {
     Task<(IReadOnlyList<Airport> Items, int TotalCount)> SearchAsync(string? search, int page, int pageSize, CancellationToken ct = default);
+    Task<IReadOnlyList<Airport>> GetAllForSimulatorAsync(string simulator, CancellationToken ct = default);
 }

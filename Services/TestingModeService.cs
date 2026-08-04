@@ -71,6 +71,19 @@ public sealed class TestingModeService
             throw new InvalidOperationException("Testing map response did not include BARS XML.");
         }
 
+        if (SceneryService.Instance.CurrentSimulator.Equals("xplane", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(payload.RemovalsJson))
+        {
+            var applied = await SceneryService.Instance
+                .ApplyXPlaneTestingRemovalsAsync(icao, payload.RemovalsJson, ct)
+                .ConfigureAwait(false);
+            if (!applied)
+            {
+                throw new InvalidOperationException(
+                    "The X-Plane testing removals did not match the installed scenery.");
+            }
+        }
+
         await _hub.LoadTestingMapAsync(icao, payload.BarsXml, ct).ConfigureAwait(false);
     }
 
@@ -200,6 +213,7 @@ public sealed class TestingModeService
         public string? Token { get; set; }
         public string? Icao { get; set; }
         public string? SupportsXml { get; set; }
+        public string? RemovalsJson { get; set; }
         public string? BarsXml { get; set; }
     }
 }

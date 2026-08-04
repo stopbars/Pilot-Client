@@ -18,8 +18,7 @@ internal sealed class HttpAirportRepository : IAirportRepository
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly JsonSerializerOptions _jsonOptions;
 
-    // Cached contributions data - fetched once, filtered locally by simulator
-    private List<ContributionDto>? _cachedContributions;
+    private IReadOnlyList<ApprovedContributionMetadata>? _cachedContributions;
     private Dictionary<string, string>? _cachedAirportNames;
     private readonly SemaphoreSlim _cacheLock = new(1, 1);
 
@@ -32,23 +31,6 @@ internal sealed class HttpAirportRepository : IAirportRepository
             Converters = { new JsonStringEnumConverter() }
         };
     }
-
-    private sealed record ContributionDto(
-        string id,
-        string userId,
-        string userDisplayName,
-        string airportIcao,
-        string packageName,
-        string submittedXml,
-        string? notes,
-        DateTime submissionDate,
-        string status,
-        string? rejectionReason,
-        DateTime? decisionDate,
-        string? simulator  // "msfs2020" or "msfs2024".
-    );
-
-    private sealed record ContributionsResponse(List<ContributionDto> contributions, long total, int page, long limit, int totalPages);
 
     /// <summary>
     /// Ensures contributions are fetched and cached. Only fetches from API once.
@@ -63,18 +45,13 @@ internal sealed class HttpAirportRepository : IAirportRepository
             if (_cachedContributions != null) return; // Double-check after acquiring lock
 
             var client = _httpClientFactory.CreateClient();
-            using var req = new HttpRequestMessage(HttpMethod.Get, "https://v2.stopbars.com/contributions?status=approved");
-            using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-            resp.EnsureSuccessStatusCode();
-            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
-            var data = await JsonSerializer.DeserializeAsync<ContributionsResponse>(stream, _jsonOptions, ct)
-                       ?? new ContributionsResponse(new List<ContributionDto>(), 0, 1, 0, 0);
-
-            _cachedContributions = data.contributions;
+            _cachedContributions = await ApprovedContributionsCache
+                .GetAsync(client, cancellationToken: ct)
+                .ConfigureAwait(false);
 
             // Pre-fetch airport names for all contributions
             var allIcaos = _cachedContributions
-                .Select(c => c.airportIcao.Trim().ToUpperInvariant())
+                .Select(c => c.AirportIcao.Trim().ToUpperInvariant())
                 .Distinct(StringComparer.OrdinalIgnoreCase);
             _cachedAirportNames = await FetchAirportNamesAsync(client, allIcaos, ct);
         }
@@ -91,35 +68,7 @@ internal sealed class HttpAirportRepository : IAirportRepository
 
         // Get the configured simulator from SceneryService to filter packages (UI toggle selection)
         var configuredSimulator = SceneryService.Instance.ConfiguredSimulator;
-
-        // Group by airport -> collect distinct package names for the configured simulator only
-        var grouped = _cachedContributions!
-            .Where(c =>
-            {
-                // Default to "msfs2020" if simulator is null or empty (matches SceneryService behavior)
-                var sim = string.IsNullOrWhiteSpace(c.simulator) ? "msfs2020" : c.simulator.Trim().ToLowerInvariant();
-                return string.Equals(sim, configuredSimulator, StringComparison.OrdinalIgnoreCase);
-            })
-            .GroupBy(c => c.airportIcao.Trim().ToUpperInvariant())
-            .Select(g => new
-            {
-                ICAO = g.Key,
-                Packages = g.Select(c => c.packageName)
-                             .Where(p => !string.IsNullOrWhiteSpace(p))
-                             .Select(p => new SceneryPackage(p.Trim()))
-                             .DistinctBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
-                             .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
-                             .ToList()
-            })
-            .ToList();
-
-        var airports = grouped
-            .Select(g =>
-            {
-                _cachedAirportNames!.TryGetValue(g.ICAO, out var name);
-                return new Airport(g.ICAO, name, g.Packages);
-            })
-            .ToList();
+        var airports = BuildAirports(configuredSimulator);
 
         if (!string.IsNullOrWhiteSpace(search))
         {
@@ -139,6 +88,53 @@ internal sealed class HttpAirportRepository : IAirportRepository
             .ToList();
 
         return (items, total);
+    }
+
+    public async Task<IReadOnlyList<Airport>> GetAllForSimulatorAsync(
+        string simulator,
+        CancellationToken ct = default)
+    {
+        await EnsureCacheLoadedAsync(ct);
+        return BuildAirports(simulator)
+            .OrderBy(airport => airport.ICAO, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private List<Airport> BuildAirports(string simulator)
+    {
+        var normalizedSimulator = simulator.Trim().ToLowerInvariant();
+
+        // Group by airport -> collect distinct package names for the requested simulator only.
+        var grouped = _cachedContributions!
+            .Where(c =>
+            {
+                // Default to "msfs2020" if simulator is null or empty (matches SceneryService behavior)
+                var sim = string.IsNullOrWhiteSpace(c.Simulator) ? "msfs2020" : c.Simulator.Trim().ToLowerInvariant();
+                return string.Equals(sim, normalizedSimulator, StringComparison.OrdinalIgnoreCase);
+            })
+            .GroupBy(c => c.AirportIcao.Trim().ToUpperInvariant())
+            .Select(g => new
+            {
+                ICAO = g.Key,
+                Packages = g.Where(c => !string.IsNullOrWhiteSpace(c.PackageName))
+                             .Select(c => new SceneryPackage(
+                                 c.PackageName.Trim(),
+                                 c.ArtifactIdentity,
+                                 c.ArtifactGenerationId,
+                                 c.RemovalArtifactKey))
+                             .DistinctBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                             .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                             .ToList()
+            })
+            .ToList();
+
+        return grouped
+            .Select(g =>
+            {
+                _cachedAirportNames!.TryGetValue(g.ICAO, out var name);
+                return new Airport(g.ICAO, name, g.Packages);
+            })
+            .ToList();
     }
 
     private sealed class AirportMetadataDto
