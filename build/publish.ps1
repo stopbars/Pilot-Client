@@ -4,7 +4,8 @@ param(
     [switch]$SkipBuild,
     [string]$Project = "..\BARS-Client-V2.csproj",
     [string]$OutRoot = "..\dist",
-    [string]$Version
+    [string]$Version,
+    [string]$XPlaneBridgeRoot = "..\..\X-Plane Bridge\dist\BARSXPlaneBridge"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -79,6 +80,22 @@ if (-not (Test-Path $publishDir)) { throw "Publish directory not found: $publish
 $stageDir = Join-Path $distRoot "BARSClient-$version-$Runtime"
 if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
 Copy-Item $publishDir $stageDir -Recurse
+
+# Bundle the native X-Plane bridge for the Installer. Keeping it as a nested
+# archive lets the client ZIP remain one release artifact while the Installer
+# can place the plugin under the user's selected X-Plane installation.
+$resolvedXPlaneBridgeRoot = Resolve-Path $XPlaneBridgeRoot -ErrorAction SilentlyContinue
+if (-not $resolvedXPlaneBridgeRoot) {
+    throw "X-Plane bridge package not found: $XPlaneBridgeRoot"
+}
+$xplaneBridgeBinary = Join-Path $resolvedXPlaneBridgeRoot 'win_x64\BARSXPlaneBridge.xpl'
+if (-not (Test-Path -LiteralPath $xplaneBridgeBinary)) {
+    throw "X-Plane bridge binary not found: $xplaneBridgeBinary"
+}
+$installerPayloadDir = Join-Path $stageDir '_installer'
+New-Item -ItemType Directory -Path $installerPayloadDir -Force | Out-Null
+$xplaneBridgeArchive = Join-Path $installerPayloadDir 'BARSXPlaneBridge.zip'
+Compress-Archive -Path $resolvedXPlaneBridgeRoot -DestinationPath $xplaneBridgeArchive -Force
 
 # Remove unwanted files (patterns)
 Get-ChildItem -Path $stageDir -Recurse -Include *.pdb, *.xml | ForEach-Object { Remove-Item $_.FullName -Force }
