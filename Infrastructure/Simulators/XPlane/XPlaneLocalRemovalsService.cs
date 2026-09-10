@@ -12,12 +12,13 @@ namespace BARS_Client_V2.Infrastructure.Simulators.XPlane;
 internal sealed class XPlaneLocalRemovalsService
 {
     private const string PackageName = "BARS X-Plane Removals";
-    private const string Schema = "bars-xplane-removals/v1";
+    private const string Schema = "bars-xplane-removals/v2";
+    private const string LegacySchema = "bars-xplane-removals/v1";
     private const int MaxRemovalArtifactBytes = 8 * 1024 * 1024;
     private static readonly Uri CoreApiBase = new("https://v2.stopbars.com/");
     private static readonly HashSet<int> NodeCodes = [111, 112, 113, 114, 115, 116];
     private readonly HttpClient _httpClient;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private static readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<string, DownloadedArtifact> _artifactCache =
         new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions StateJsonOptions = new(JsonSerializerDefaults.Web)
@@ -54,6 +55,7 @@ internal sealed class XPlaneLocalRemovalsService
                 // remains byte-for-byte identical, so it must be retried after exit.
                 return true;
             }
+            XPlanePatchTransaction.Recover(root, GetStateRoot(root));
             if (!enabled || string.IsNullOrWhiteSpace(packageName))
             {
                 return await RestoreAirportAsync(root, normalizedIcao, cancellationToken)
@@ -92,6 +94,7 @@ internal sealed class XPlaneLocalRemovalsService
             return false;
         }
 
+        if (XPlanePatchTransaction.HasPending(GetStateRoot(root))) return false;
         var normalizedIcao = NormalizeIcao(icao);
         var state = LoadPatchState(root);
         var applied = state.Airports.FirstOrDefault(item =>
@@ -104,12 +107,14 @@ internal sealed class XPlaneLocalRemovalsService
             normalizedIcao + ".apt");
         if (!enabled)
         {
-            return applied == null && !File.Exists(legacyBlockPath);
+            return applied == null && !XPlaneDsfRemovals.HasAirport(GetStateRoot(root), normalizedIcao) && !File.Exists(legacyBlockPath);
         }
 
+        var hasDsf = XPlaneDsfRemovals.HasAirport(GetStateRoot(root), normalizedIcao);
+        if (hasDsf && !XPlaneDsfRemovals.IsApplied(root, GetStateRoot(root), normalizedIcao)) return false;
         if (applied == null)
         {
-            return false;
+            return hasDsf;
         }
 
         var sourcePath = ResolveStateSourcePath(root, applied.SourceRelativePath);
@@ -128,15 +133,22 @@ internal sealed class XPlaneLocalRemovalsService
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            var recoveryPending = XPlanePatchTransaction.HasPending(GetStateRoot(root));
+            if (recoveryPending)
+            {
+                if (IsXPlaneProcessRunning()) return true;
+                XPlanePatchTransaction.Recover(root, GetStateRoot(root));
+            }
             var testingAirports = LoadPatchState(root).Airports
                 .Where(item => item.PackageName.Equals("Testing", StringComparison.OrdinalIgnoreCase))
                 .Select(item => item.Icao)
+                .Concat(XPlaneDsfRemovals.TestingAirports(GetStateRoot(root)))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            if (testingAirports.Length == 0) return false;
+            if (testingAirports.Length == 0) return recoveryPending;
             if (IsXPlaneProcessRunning()) return true;
 
-            var changed = false;
+            var changed = recoveryPending;
             foreach (var airport in testingAirports)
             {
                 changed |= await RestoreAirportAsync(root, airport, cancellationToken).ConfigureAwait(false);
@@ -171,13 +183,13 @@ internal sealed class XPlaneLocalRemovalsService
             if (IsXPlaneProcessRunning())
             {
                 throw new InvalidOperationException(
-                    "Close X-Plane before applying testing removals; its active apt.dat is currently in use.");
+                    "Close X-Plane before applying testing removals; its scenery files are currently in use.");
             }
             var normalizedIcao = NormalizeIcao(icao);
             var artifact = JsonSerializer.Deserialize<RemovalArtifact>(
                 removalJson,
                 new JsonSerializerOptions(JsonSerializerDefaults.Web));
-            if (artifact?.Schema != Schema ||
+            if (artifact == null || (artifact.Schema != Schema && artifact.Schema != LegacySchema) ||
                 NormalizeIcao(artifact.Icao) != normalizedIcao)
             {
                 return false;
@@ -206,6 +218,37 @@ internal sealed class XPlaneLocalRemovalsService
     }
 
     private async Task<bool> ApplyArtifactAsync(
+        string root, string icao, RemovalArtifact artifact, string packageName,
+        string artifactIdentity, string? artifactGenerationId, string artifactSha256, CancellationToken cancellationToken)
+    {
+        ValidateArtifact(artifact);
+        var stateRoot = GetStateRoot(root);
+        XPlanePatchTransaction.Recover(root, stateRoot);
+        var applyDsf = XPlaneDsfRemovals.Prepare(root, stateRoot, icao, packageName, artifact.DsfSelectors);
+        return await XPlanePatchTransaction.RunAsync(root, stateRoot, async () =>
+        {
+            var changed = await ApplyAptArtifactAsync(root, icao, artifact, packageName, artifactIdentity, artifactGenerationId, artifactSha256, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            applyDsf.Apply();
+            return changed || applyDsf.Changed;
+        }).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> RestoreAirportAsync(string root, string icao, CancellationToken cancellationToken)
+    {
+        var stateRoot = GetStateRoot(root);
+        XPlanePatchTransaction.Recover(root, stateRoot);
+        var restoreDsf = XPlaneDsfRemovals.Prepare(root, stateRoot, icao, "", []);
+        return await XPlanePatchTransaction.RunAsync(root, stateRoot, async () =>
+        {
+            var changed = await RestoreAptAirportAsync(root, icao, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            restoreDsf.Apply();
+            return changed || restoreDsf.Changed;
+        }).ConfigureAwait(false);
+    }
+
+    private async Task<bool> ApplyAptArtifactAsync(
         string root,
         string icao,
         RemovalArtifact artifact,
@@ -218,7 +261,7 @@ internal sealed class XPlaneLocalRemovalsService
         ValidateArtifact(artifact);
         if (artifact.Selectors.Count == 0)
         {
-            return await RestoreAirportAsync(root, icao, cancellationToken).ConfigureAwait(false);
+            return await RestoreAptAirportAsync(root, icao, cancellationToken).ConfigureAwait(false);
         }
 
         var state = LoadPatchState(root);
@@ -441,7 +484,7 @@ internal sealed class XPlaneLocalRemovalsService
         var artifact = JsonSerializer.Deserialize<RemovalArtifact>(
             bytes,
             new JsonSerializerOptions(JsonSerializerDefaults.Web));
-        if (artifact?.Schema != Schema || NormalizeIcao(artifact.Icao) != icao)
+        if (artifact == null || (artifact.Schema != Schema && artifact.Schema != LegacySchema) || NormalizeIcao(artifact.Icao) != icao)
         {
             throw new InvalidOperationException("The X-Plane removals artifact is invalid.");
         }
@@ -528,10 +571,9 @@ internal sealed class XPlaneLocalRemovalsService
             if (selectorsByFeature.TryGetValue(featureId, out var selectors))
             {
                 PatchFeature(featureLines, selectors, matchedSelectors);
-                for (var offset = 0; offset < featureLines.Count; offset++)
-                {
-                    lines[index + offset] = featureLines[offset];
-                }
+                lines.RemoveRange(index, end - index);
+                lines.InsertRange(index, featureLines);
+                end = index + featureLines.Count;
             }
             index = end;
         }
@@ -555,118 +597,11 @@ internal sealed class XPlaneLocalRemovalsService
         IReadOnlyCollection<RemovalSelector> selectors,
         ISet<RemovalSelector> matchedSelectors)
     {
-        foreach (var codeGroup in selectors.GroupBy(selector => selector.Code))
-        {
-            var runs = FindRuns(featureLines, codeGroup.Key);
-            foreach (var selector in codeGroup)
-            {
-                if (selector.Run < 0 || selector.Run >= runs.Count || selector.Ranges.Count == 0)
-                {
-                    continue;
-                }
-
-                var run = runs[selector.Run];
-                var total = run.Sum(segment => segment.LengthMeters);
-                if (!(total > 0))
-                {
-                    continue;
-                }
-
-                var cursor = 0d;
-                var changed = false;
-                foreach (var segment in run)
-                {
-                    var segmentStart = cursor / total;
-                    cursor += segment.LengthMeters;
-                    var segmentEnd = cursor / total;
-                    if (!selector.Ranges.Any(range =>
-                            range.Length == 2 &&
-                            segmentEnd > range[0] &&
-                            segmentStart < range[1]))
-                    {
-                        continue;
-                    }
-                    featureLines[segment.LineIndex] = RemoveStyleCode(featureLines[segment.LineIndex], codeGroup.Key);
-                    changed = true;
-                }
-                if (changed)
-                {
-                    matchedSelectors.Add(selector);
-                }
-            }
-        }
-    }
-
-    private static List<List<Segment>> FindRuns(IReadOnlyList<string> featureLines, int lightCode)
-    {
-        var runs = new List<List<Segment>>();
-        List<Segment>? current = null;
-        var nodes = featureLines
-            .Select((line, index) => (Node: ParseNode(line), LineIndex: index))
-            .Where(item => item.Node != null)
-            .ToList();
-        var closesPath = nodes.Count > 1 && nodes[^1].Node!.Code is 113 or 114;
-        var segmentCount = Math.Max(0, nodes.Count - 1) + (closesPath ? 1 : 0);
-        for (var index = 0; index < segmentCount; index++)
-        {
-            var start = nodes[index].Node!;
-            var end = nodes[(index + 1) % nodes.Count].Node!;
-            if (!start.Styles.Contains(lightCode))
-            {
-                current = null;
-                continue;
-            }
-            if (current == null)
-            {
-                current = [];
-                runs.Add(current);
-            }
-            current.Add(new Segment(
-                nodes[index].LineIndex,
-                DistanceMeters(start.Latitude, start.Longitude, end.Latitude, end.Longitude)));
-        }
-        return runs;
-    }
-
-    private static string RemoveStyleCode(string line, int lightCode)
-    {
-        var fields = SplitFields(line);
-        if (fields.Count < 4 || !int.TryParse(fields[0], out var recordCode))
-        {
-            return line;
-        }
-        var styleStart = recordCode is 112 or 114 or 116 ? 5 : 3;
-        if (fields.Count <= styleStart)
-        {
-            return line;
-        }
-        var styles = fields.Skip(styleStart)
-            .SelectMany(field => field.Split(',', StringSplitOptions.RemoveEmptyEntries))
-            .Where(value => !int.TryParse(value, out var parsed) || parsed != lightCode)
-            .ToList();
-        return string.Join(' ', fields.Take(styleStart).Concat(styles));
-    }
-
-    private static Node? ParseNode(string line)
-    {
-        var fields = SplitFields(line);
-        if (fields.Count < 3 ||
-            !int.TryParse(fields[0], out var code) ||
-            !NodeCodes.Contains(code) ||
-            !double.TryParse(fields[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var latitude) ||
-            !double.TryParse(fields[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var longitude))
-        {
-            return null;
-        }
-        var styleStart = code is 112 or 114 or 116 ? 5 : 3;
-        var styles = code is 115 or 116
-            ? []
-            : fields.Skip(styleStart)
-                .SelectMany(field => field.Split(',', StringSplitOptions.RemoveEmptyEntries))
-                .Select(value => int.TryParse(value, out var parsed) ? parsed : int.MinValue)
-                .Where(value => value != int.MinValue)
-                .ToHashSet();
-        return new Node(code, latitude, longitude, styles);
+        var patched = XPlaneAptRangePatcher.Patch(featureLines,
+            selectors.Select(selector => new XPlaneAptRangePatcher.Selection(selector.Code, selector.Run, selector.Ranges)).ToArray());
+        featureLines.Clear();
+        featureLines.AddRange(patched);
+        foreach (var selector in selectors) matchedSelectors.Add(selector);
     }
 
     private static async Task<SourceAirport?> FindActiveAirportSourceAsync(
@@ -772,7 +707,7 @@ internal sealed class XPlaneLocalRemovalsService
         });
     }
 
-    private static async Task<bool> RestoreAirportAsync(
+    private static async Task<bool> RestoreAptAirportAsync(
         string root,
         string icao,
         CancellationToken cancellationToken)
@@ -862,6 +797,7 @@ internal sealed class XPlaneLocalRemovalsService
         var changed = false;
         if (File.Exists(blockPath))
         {
+            XPlanePatchTransaction.BeforeWrite(blockPath, null);
             File.Delete(blockPath);
             changed = true;
         }
@@ -876,10 +812,11 @@ internal sealed class XPlaneLocalRemovalsService
 
         var hasLegacyBlocks = Directory.Exists(blocksDirectory) &&
                               Directory.EnumerateFiles(blocksDirectory, "*.apt").Any();
-        if (!hasLegacyBlocks && Directory.Exists(packageRoot))
+        if (!XPlanePatchTransaction.IsActive && !hasLegacyBlocks && Directory.Exists(packageRoot))
         {
             try
             {
+                XPlanePatchTransaction.EnsureSimulatorClosed();
                 Directory.Delete(packageRoot, recursive: true);
             }
             catch (IOException)
@@ -1293,6 +1230,7 @@ internal sealed class XPlaneLocalRemovalsService
             }
             await writer.DisposeAsync().ConfigureAwait(false);
             reader.Dispose();
+            XPlanePatchTransaction.BeforeMove(temporary, aptPath);
             File.Move(temporary, aptPath, overwrite: true);
         }
         finally
@@ -1344,6 +1282,7 @@ internal sealed class XPlaneLocalRemovalsService
         {
             if (File.Exists(aptPath))
             {
+                XPlanePatchTransaction.BeforeWrite(aptPath, null);
                 File.Delete(aptPath);
                 changed = true;
             }
@@ -1380,6 +1319,7 @@ internal sealed class XPlaneLocalRemovalsService
 
         var temporary = iniPath + ".bars.tmp";
         File.WriteAllLines(temporary, lines, new UTF8Encoding(false));
+        XPlanePatchTransaction.BeforeMove(temporary, iniPath);
         File.Move(temporary, iniPath, true);
         return true;
     }
@@ -1401,6 +1341,7 @@ internal sealed class XPlaneLocalRemovalsService
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var temporary = path + ".tmp";
         await File.WriteAllTextAsync(temporary, content, new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
+        XPlanePatchTransaction.BeforeMove(temporary, path);
         File.Move(temporary, path, true);
         return true;
     }
@@ -1444,12 +1385,15 @@ internal sealed class XPlaneLocalRemovalsService
 
     private static void ValidateArtifact(RemovalArtifact artifact)
     {
-        if (!string.Equals(artifact.Schema, Schema, StringComparison.Ordinal) ||
+        if ((artifact.Schema != Schema && artifact.Schema != LegacySchema) ||
             artifact.Selectors == null)
         {
             throw new InvalidOperationException("The X-Plane removals artifact is invalid.");
         }
 
+        if (artifact.DsfSelectors == null || artifact.DsfSelectors.Count + artifact.Selectors.Count > 20000 ||
+            (artifact.Schema == LegacySchema && artifact.DsfSelectors.Count != 0)) throw new InvalidOperationException("Invalid DSF artifact version or selector count.");
+        foreach (var selector in artifact.DsfSelectors) selector.Validate();
         foreach (var selector in artifact.Selectors)
         {
             if (selector == null ||
@@ -1471,17 +1415,6 @@ internal sealed class XPlaneLocalRemovalsService
                 throw new InvalidOperationException("The X-Plane removals artifact contains an invalid selector.");
             }
         }
-    }
-
-    private static double DistanceMeters(double lat1, double lon1, double lat2, double lon2)
-    {
-        const double earthRadius = 6371008.8;
-        var dLat = (lat2 - lat1) * Math.PI / 180d;
-        var dLon = (lon2 - lon1) * Math.PI / 180d;
-        var a = Math.Sin(dLat / 2d) * Math.Sin(dLat / 2d) +
-                Math.Cos(lat1 * Math.PI / 180d) * Math.Cos(lat2 * Math.PI / 180d) *
-                Math.Sin(dLon / 2d) * Math.Sin(dLon / 2d);
-        return earthRadius * 2d * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1d - a));
     }
 
     private static string? ResolveXPlaneRoot()
@@ -1569,6 +1502,7 @@ internal sealed class XPlaneLocalRemovalsService
         public string Schema { get; set; } = string.Empty;
         public string Icao { get; set; } = string.Empty;
         public List<RemovalSelector> Selectors { get; set; } = [];
+        public List<XPlaneDsfSelector> DsfSelectors { get; set; } = [];
     }
 
     private sealed class RemovalSelector
@@ -1579,8 +1513,6 @@ internal sealed class XPlaneLocalRemovalsService
         public List<double[]> Ranges { get; set; } = [];
     }
 
-    private sealed record Node(int Code, double Latitude, double Longitude, HashSet<int> Styles);
-    private sealed record Segment(int LineIndex, double LengthMeters);
     private sealed record SourceAirport(string Path, string AirportBlock);
     private sealed record DownloadedArtifact(
         RemovalArtifact Artifact,
