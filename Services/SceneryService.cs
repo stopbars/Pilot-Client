@@ -4,9 +4,11 @@ using System.Linq;
 using System.Net.Http;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using BARS_Client_V2.Application;
 using BARS_Client_V2.Infrastructure.Networking;
 using BARS_Client_V2.Infrastructure.Settings;
 using BARS_Client_V2.Infrastructure.Simulators.XPlane;
@@ -20,14 +22,20 @@ namespace BARS_Client_V2.Services
         private readonly XPlaneLocalRemovalsService _xplaneRemovals;
         // Key format: "ICAO:simulator" (e.g., "YSCB:msfs2020" or "YSCB:msfs2024")
         private Dictionary<string, string> _selectedPackages;
-        private static SceneryService? _instance;
+        private readonly object _selectionLock = new();
+        private static readonly Lazy<SceneryService> LazyInstance = new(
+            () => new SceneryService(),
+            LazyThreadSafetyMode.ExecutionAndPublication);
         private string _currentSimulator = "msfs2020"; // Default to 2020 - set by actual SimConnect detection
         private string _configuredSimulator = "msfs2024"; // Which simulator the user is configuring in the UI
 
         // Cached packages data - fetched once, filtered locally by simulator
         private Dictionary<string, Dictionary<string, List<string>>>? _cachedPackages;
         private readonly SemaphoreSlim _cacheLock = new(1, 1);
-        private readonly SemaphoreSlim _removalGate = new(1, 1);
+        private DateTime _packagesLoadedUtc = DateTime.MinValue;
+        private static readonly TimeSpan PackageCacheFreshness = TimeSpan.FromMinutes(5);
+        private readonly SemaphoreSlim _msfsRemovalGate = RemovalFileAccess.MsfsGate;
+        private readonly SemaphoreSlim _xplaneRemovalGate = new(1, 1);
 
         // Supported simulators
         public static readonly string[] SupportedSimulators = { "msfs2020", "msfs2024", "xplane" };
@@ -100,11 +108,7 @@ namespace BARS_Client_V2.Services
 
         public static SceneryService Instance
         {
-            get
-            {
-                _instance ??= new SceneryService();
-                return _instance;
-            }
+            get => LazyInstance.Value;
         }
 
         private SceneryService()
@@ -117,23 +121,23 @@ namespace BARS_Client_V2.Services
         /// <summary>
         /// Gets available packages organized by simulator, then by airport ICAO.
         /// Returns: Dictionary[simulator] -> Dictionary[icao] -> List of package names
-        /// Fetches from API only once and caches the result.
+        /// Refreshes the cached result periodically.
         /// </summary>
         public async Task<Dictionary<string, Dictionary<string, List<string>>>> GetAvailablePackagesAsync()
         {
             // Return cached data if available
-            if (_cachedPackages != null)
+            if (IsPackageCacheFresh())
             {
-                return _cachedPackages;
+                return _cachedPackages!;
             }
 
             await _cacheLock.WaitAsync();
             try
             {
                 // Double-check after acquiring lock
-                if (_cachedPackages != null)
+                if (IsPackageCacheFresh())
                 {
-                    return _cachedPackages;
+                    return _cachedPackages!;
                 }
 
                 var packages = new Dictionary<string, Dictionary<string, List<string>>>(StringComparer.OrdinalIgnoreCase);
@@ -176,6 +180,7 @@ namespace BARS_Client_V2.Services
                 }
 
                 _cachedPackages = packages;
+                _packagesLoadedUtc = DateTime.UtcNow;
                 return packages;
             }
             finally
@@ -221,7 +226,10 @@ namespace BARS_Client_V2.Services
             if (string.IsNullOrWhiteSpace(icao) || string.IsNullOrWhiteSpace(simulator)) return string.Empty;
 
             var key = $"{icao.ToUpperInvariant()}:{simulator.ToLowerInvariant()}";
-            return _selectedPackages.TryGetValue(key, out string? package) ? package : string.Empty;
+            lock (_selectionLock)
+            {
+                return _selectedPackages.TryGetValue(key, out string? package) ? package : string.Empty;
+            }
         }
 
         /// <summary>
@@ -241,12 +249,15 @@ namespace BARS_Client_V2.Services
             if (string.IsNullOrWhiteSpace(icao)) return result;
 
             var upperIcao = icao.ToUpperInvariant();
-            foreach (var sim in SupportedSimulators)
+            lock (_selectionLock)
             {
-                var key = $"{upperIcao}:{sim}";
-                if (_selectedPackages.TryGetValue(key, out string? package) && !string.IsNullOrEmpty(package))
+                foreach (var sim in SupportedSimulators)
                 {
-                    result[sim] = package;
+                    var key = $"{upperIcao}:{sim}";
+                    if (_selectedPackages.TryGetValue(key, out string? package) && !string.IsNullOrEmpty(package))
+                    {
+                        result[sim] = package;
+                    }
                 }
             }
             return result;
@@ -265,15 +276,30 @@ namespace BARS_Client_V2.Services
             var key = $"{icao.Trim().ToUpperInvariant()}:{simulator.Trim().ToLowerInvariant()}";
             packageName = packageName?.Trim() ?? string.Empty;
 
-            // Avoid redundant writes/events if unchanged
-            if (_selectedPackages.TryGetValue(key, out var existing) &&
-                string.Equals(existing, packageName, StringComparison.Ordinal))
+            string? previous;
+            lock (_selectionLock)
             {
-                return;
+                if (_selectedPackages.TryGetValue(key, out previous) &&
+                    string.Equals(previous, packageName, StringComparison.Ordinal))
+                {
+                    return;
+                }
+                _selectedPackages[key] = packageName;
             }
 
-            _selectedPackages[key] = packageName;
-            SaveSelectedPackages();
+            try
+            {
+                SaveSelectedPackages();
+            }
+            catch
+            {
+                lock (_selectionLock)
+                {
+                    if (previous == null) _selectedPackages.Remove(key);
+                    else _selectedPackages[key] = previous;
+                }
+                throw;
+            }
 
             try { PackageChanged?.Invoke(icao.Trim().ToUpperInvariant(), simulator.Trim().ToLowerInvariant(), packageName); } catch { }
         }
@@ -293,60 +319,117 @@ namespace BARS_Client_V2.Services
         /// </summary>
         public async Task<HashSet<string>> SyncAllRemovalStatesAsync(IDictionary<string, string> savedPackages, IDictionary<string, bool> savedToggles)
         {
-            await _removalGate.WaitAsync().ConfigureAwait(false);
+            var packageSnapshot = new Dictionary<string, string>(savedPackages, StringComparer.OrdinalIgnoreCase);
+            var toggleSnapshot = new Dictionary<string, bool>(savedToggles, StringComparer.OrdinalIgnoreCase);
+
+            HashSet<string> changedSims;
+            await RemovalFileAccess.MsfsTransactionGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                var xplaneChanged = await SyncXPlaneRemovalStatesCoreAsync(savedPackages, savedToggles)
+                changedSims = await SyncMsfsRemovalStatesAsync(packageSnapshot, toggleSnapshot)
                     .ConfigureAwait(false);
-
-                var changedSims = await Task.Run(() =>
-                {
-                    var changedSims = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var sim in SupportedSimulators.Where(sim =>
-                                 !sim.Equals("xplane", StringComparison.OrdinalIgnoreCase)))
-                    {
-                        var communityPath = TryResolveCommunityPath(sim);
-                        if (string.IsNullOrWhiteSpace(communityPath)) continue;
-
-                        var removalsRoot = Path.Combine(communityPath, "bars-removals", "Scenery", "removals");
-                        if (!Directory.Exists(removalsRoot)) continue;
-
-                        foreach (var icaoDir in Directory.EnumerateDirectories(removalsRoot))
-                        {
-                            var icao = Path.GetFileName(icaoDir)?.ToUpperInvariant();
-                            if (string.IsNullOrEmpty(icao)) continue;
-
-                            var packageKey = $"{icao}:{sim}";
-                            if (!savedPackages.TryGetValue(packageKey, out var selectedPackage) || string.IsNullOrWhiteSpace(selectedPackage))
-                            {
-                                continue;
-                            }
-
-                            var toggleKey = $"{icao}:{sim}:{selectedPackage}";
-                            var enabled = !savedToggles.TryGetValue(toggleKey, out var toggled) || toggled;
-
-                            if (ApplyRemovalState(icaoDir, icao, selectedPackage, enabled))
-                            {
-                                changedSims.Add(sim);
-                            }
-                        }
-                    }
-                    return changedSims;
-                }).ConfigureAwait(false);
-                if (xplaneChanged) changedSims.Add("xplane");
-                return changedSims;
             }
             finally
             {
-                _removalGate.Release();
+                RemovalFileAccess.MsfsTransactionGate.Release();
             }
+            var xplaneChanged = await SyncXPlaneRemovalStatesAsync(packageSnapshot, toggleSnapshot)
+                .ConfigureAwait(false);
+            if (xplaneChanged) changedSims.Add("xplane");
+            return changedSims;
+        }
+
+        private bool IsPackageCacheFresh() =>
+            _cachedPackages != null &&
+            DateTime.UtcNow - _packagesLoadedUtc < PackageCacheFreshness;
+
+        private async Task<HashSet<string>> SyncMsfsRemovalStatesAsync(
+            IDictionary<string, string> savedPackages,
+            IDictionary<string, bool> savedToggles)
+        {
+            await _msfsRemovalGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                return await Task.Run(() => SyncMsfsRemovalStatesCore(
+                    savedPackages,
+                    savedToggles,
+                    CancellationToken.None)).ConfigureAwait(false);
+            }
+            finally
+            {
+                _msfsRemovalGate.Release();
+            }
+        }
+
+        public async Task<HashSet<string>> SyncMsfsRemovalStatesFromSettingsAsync(
+            ISettingsStore settingsStore,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(settingsStore);
+            await _msfsRemovalGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                // Load after taking the filesystem gate. A UI change that got
+                // the gate first can finish persisting before this read, while
+                // a UI change that arrives later will apply after this sync.
+                var settings = await settingsStore.LoadAsync().ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                return await Task.Run(() => SyncMsfsRemovalStatesCore(
+                    settings.AirportPackages ?? new Dictionary<string, string>(),
+                    settings.SceneryRemovalToggles ?? new Dictionary<string, bool>(),
+                    cancellationToken), cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _msfsRemovalGate.Release();
+            }
+        }
+
+        private static HashSet<string> SyncMsfsRemovalStatesCore(
+            IDictionary<string, string> savedPackages,
+            IDictionary<string, bool> savedToggles,
+            CancellationToken cancellationToken)
+        {
+            var changedSims = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var sim in SupportedSimulators.Where(sim =>
+                         !sim.Equals("xplane", StringComparison.OrdinalIgnoreCase)))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var communityPath = TryResolveCommunityPath(sim);
+                if (string.IsNullOrWhiteSpace(communityPath)) continue;
+
+                var removalsRoot = Path.Combine(communityPath, "bars-removals", "Scenery", "removals");
+                if (!Directory.Exists(removalsRoot)) continue;
+
+                foreach (var icaoDir in Directory.EnumerateDirectories(removalsRoot))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var icao = Path.GetFileName(icaoDir)?.ToUpperInvariant();
+                    if (string.IsNullOrEmpty(icao)) continue;
+
+                    var packageKey = $"{icao}:{sim}";
+                    if (!savedPackages.TryGetValue(packageKey, out var selectedPackage) ||
+                        string.IsNullOrWhiteSpace(selectedPackage))
+                    {
+                        continue;
+                    }
+
+                    var toggleKey = $"{icao}:{sim}:{selectedPackage}";
+                    var enabled = !savedToggles.TryGetValue(toggleKey, out var toggled) || toggled;
+                    if (ApplyRemovalState(icaoDir, icao, selectedPackage, enabled))
+                    {
+                        changedSims.Add(sim);
+                    }
+                }
+            }
+            return changedSims;
         }
 
         public async Task<bool> SyncXPlaneRemovalStatesAsync(
             IDictionary<string, string> savedPackages,
             IDictionary<string, bool> savedToggles)
         {
-            await _removalGate.WaitAsync().ConfigureAwait(false);
+            await _xplaneRemovalGate.WaitAsync().ConfigureAwait(false);
             try
             {
                 return await SyncXPlaneRemovalStatesCoreAsync(savedPackages, savedToggles)
@@ -354,7 +437,7 @@ namespace BARS_Client_V2.Services
             }
             finally
             {
-                _removalGate.Release();
+                _xplaneRemovalGate.Release();
             }
         }
 
@@ -394,6 +477,7 @@ namespace BARS_Client_V2.Services
                         artifact?.ArtifactGenerationId)
                     .ConfigureAwait(false);
             }
+            changed |= await _xplaneRemovals.RestoreTestingArtifactsAsync().ConfigureAwait(false);
             return changed;
         }
 
@@ -410,7 +494,7 @@ namespace BARS_Client_V2.Services
 
             if (normalizedSim.Equals("xplane", StringComparison.OrdinalIgnoreCase))
             {
-                await _removalGate.WaitAsync().ConfigureAwait(false);
+                await _xplaneRemovalGate.WaitAsync().ConfigureAwait(false);
                 try
                 {
                     var artifact = await FindXPlaneContributionAsync(
@@ -430,30 +514,32 @@ namespace BARS_Client_V2.Services
                 }
                 finally
                 {
-                    _removalGate.Release();
+                    _xplaneRemovalGate.Release();
                 }
             }
 
             var communityPath = TryResolveCommunityPath(normalizedSim);
             if (string.IsNullOrWhiteSpace(communityPath))
             {
-                return false;
+                throw new InvalidOperationException(
+                    $"The {normalizedSim} Community folder is not configured in the BARS Installer.");
             }
 
             var removalsPath = Path.Combine(communityPath, "bars-removals", "Scenery", "removals", normalizedIcao);
             if (!Directory.Exists(removalsPath))
             {
-                return false;
+                throw new DirectoryNotFoundException(
+                    $"No removal files were installed for {normalizedIcao} in {normalizedSim}.");
             }
 
-            await _removalGate.WaitAsync().ConfigureAwait(false);
+            await _msfsRemovalGate.WaitAsync().ConfigureAwait(false);
             try
             {
                 return await Task.Run(() => ApplyRemovalState(removalsPath, normalizedIcao, normalizedPackage, enabled)).ConfigureAwait(false);
             }
             finally
             {
-                _removalGate.Release();
+                _msfsRemovalGate.Release();
             }
         }
 
@@ -479,65 +565,126 @@ namespace BARS_Client_V2.Services
 
         private static bool ApplyRemovalState(string removalsPath, string icao, string packageName, bool enabled)
         {
-            var anyChanged = false;
-            var normalizedPackageName = packageName?.Replace(' ', '-') ?? string.Empty;
+            var normalizedPackageName = NormalizeRemovalFileComponent(packageName);
             var expectedBase = string.IsNullOrWhiteSpace(normalizedPackageName)
                 ? string.Empty
                 : $"{normalizedPackageName}_{icao}";
+            var matchingFileFound = false;
+            var candidates = Directory.EnumerateFiles(removalsPath)
+                .Select(file => file.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase)
+                    ? file[..^".disabled".Length]
+                    : file)
+                .Where(file => file.EndsWith(".bgl", StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(file => file, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var moves = new List<(string Source, string Target, bool DeleteAfterCommit)>();
 
-            foreach (var file in Directory.EnumerateFiles(removalsPath))
+            foreach (var candidatePath in candidates)
             {
-                var fileName = Path.GetFileName(file);
-                if (string.IsNullOrEmpty(fileName))
-                {
-                    continue;
-                }
-
-                var isDisabled = fileName.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase);
-                var candidatePath = isDisabled ? file[..^".disabled".Length] : file;
-
-                if (!candidatePath.EndsWith(".bgl", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
                 var baseName = Path.GetFileNameWithoutExtension(candidatePath);
-                var shouldEnable = enabled && !string.IsNullOrEmpty(expectedBase)
-                    && string.Equals(baseName, expectedBase, StringComparison.OrdinalIgnoreCase);
+                var normalizedBaseName = NormalizeRemovalFileComponent(baseName);
+                var shouldEnable = enabled && !string.IsNullOrEmpty(expectedBase) &&
+                    string.Equals(normalizedBaseName, NormalizeRemovalFileComponent(expectedBase), StringComparison.OrdinalIgnoreCase);
+                matchingFileFound |= shouldEnable;
+                var disabledPath = candidatePath + ".disabled";
+                var activeExists = File.Exists(candidatePath);
+                var disabledExists = File.Exists(disabledPath);
 
                 if (shouldEnable)
                 {
-                    if (isDisabled)
+                    if (!activeExists && disabledExists)
                     {
-                        if (File.Exists(candidatePath))
-                        {
-                            File.Delete(file);
-                        }
-                        else
-                        {
-                            File.Move(file, candidatePath);
-                        }
-                        anyChanged = true;
+                        moves.Add((disabledPath, candidatePath, false));
+                    }
+                    else if (activeExists && disabledExists)
+                    {
+                        moves.Add((disabledPath, UniqueQuarantinePath(disabledPath), true));
                     }
                 }
-                else
+                else if (activeExists)
                 {
-                    if (!isDisabled)
+                    if (!disabledExists)
                     {
-                        var target = file + ".disabled";
-                        if (File.Exists(target))
-                        {
-                            File.Delete(file);
-                        }
-                        else
-                        {
-                            File.Move(file, target);
-                        }
-                        anyChanged = true;
+                        moves.Add((candidatePath, disabledPath, false));
+                    }
+                    else
+                    {
+                        moves.Add((candidatePath, UniqueQuarantinePath(candidatePath), true));
                     }
                 }
             }
-            return anyChanged;
+            if (enabled && !matchingFileFound)
+            {
+                throw new FileNotFoundException(
+                    $"No installed removal BGL matched package '{packageName}' for {icao}.");
+            }
+
+            var completed = new List<(string Source, string Target, bool DeleteAfterCommit)>();
+            try
+            {
+                foreach (var move in moves)
+                {
+                    File.Move(move.Source, move.Target);
+                    completed.Add(move);
+                }
+            }
+            catch (Exception operationError)
+            {
+                Exception? rollbackError = null;
+                foreach (var move in completed.AsEnumerable().Reverse())
+                {
+                    try
+                    {
+                        if (File.Exists(move.Target) && !File.Exists(move.Source))
+                        {
+                            File.Move(move.Target, move.Source);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        rollbackError ??= ex;
+                    }
+                }
+
+                if (rollbackError != null)
+                {
+                    throw new IOException(
+                        $"Changing removal files for {icao} failed, and rollback also failed.",
+                        new AggregateException(operationError, rollbackError));
+                }
+                throw;
+            }
+
+            foreach (var move in completed.Where(item => item.DeleteAfterCommit))
+            {
+                try { File.Delete(move.Target); } catch { }
+            }
+            return completed.Count > 0;
+        }
+
+        private static string UniqueQuarantinePath(string sourcePath) =>
+            $"{sourcePath}.bars-stale-{Guid.NewGuid():N}";
+
+        private static string NormalizeRemovalFileComponent(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+            var builder = new System.Text.StringBuilder(value.Length);
+            var previousWasSeparator = false;
+            foreach (var character in value.Trim())
+            {
+                if (char.IsLetterOrDigit(character) || character == '.')
+                {
+                    builder.Append(char.ToLowerInvariant(character));
+                    previousWasSeparator = false;
+                }
+                else if (!previousWasSeparator)
+                {
+                    builder.Append('-');
+                    previousWasSeparator = true;
+                }
+            }
+            return builder.ToString().Trim('-');
         }
 
         private static string? TryResolveCommunityPath(string simulator)
@@ -589,16 +736,19 @@ namespace BARS_Client_V2.Services
                 string settingsPath = Path.Combine(appDataPath, SETTINGS_FILENAME);
                 var options = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true };
 
-                // Local type matching JsonSettingsStore serialization shape
-                var persisted = new SettingsPersisted();
-
                 if (File.Exists(settingsPath))
                 {
                     try
                     {
                         string json = File.ReadAllText(settingsPath);
-                        var loaded = JsonSerializer.Deserialize<SettingsPersisted>(json, options);
-                        if (loaded != null) persisted = loaded;
+                        var root = JsonNode.Parse(json) as JsonObject;
+                        var packageProperty = root?.FirstOrDefault(item =>
+                            item.Key.Equals("airportPackages", StringComparison.OrdinalIgnoreCase)).Value;
+                        var loaded = packageProperty?.Deserialize<Dictionary<string, string>>(options);
+                        if (loaded != null)
+                        {
+                            return new Dictionary<string, string>(loaded, StringComparer.OrdinalIgnoreCase);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -606,8 +756,7 @@ namespace BARS_Client_V2.Services
                     }
                 }
 
-                var result = persisted.AirportPackages ?? new Dictionary<string, string>();
-                return new Dictionary<string, string>(result, StringComparer.OrdinalIgnoreCase);
+                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             }
             catch (Exception ex)
             {
@@ -637,45 +786,35 @@ namespace BARS_Client_V2.Services
 
                 string settingsPath = Path.Combine(appDataPath, SETTINGS_FILENAME);
                 var options = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true };
-
-                // Load existing to preserve unrelated fields (e.g., apiToken)
-                var persisted = new SettingsPersisted();
+                JsonObject persisted = new();
                 if (File.Exists(settingsPath))
                 {
-                    try
-                    {
-                        var current = JsonSerializer.Deserialize<SettingsPersisted>(File.ReadAllText(settingsPath), options);
-                        if (current != null) persisted = current;
-                    }
-                    catch { /* ignore and overwrite minimal */ }
+                    persisted = JsonNode.Parse(File.ReadAllText(settingsPath)) as JsonObject
+                        ?? throw new InvalidDataException("The client settings file did not contain a JSON object.");
                 }
 
-                persisted.AirportPackages = new Dictionary<string, string>(_selectedPackages, StringComparer.OrdinalIgnoreCase);
+                Dictionary<string, string> selections;
+                lock (_selectionLock)
+                {
+                    selections = new Dictionary<string, string>(_selectedPackages, StringComparer.OrdinalIgnoreCase);
+                }
+                var propertyName = persisted.Select(item => item.Key)
+                    .FirstOrDefault(name => name.Equals("airportPackages", StringComparison.OrdinalIgnoreCase))
+                    ?? "airportPackages";
+                persisted[propertyName] = JsonSerializer.SerializeToNode(selections, options);
 
-                var json = JsonSerializer.Serialize(persisted, options);
-                File.WriteAllText(settingsPath, json);
+                var json = persisted.ToJsonString(options);
+                SettingsFileAccess.WriteAllTextAtomic(settingsPath, json);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error saving scenery selections to settings.json: {ex.Message}");
+                throw;
             }
             finally
             {
                 SettingsFileAccess.Gate.Release();
             }
-        }
-
-        private sealed class SettingsPersisted
-        {
-            public string? ApiToken { get; set; }
-            /// <summary>
-            /// Airport package selections. Key format: "ICAO:simulator" (e.g., "YSCB:msfs2020")
-            /// </summary>
-            public Dictionary<string, string>? AirportPackages { get; set; }
-            /// <summary>
-            /// Scenery removal toggle states. Key format: "ICAO:simulator:package"
-            /// </summary>
-            public Dictionary<string, bool>? SceneryRemovalToggles { get; set; }
         }
 
         private sealed class InstallerSettings

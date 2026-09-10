@@ -120,6 +120,35 @@ internal sealed class XPlaneLocalRemovalsService
                BlockHash(current).Equals(applied.PatchedSha256, StringComparison.OrdinalIgnoreCase);
     }
 
+    public async Task<bool> RestoreTestingArtifactsAsync(CancellationToken cancellationToken = default)
+    {
+        var root = ResolveXPlaneRoot();
+        if (root == null) return false;
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var testingAirports = LoadPatchState(root).Airports
+                .Where(item => item.PackageName.Equals("Testing", StringComparison.OrdinalIgnoreCase))
+                .Select(item => item.Icao)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (testingAirports.Length == 0) return false;
+            if (IsXPlaneProcessRunning()) return true;
+
+            var changed = false;
+            foreach (var airport in testingAirports)
+            {
+                changed |= await RestoreAirportAsync(root, airport, cancellationToken).ConfigureAwait(false);
+            }
+            return changed;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public async Task<bool> ApplyTestingArtifactAsync(
         string icao,
         string removalJson,
@@ -335,13 +364,16 @@ internal sealed class XPlaneLocalRemovalsService
         }
         catch
         {
+            // Once a source file has changed, rollback must finish even if the
+            // caller cancelled during shutdown or switched operations.
+            var rollbackToken = CancellationToken.None;
             if (targetChanged)
             {
                 await ReplaceAirportBlockAtomicallyAsync(
                         sourcePath,
                         icao,
                         current,
-                        cancellationToken)
+                        rollbackToken)
                     .ConfigureAwait(false);
             }
             if (sourceChanged && previousSourceWasPatched && previousSourceCurrent != null)
@@ -350,7 +382,7 @@ internal sealed class XPlaneLocalRemovalsService
                         previousSourcePath!,
                         icao,
                         previousSourceCurrent,
-                        cancellationToken)
+                        rollbackToken)
                     .ConfigureAwait(false);
             }
             if (previousState != null)
@@ -801,11 +833,13 @@ internal sealed class XPlaneLocalRemovalsService
                 state.Airports.Add(applied);
                 if (changed)
                 {
+                    // The apt.dat change must be undone even when the state
+                    // save failed because the caller cancelled.
                     await ReplaceAirportBlockAtomicallyAsync(
                             sourcePath,
                             icao,
                             current,
-                            cancellationToken)
+                            CancellationToken.None)
                         .ConfigureAwait(false);
                 }
                 throw;
@@ -1524,7 +1558,9 @@ internal sealed class XPlaneLocalRemovalsService
         }
         catch
         {
-            return false;
+            // Failing to inspect the process list is not proof that X-Plane is
+            // closed. Refuse to edit active scenery in that case.
+            return true;
         }
     }
 

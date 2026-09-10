@@ -40,20 +40,27 @@ public sealed class RemovalsUpdateService
     /// <summary>
     /// Result of checking and updating removals packages.
     /// </summary>
-    public sealed record RemovalsUpdateResult(ClientSettings Settings, HashSet<string> UpdatedSimulators);
+    public sealed record RemovalsUpdateResult(ClientSettings Settings, HashSet<string> UpdatedSimulators)
+    {
+        public HashSet<string> FailedSimulators { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    }
 
     /// <summary>
     /// Check both MSFS 2020 and MSFS 2024 removals for updates and download if needed.
     /// </summary>
     /// <param name="currentSettings">Current client settings containing stored ETags</param>
     /// <returns>Updated ClientSettings with new ETags and a set of simulators that were updated</returns>
-    public async Task<RemovalsUpdateResult> CheckAndUpdateRemovalsAsync(ClientSettings currentSettings)
+    public async Task<RemovalsUpdateResult> CheckAndUpdateRemovalsAsync(
+        ClientSettings currentSettings,
+        CancellationToken cancellationToken = default)
     {
         StartupTrace.Write("RemovalsUpdateService.CheckAndUpdateRemovalsAsync enter");
         var updatedSims = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        await _updateLock.WaitAsync().ConfigureAwait(false);
+        var failedSims = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await _updateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            currentSettings = await _settingsStore.LoadAsync().ConfigureAwait(false);
             var newMsfs2020Etag = currentSettings.Msfs2020RemovalsEtag;
             var newMsfs2024Etag = currentSettings.Msfs2024RemovalsEtag;
 
@@ -65,7 +72,9 @@ public sealed class RemovalsUpdateService
                     "msfs2020",
                     Msfs2020RemovalsUrl,
                     currentSettings.Msfs2020RemovalsEtag,
-                    msfs2020Path).ConfigureAwait(false);
+                    msfs2020Path,
+                    cancellationToken).ConfigureAwait(false);
+                if (result.Failed) failedSims.Add("msfs2020");
                 if (result.Updated)
                 {
                     newMsfs2020Etag = result.NewEtag;
@@ -85,7 +94,9 @@ public sealed class RemovalsUpdateService
                     "msfs2024",
                     Msfs2024RemovalsUrl,
                     currentSettings.Msfs2024RemovalsEtag,
-                    msfs2024Path).ConfigureAwait(false);
+                    msfs2024Path,
+                    cancellationToken).ConfigureAwait(false);
+                if (result.Failed) failedSims.Add("msfs2024");
                 if (result.Updated)
                 {
                     newMsfs2024Etag = result.NewEtag;
@@ -100,24 +111,27 @@ public sealed class RemovalsUpdateService
             if (newMsfs2020Etag != currentSettings.Msfs2020RemovalsEtag ||
                 newMsfs2024Etag != currentSettings.Msfs2024RemovalsEtag)
             {
-                var updatedSettings = currentSettings with
+                var updatedSettings = await _settingsStore.UpdateAsync(latest => latest with
                 {
-                    Msfs2020RemovalsEtag = newMsfs2020Etag,
-                    Msfs2024RemovalsEtag = newMsfs2024Etag
-                };
-                await _settingsStore.SaveAsync(updatedSettings).ConfigureAwait(false);
+                    Msfs2020RemovalsEtag = updatedSims.Contains("msfs2020") ? newMsfs2020Etag : latest.Msfs2020RemovalsEtag,
+                    Msfs2024RemovalsEtag = updatedSims.Contains("msfs2024") ? newMsfs2024Etag : latest.Msfs2024RemovalsEtag
+                }).ConfigureAwait(false);
                 StartupTrace.Write("RemovalsUpdateService: ETags updated and saved");
-                return new RemovalsUpdateResult(updatedSettings, updatedSims);
+                return new RemovalsUpdateResult(updatedSettings, updatedSims) { FailedSimulators = failedSims };
             }
 
             StartupTrace.Write("RemovalsUpdateService.CheckAndUpdateRemovalsAsync exit (no changes)");
-            return new RemovalsUpdateResult(currentSettings, updatedSims);
+            return new RemovalsUpdateResult(currentSettings, updatedSims) { FailedSimulators = failedSims };
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error checking for removals updates");
             StartupTrace.Write($"RemovalsUpdateService error: {ex.Message}");
-            return new RemovalsUpdateResult(currentSettings, updatedSims);
+            throw;
         }
         finally
         {
@@ -125,11 +139,12 @@ public sealed class RemovalsUpdateService
         }
     }
 
-    private async Task<(bool Updated, string? NewEtag)> CheckAndUpdateSingleSimulatorAsync(
+    private async Task<(bool Updated, string? NewEtag, bool Failed)> CheckAndUpdateSingleSimulatorAsync(
         string simulator,
         string url,
         string? storedEtag,
-        string communityPath)
+        string communityPath,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -139,12 +154,12 @@ public sealed class RemovalsUpdateService
 
             using var headRequest = new HttpRequestMessage(HttpMethod.Head, cacheBustedUrl);
             AddNoCacheHeaders(headRequest);
-            using var headResponse = await _httpClient.SendAsync(headRequest).ConfigureAwait(false);
+            using var headResponse = await _httpClient.SendAsync(headRequest, cancellationToken).ConfigureAwait(false);
 
             if (!headResponse.IsSuccessStatusCode)
             {
                 _logger.LogWarning("HEAD request failed for {Simulator}: {StatusCode}", simulator, headResponse.StatusCode);
-                return (false, storedEtag);
+                return (false, storedEtag, true);
             }
 
             var currentEtag = headResponse.Headers.ETag?.Tag;
@@ -165,100 +180,209 @@ public sealed class RemovalsUpdateService
 
             StartupTrace.Write($"{simulator} normalized ETags - current: '{normalizedCurrent}', stored: '{normalizedStored}'");
 
-            if (string.Equals(normalizedCurrent, normalizedStored, StringComparison.OrdinalIgnoreCase))
+            var removalsDestPath = Path.Combine(communityPath, RemovalsFolderName);
+            if (Directory.Exists(removalsDestPath) &&
+                normalizedCurrent != null &&
+                string.Equals(normalizedCurrent, normalizedStored, StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogInformation("{Simulator} removals are up to date", simulator);
                 StartupTrace.Write($"{simulator} removals are up to date (ETags match)");
-                return (false, storedEtag);
+                return (false, storedEtag, false);
             }
 
             _logger.LogInformation("{Simulator} removals have changed, downloading update...", simulator);
             StartupTrace.Write($"{simulator} removals ETag changed from {normalizedStored} to {normalizedCurrent}, starting download");
-            var success = await DownloadAndInstallRemovalsAsync(simulator, url, communityPath).ConfigureAwait(false);
+            var download = await DownloadAndInstallRemovalsAsync(
+                simulator,
+                cacheBustedUrl,
+                communityPath,
+                currentEtag,
+                cancellationToken).ConfigureAwait(false);
 
-            if (success)
+            if (download.Success)
             {
                 _logger.LogInformation("{Simulator} removals updated successfully", simulator);
                 StartupTrace.Write($"{simulator} removals updated successfully");
-                return (true, currentEtag);
+                return (true, download.Etag ?? currentEtag, false);
             }
 
             _logger.LogWarning("{Simulator} removals download/install returned false", simulator);
             StartupTrace.Write($"{simulator} removals download/install failed (returned false)");
-            return (false, storedEtag);
+            return (false, storedEtag, true);
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is not RemovalPackageInstaller.RecoveryException)
         {
             _logger.LogError(ex, "Error checking/updating removals for {Simulator}", simulator);
             StartupTrace.Write($"CheckAndUpdateSingleSimulatorAsync EXCEPTION for {simulator}: {ex.GetType().Name}: {ex.Message}");
             StartupTrace.Write($"Stack trace: {ex.StackTrace}");
-            return (false, storedEtag);
+            return (false, storedEtag, true);
         }
     }
 
-    private async Task<bool> DownloadAndInstallRemovalsAsync(string simulator, string url, string communityPath)
+    private async Task<(bool Success, string? Etag)> DownloadAndInstallRemovalsAsync(
+        string simulator,
+        string downloadUrl,
+        string communityPath,
+        string? expectedEtag,
+        CancellationToken cancellationToken)
     {
         var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var tempDir = Path.Combine(root, "BARS", "Installer", "TEMP");
         Directory.CreateDirectory(tempDir);
 
-        var tempZipPath = Path.Combine(tempDir, $"bars-removals-{simulator}.zip");
+        var operationId = Guid.NewGuid().ToString("N");
+        var tempZipPath = Path.Combine(tempDir, $"bars-removals-{simulator}-{operationId}.zip");
         var removalsDestPath = Path.Combine(communityPath, RemovalsFolderName);
+        var stageRoot = Path.Combine(communityPath, $".{RemovalsFolderName}-stage-{operationId}");
+        var stagePackagePath = Path.Combine(stageRoot, RemovalsFolderName);
+        var backupPath = Path.Combine(communityPath, $".{RemovalsFolderName}-backup-{operationId}");
+        var previousMoved = false;
+        var replacementInstalled = false;
+        var removalGateHeld = false;
 
         StartupTrace.Write($"DownloadAndInstallRemovalsAsync: simulator={simulator}, tempZipPath={tempZipPath}, removalsDestPath={removalsDestPath}");
 
         try
         {
-            var cacheBustedUrl = AppendCacheBuster(url);
             _logger.LogInformation("Downloading {Simulator} removals to {TempPath}", simulator, tempZipPath);
-            StartupTrace.Write($"Starting download from {cacheBustedUrl}");
-            using var downloadRequest = new HttpRequestMessage(HttpMethod.Get, cacheBustedUrl);
+            StartupTrace.Write($"Starting download from {downloadUrl}");
+            using var downloadRequest = new HttpRequestMessage(HttpMethod.Get, downloadUrl);
             AddNoCacheHeaders(downloadRequest);
-            using (var response = await _httpClient.SendAsync(downloadRequest, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false))
+            if (!string.IsNullOrWhiteSpace(expectedEtag))
+            {
+                downloadRequest.Headers.TryAddWithoutValidation("If-Match", expectedEtag);
+            }
+            string? downloadedEtag;
+            using (var response = await _httpClient.SendAsync(
+                       downloadRequest,
+                       HttpCompletionOption.ResponseHeadersRead,
+                       cancellationToken).ConfigureAwait(false))
             {
                 StartupTrace.Write($"Download response status: {response.StatusCode}");
                 response.EnsureSuccessStatusCode();
+                downloadedEtag = response.Headers.ETag?.Tag;
+                if (!string.IsNullOrWhiteSpace(expectedEtag) &&
+                    !string.IsNullOrWhiteSpace(downloadedEtag) &&
+                    !string.Equals(
+                        NormalizeEtag(expectedEtag),
+                        NormalizeEtag(downloadedEtag),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException("The removals package changed between the update check and download.");
+                }
                 await using var fs = new FileStream(tempZipPath, FileMode.Create, FileAccess.Write, FileShare.None);
-                await response.Content.CopyToAsync(fs).ConfigureAwait(false);
+                await response.Content.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
             }
 
             var downloadedSize = new FileInfo(tempZipPath).Length;
+            if (downloadedSize == 0)
+            {
+                throw new InvalidDataException("The downloaded removals archive was empty.");
+            }
             _logger.LogInformation("Downloaded {Simulator} removals ({Size} bytes)", simulator, downloadedSize);
             StartupTrace.Write($"Downloaded {downloadedSize} bytes to {tempZipPath}");
 
+            ValidateArchive(tempZipPath);
+            cancellationToken.ThrowIfCancellationRequested();
+            Directory.CreateDirectory(stageRoot);
+            ZipFile.ExtractToDirectory(tempZipPath, stageRoot, overwriteFiles: false);
+            var stagedRemovalsRoot = Path.Combine(stagePackagePath, "Scenery", "removals");
+            if (!Directory.Exists(stagedRemovalsRoot))
+            {
+                throw new InvalidDataException(
+                    $"The {simulator} removals archive does not contain {RemovalsFolderName}/Scenery/removals.");
+            }
+
+            await RemovalFileAccess.MsfsGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            removalGateHeld = true;
             if (Directory.Exists(removalsDestPath))
             {
-                _logger.LogInformation("Deleting existing removals folder: {Path}", removalsDestPath);
-                StartupTrace.Write($"Deleting existing folder: {removalsDestPath}");
+                _logger.LogInformation("Moving existing removals folder aside: {Path}", removalsDestPath);
                 try
                 {
-                    Directory.Delete(removalsDestPath, recursive: true);
-                    StartupTrace.Write("Existing folder deleted successfully");
+                    Directory.Move(removalsDestPath, backupPath);
+                    previousMoved = true;
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    _logger.LogWarning(ex, "Failed to delete existing removals folder, attempting to overwrite");
-                    StartupTrace.Write($"Failed to delete existing folder: {ex.Message}");
+                    StartupTrace.Write($"Package directory rename failed ({ex.Message}); replacing files with rollback");
+                    for (var attempt = 0; ; attempt++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        try
+                        {
+                            RemovalPackageInstaller.ReplaceFiles(stagePackagePath, removalsDestPath, backupPath);
+                            replacementInstalled = true;
+                            break;
+                        }
+                        catch (Exception fileError) when (attempt < 2 && fileError is IOException or UnauthorizedAccessException)
+                        {
+                            StartupTrace.Write($"Removal file replacement failed; retrying attempt {attempt + 2}: {fileError.Message}");
+                            await Task.Delay(TimeSpan.FromSeconds(attempt + 1), cancellationToken).ConfigureAwait(false);
+                        }
+                    }
                 }
             }
 
-            _logger.LogInformation("Extracting removals to {DestPath}", communityPath);
-            StartupTrace.Write($"Extracting zip to {communityPath}");
-            ZipFile.ExtractToDirectory(tempZipPath, communityPath, overwriteFiles: true);
-            StartupTrace.Write("Extraction completed successfully");
+            if (!replacementInstalled) Directory.Move(stagePackagePath, removalsDestPath);
+            replacementInstalled = true;
+            StartupTrace.Write("Staged removals package installed successfully");
+
+            if (Directory.Exists(backupPath))
+            {
+                try
+                {
+                    Directory.Delete(backupPath, recursive: true);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to delete the previous removals backup at {Path}", backupPath);
+                }
+            }
 
             _logger.LogInformation("{Simulator} removals installed successfully", simulator);
-            return true;
+            return (true, downloadedEtag);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
+            if (previousMoved && !replacementInstalled && !Directory.Exists(removalsDestPath) && Directory.Exists(backupPath))
+            {
+                try
+                {
+                    Directory.Move(backupPath, removalsDestPath);
+                    previousMoved = false;
+                }
+                catch (Exception rollbackException)
+                {
+                    _logger.LogCritical(
+                        rollbackException,
+                        "Failed to restore the previous removals package from {BackupPath}",
+                        backupPath);
+                    throw new RemovalPackageInstaller.RecoveryException(
+                        $"Removal update rollback failed. Backups retained at {backupPath}.",
+                        new[] { ex, rollbackException });
+                }
+            }
             _logger.LogError(ex, "Failed to download/install removals for {Simulator}", simulator);
             StartupTrace.Write($"DownloadAndInstallRemovalsAsync EXCEPTION: {ex.GetType().Name}: {ex.Message}");
             StartupTrace.Write($"Stack trace: {ex.StackTrace}");
-            return false;
+            if (ex is RemovalPackageInstaller.RecoveryException) throw;
+            return (false, null);
         }
         finally
         {
+            if (removalGateHeld)
+            {
+                RemovalFileAccess.MsfsGate.Release();
+            }
             if (File.Exists(tempZipPath))
             {
                 try
@@ -271,6 +395,42 @@ public sealed class RemovalsUpdateService
                     _logger.LogWarning(ex, "Failed to delete temp file: {TempPath}", tempZipPath);
                 }
             }
+            if (Directory.Exists(stageRoot))
+            {
+                try { Directory.Delete(stageRoot, recursive: true); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete removals staging folder {Path}", stageRoot); }
+            }
+        }
+    }
+
+    private static void ValidateArchive(string archivePath)
+    {
+        const long maxExpandedBytes = 2L * 1024 * 1024 * 1024;
+        using var archive = ZipFile.OpenRead(archivePath);
+        if (archive.Entries.Count == 0)
+        {
+            throw new InvalidDataException("The removals archive contained no files.");
+        }
+
+        long expandedBytes = 0;
+        var expectedPrefix = RemovalsFolderName + "/";
+        var hasPackageContent = false;
+        foreach (var entry in archive.Entries)
+        {
+            expandedBytes = checked(expandedBytes + entry.Length);
+            if (expandedBytes > maxExpandedBytes)
+            {
+                throw new InvalidDataException("The removals archive exceeds the expanded-size safety limit.");
+            }
+            if (entry.FullName.Replace('\\', '/').StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                hasPackageContent = true;
+            }
+        }
+
+        if (!hasPackageContent)
+        {
+            throw new InvalidDataException($"The removals archive does not contain a {RemovalsFolderName} package.");
         }
     }
 
