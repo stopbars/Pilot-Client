@@ -16,15 +16,8 @@
                     <ContextMenu>
                         <MenuItem Header="Show"
                                   Click="TaskbarIcon_ShowMenuItem_OnClick"/>
-                        <MenuItem Header="Auto Minimize on Start"
-                                  Tag="AutoMinimizeToggle"
-                                  IsCheckable="True"
-                                  Click="TaskbarIcon_AutoMinimizeMenuItem_OnClick"/>
-                        <MenuItem Header="Discord Rich Presence"
-                                  Tag="DiscordPresenceToggle"
-                                  IsCheckable="True"
-                                  IsChecked="True"
-                                  Click="TaskbarIcon_DiscordPresenceMenuItem_OnClick"/>
+                        <MenuItem Header="Settings"
+                                  Click="TaskbarIcon_SettingsMenuItem_OnClick"/>
                         <Separator/>
                         <MenuItem Header="Exit"
                                   Click="TaskbarIcon_ExitMenuItem_OnClick"/>

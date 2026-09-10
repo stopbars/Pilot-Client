@@ -10,7 +10,8 @@ namespace BARS_Client_V2.Infrastructure.Simulators.XPlane;
 
 public sealed class XPlanePointController : BackgroundService, IPointStateListener
 {
-    private const double VisibilityRadiusMeters = 500.0;
+    private readonly LightDrawDistanceSettings _drawDistance;
+    private int _appliedDrawDistanceMeters;
     private const double VisibilityRecenterMeters = 50.0;
     private readonly XPlaneSimulatorConnector _connector;
     private readonly SimulatorManager _simulatorManager;
@@ -18,12 +19,14 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
     private readonly ILogger<XPlanePointController> _logger;
     private readonly ConcurrentDictionary<string, PointState> _states = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, IReadOnlyList<AirportStateHub.LightLayout>> _layouts = new(StringComparer.Ordinal);
-    private readonly Channel<string> _pendingPoints = Channel.CreateUnbounded<string>(
-        new UnboundedChannelOptions
+    private readonly ConcurrentDictionary<string, byte> _queuedPoints = new(StringComparer.Ordinal);
+    private readonly Channel<string> _pendingPoints = Channel.CreateBounded<string>(
+        new BoundedChannelOptions(8192)
         {
             SingleReader = true,
             SingleWriter = false,
-            AllowSynchronousContinuations = false
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.Wait
         });
     private readonly ConcurrentDictionary<string, List<XPlaneBridgeLight>> _activeByPoint = new(StringComparer.Ordinal);
     private volatile bool _snapshotRequired = true;
@@ -31,17 +34,20 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
     private (double Latitude, double Longitude)? _lastCenter;
     private int _lastConnectionGeneration;
     private long _sceneGeneration;
+    private long _mapGeneration;
 
     public XPlanePointController(
         XPlaneSimulatorConnector connector,
         SimulatorManager simulatorManager,
         AirportStateHub hub,
-        ILogger<XPlanePointController> logger)
+        ILogger<XPlanePointController> logger,
+        LightDrawDistanceSettings? drawDistance = null)
     {
         _connector = connector;
         _simulatorManager = simulatorManager;
         _hub = hub;
         _logger = logger;
+        _drawDistance = drawDistance ?? new LightDrawDistanceSettings();
         _hub.PointStateChanged += OnPointStateChanged;
         _hub.MapLoaded += OnMapLoaded;
     }
@@ -50,14 +56,19 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
     {
         _states[state.Metadata.Id] = state;
         _layouts.TryRemove(state.Metadata.Id, out _);
-        _pendingPoints.Writer.TryWrite(state.Metadata.Id);
+        if (_simulatorManager.ActiveConnector != _connector)
+        {
+            _snapshotRequired = true;
+            return;
+        }
+        QueuePoint(state.Metadata.Id);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
             "XPlanePointController started radius={radius}m recenter={recenter}m",
-            VisibilityRadiusMeters,
+            _drawDistance.Meters,
             VisibilityRecenterMeters);
 
         while (!stoppingToken.IsCancellationRequested)
@@ -93,11 +104,13 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
                     _snapshotRequired = true;
                 }
 
-                if (_snapshotRequired)
+                var drawDistanceMeters = _drawDistance.Meters;
+                if (_snapshotRequired || drawDistanceMeters != _appliedDrawDistanceMeters)
                 {
-                    await ReplaceSnapshotAsync(center, stoppingToken).ConfigureAwait(false);
-                    _snapshotRequired = false;
-                    DrainPendingPoints();
+                    var mapGeneration = Volatile.Read(ref _mapGeneration);
+                    await ReplaceSnapshotAsync(center, drawDistanceMeters, stoppingToken).ConfigureAwait(false);
+                    _appliedDrawDistanceMeters = drawDistanceMeters;
+                    _snapshotRequired = mapGeneration != Volatile.Read(ref _mapGeneration);
                 }
                 else
                 {
@@ -121,28 +134,10 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
 
     private async Task ReplaceSnapshotAsync(
         (double Latitude, double Longitude) center,
+        int drawDistanceMeters,
         CancellationToken ct)
     {
-        var lights = new List<XPlaneBridgeLight>();
-        var byPoint = new Dictionary<string, List<XPlaneBridgeLight>>(StringComparer.Ordinal);
-        foreach (var pair in _states)
-        {
-            var state = pair.Value;
-            if (DistanceMeters(
-                    center.Latitude,
-                    center.Longitude,
-                    state.Metadata.Latitude,
-                    state.Metadata.Longitude) > VisibilityRadiusMeters)
-            {
-                continue;
-            }
-
-            var pointLights = BuildLights(pair.Key, state);
-            if (pointLights.Count == 0) continue;
-            byPoint[pair.Key] = pointLights;
-            lights.AddRange(pointLights);
-        }
-
+        var (lights, byPoint) = BuildSnapshot(center, drawDistanceMeters);
         var generation = Interlocked.Increment(ref _sceneGeneration);
         await _connector.ReplaceSceneAsync(_airport, generation, lights, ct).ConfigureAwait(false);
         _activeByPoint.Clear();
@@ -154,10 +149,40 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
             lights.Count);
     }
 
+    private (List<XPlaneBridgeLight> Lights, Dictionary<string, List<XPlaneBridgeLight>> ByPoint) BuildSnapshot(
+        (double Latitude, double Longitude) center, int drawDistanceMeters)
+    {
+        var lights = new List<XPlaneBridgeLight>();
+        var byPoint = new Dictionary<string, List<XPlaneBridgeLight>>(StringComparer.Ordinal);
+        foreach (var pair in _states)
+        {
+            var state = pair.Value;
+            if (DistanceMeters(
+                    center.Latitude,
+                    center.Longitude,
+                    state.Metadata.Latitude,
+                    state.Metadata.Longitude) > drawDistanceMeters)
+            {
+                continue;
+            }
+
+            var pointLights = BuildLights(pair.Key, state);
+            if (pointLights.Count == 0) continue;
+            byPoint[pair.Key] = pointLights;
+            lights.AddRange(pointLights);
+        }
+
+        return (lights, byPoint);
+    }
+
     private async Task PatchChangedPointsAsync(CancellationToken ct)
     {
         var changed = new HashSet<string>(StringComparer.Ordinal);
-        while (_pendingPoints.Reader.TryRead(out var pointId)) changed.Add(pointId);
+        while (_pendingPoints.Reader.TryRead(out var pointId))
+        {
+            _queuedPoints.TryRemove(pointId, out _);
+            changed.Add(pointId);
+        }
         if (changed.Count == 0) return;
 
         var patches = new List<XPlaneBridgeLightPatch>();
@@ -230,11 +255,13 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
     private static int ResolveStateId(AirportStateHub.LightLayout layout, bool isOn)
     {
         if (isOn) return layout.StateId is > 0 ? layout.StateId.Value : 1;
-        return layout.OffStateId ?? 0;
+        // Keep the elevated fixture visible when the map omits its off state.
+        return layout.OffStateId ?? (layout.StateId is 6 or 7 ? 7 : 0);
     }
 
     private void OnMapLoaded(string airport)
     {
+        Interlocked.Increment(ref _mapGeneration);
         _airport = airport?.Trim().ToUpperInvariant() ?? string.Empty;
         _states.Clear();
         _layouts.Clear();
@@ -246,7 +273,20 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
 
     private void DrainPendingPoints()
     {
-        while (_pendingPoints.Reader.TryRead(out _)) { }
+        while (_pendingPoints.Reader.TryRead(out var pointId))
+        {
+            _queuedPoints.TryRemove(pointId, out _);
+        }
+    }
+
+    private void QueuePoint(string pointId)
+    {
+        if (!_queuedPoints.TryAdd(pointId, 0)) return;
+        if (!_pendingPoints.Writer.TryWrite(pointId))
+        {
+            _queuedPoints.TryRemove(pointId, out _);
+            _snapshotRequired = true;
+        }
     }
 
     private static double DistanceMeters(double lat1, double lon1, double lat2, double lon2)

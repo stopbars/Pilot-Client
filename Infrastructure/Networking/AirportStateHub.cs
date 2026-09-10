@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -21,6 +22,7 @@ namespace BARS_Client_V2.Infrastructure.Networking;
 
 public sealed class AirportStateHub
 {
+    private const int MaxMapBytes = 16 * 1024 * 1024;
     private readonly HttpClient _httpClient;
     private readonly ILogger<AirportStateHub> _logger;
     private readonly SimulatorManager _simManager;
@@ -28,6 +30,8 @@ public sealed class AirportStateHub
     private readonly ConcurrentDictionary<string, PointState> _states = new(); // pointId -> current state
     private readonly ConcurrentDictionary<string, List<LightLayout>> _layouts = new(); // pointId -> lights
     private readonly SemaphoreSlim _mapLock = new(1, 1);
+    private readonly SemaphoreSlim _messageLock = new(1, 1);
+    private readonly object _mapStateSync = new();
     private string? _mapAirport; // airport code currently loaded
     private DateTime _lastSnapshotUtc = DateTime.MinValue;
     private readonly TimeSpan _snapshotStaleAfter = TimeSpan.FromSeconds(25); // if no snapshot / updates for this long, re-request
@@ -38,6 +42,7 @@ public sealed class AirportStateHub
     private readonly TimeSpan _snapshotRequestMinInterval = TimeSpan.FromSeconds(20);
     private volatile bool _testingMode;
     private string? _testingAirport;
+    private long _packageReloadVersion;
 
     public AirportStateHub(IHttpClientFactory httpFactory, ILogger<AirportStateHub> logger, SimulatorManager simManager)
     {
@@ -81,13 +86,14 @@ public sealed class AirportStateHub
 
     public async Task ProcessAsync(string json, CancellationToken ct = default)
     {
-        if (_testingMode)
-        {
-            return;
-        }
-
+        await _messageLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_testingMode)
+            {
+                return;
+            }
+
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object) return;
@@ -118,6 +124,10 @@ public sealed class AirportStateHub
         {
             _logger.LogDebug(ex, "AirportStateHub message parse failed");
         }
+        finally
+        {
+            _messageLock.Release();
+        }
     }
 
     /// <summary>
@@ -139,7 +149,7 @@ public sealed class AirportStateHub
         if (!root.TryGetProperty("airport", out var aProp) || aProp.ValueKind != JsonValueKind.String) return;
         var airport = aProp.GetString();
         if (string.IsNullOrWhiteSpace(airport)) return;
-        await EnsureMapLoadedAsync(airport!, ct);
+        if (!await EnsureMapLoadedAsync(airport!, ct).ConfigureAwait(false)) return;
         if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
         if (!data.TryGetProperty("objects", out var objects) || objects.ValueKind != JsonValueKind.Array) return;
         int applied = 0;
@@ -154,8 +164,12 @@ public sealed class AirportStateHub
             var ts = obj.TryGetProperty("timestamp", out var tsp) && tsp.TryGetInt64(out var lts) ? lts : 0L;
             if (!_metadata.TryGetValue(id!, out var meta))
             {
-                meta = new PointMetadata(id!, airport!, "", id!, 0, 0, null, null, null, false, false);
-                _metadata[id!] = meta;
+                _logger.LogTrace("Skipping snapshot state for unknown object {id}", id);
+                continue;
+            }
+            if (_states.TryGetValue(id!, out var current) && IsOlder(ts, current.TimestampMs))
+            {
+                continue;
             }
             var ps = new PointState(meta, on, ts);
             _states[id!] = ps;
@@ -183,7 +197,7 @@ public sealed class AirportStateHub
         if (!root.TryGetProperty("airport", out var aProp) || aProp.ValueKind != JsonValueKind.String) return;
         var airport = aProp.GetString();
         if (string.IsNullOrWhiteSpace(airport)) return;
-        await EnsureMapLoadedAsync(airport!, ct);
+        if (!await EnsureMapLoadedAsync(airport!, ct).ConfigureAwait(false)) return;
         if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
         if (!data.TryGetProperty("objects", out var objects) || objects.ValueKind != JsonValueKind.Array) return;
         int count = 0;
@@ -201,6 +215,10 @@ public sealed class AirportStateHub
             {
                 // Ignore objects not present in map to avoid spawning at (0,0). We'll request a snapshot soon if map is outdated.
                 ignoredUnknown++;
+                continue;
+            }
+            if (_states.TryGetValue(id!, out var current) && IsOlder(ts, current.TimestampMs))
+            {
                 continue;
             }
             var ps = new PointState(meta, on, ts);
@@ -236,6 +254,7 @@ public sealed class AirportStateHub
             _logger.LogTrace("Skipping update for unknown object {id}", id);
             return;
         }
+        if (_states.TryGetValue(id!, out var current) && IsOlder(ts, current.TimestampMs)) return;
         var ps = new PointState(meta, on, ts);
         _states[id!] = ps;
         _lastUpdateUtc = DateTime.UtcNow;
@@ -261,6 +280,10 @@ public sealed class AirportStateHub
                 _logger.LogTrace("Skipping update for unknown object {id}", id);
                 continue;
             }
+            if (_states.TryGetValue(id!, out var current) && IsOlder(ts, current.TimestampMs))
+            {
+                continue;
+            }
             var ps = new PointState(meta, on, ts);
             _states[id!] = ps;
             anyApplied = true;
@@ -278,19 +301,19 @@ public sealed class AirportStateHub
         }
     }
 
-    public async Task EnsureMapLoadedAsync(string airport, CancellationToken ct = default)
+    public async Task<bool> EnsureMapLoadedAsync(string airport, CancellationToken ct = default)
     {
         if (_testingMode)
         {
-            return;
+            return string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase);
         }
 
-        if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return;
+        if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return true;
         await _mapLock.WaitAsync(ct);
         try
         {
-            if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return;
-            await LoadMapInternalAsync(airport, ct);
+            if (string.Equals(_mapAirport, airport, StringComparison.OrdinalIgnoreCase)) return true;
+            return await LoadMapInternalAsync(airport, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -312,21 +335,23 @@ public sealed class AirportStateHub
 
         var normalizedAirport = airport.Trim().ToUpperInvariant();
         var document = ParseBarsXmlSecure(barsXml);
+        if (document.Root == null || document.Root.Name.LocalName != "BarsLights")
+        {
+            throw new InvalidDataException("Testing map XML did not contain a BarsLights root element.");
+        }
+        var parsedMetadata = new Dictionary<string, PointMetadata>(StringComparer.Ordinal);
+        var parsedLayouts = new Dictionary<string, List<LightLayout>>(StringComparer.Ordinal);
+        ParseMap(document, normalizedAirport, parsedMetadata, parsedLayouts);
 
         await _mapLock.WaitAsync(ct);
         try
         {
             _testingMode = true;
             _testingAirport = normalizedAirport;
-            _metadata.Clear();
-            _layouts.Clear();
-            _states.Clear();
+            CommitMap(normalizedAirport, parsedMetadata, parsedLayouts);
             _lastSnapshotUtc = DateTime.MaxValue;
             _lastUpdateUtc = DateTime.UtcNow;
             _lastSnapshotRequestUtc = DateTime.MaxValue;
-
-            ParseMap(document, normalizedAirport);
-            _mapAirport = normalizedAirport;
 
             try { MapLoaded?.Invoke(normalizedAirport); } catch { }
 
@@ -353,10 +378,13 @@ public sealed class AirportStateHub
 
             _testingMode = false;
             _testingAirport = null;
-            _mapAirport = null;
-            _metadata.Clear();
-            _layouts.Clear();
-            _states.Clear();
+            lock (_mapStateSync)
+            {
+                _mapAirport = null;
+                _metadata.Clear();
+                _layouts.Clear();
+                _states.Clear();
+            }
             _lastSnapshotUtc = DateTime.MinValue;
             _lastUpdateUtc = DateTime.MinValue;
             _lastSnapshotRequestUtc = DateTime.MinValue;
@@ -384,21 +412,31 @@ public sealed class AirportStateHub
             var runningSim = GetRunningSimulatorId();
             if (!string.Equals(runningSim, simulator, StringComparison.OrdinalIgnoreCase)) return;
 
+            var reloadVersion = Interlocked.Increment(ref _packageReloadVersion);
             _logger.LogInformation("Scenery package changed for {apt} ({sim}) -> {pkg}; reloading map", icao, simulator, newPackage);
-            await _mapLock.WaitAsync();
+            await _messageLock.WaitAsync();
             try
             {
-                // Clear current map caches and state, then load again using the new selection
-                _metadata.Clear();
-                _layouts.Clear();
-                _states.Clear();
-                _lastSnapshotUtc = DateTime.MinValue;
-                _lastUpdateUtc = DateTime.MinValue;
-                await LoadMapInternalAsync(icao, CancellationToken.None);
-                // Immediately request a fresh snapshot so clients rebuild using the new layout
-                _ = RequestSnapshotAsync(icao);
+                await _mapLock.WaitAsync();
+                try
+                {
+                    if (reloadVersion != Volatile.Read(ref _packageReloadVersion)) return;
+                    if (!string.Equals(
+                            SceneryService.Instance.GetSelectedPackage(icao, simulator),
+                            newPackage,
+                            StringComparison.Ordinal)) return;
+
+                    var loaded = await LoadMapInternalAsync(icao, CancellationToken.None, reloadVersion);
+                    if (loaded && reloadVersion == Volatile.Read(ref _packageReloadVersion))
+                    {
+                        // Package changes need a new snapshot now. The normal 20-second
+                        // throttle would otherwise leave the freshly loaded map empty.
+                        await RequestSnapshotAsync(icao, force: true);
+                    }
+                }
+                finally { _mapLock.Release(); }
             }
-            finally { _mapLock.Release(); }
+            finally { _messageLock.Release(); }
         }
         catch (Exception ex)
         {
@@ -406,7 +444,7 @@ public sealed class AirportStateHub
         }
     }
 
-    private async Task LoadMapInternalAsync(string airport, CancellationToken ct)
+    private async Task<bool> LoadMapInternalAsync(string airport, CancellationToken ct, long? reloadVersion = null)
     {
         // Determine currently selected scenery package for this airport (if any). If none selected yet, auto-select first available.
         string package = string.Empty;
@@ -427,7 +465,7 @@ public sealed class AirportStateHub
                 if (airportPackages == null || airportPackages.Count == 0)
                 {
                     _logger.LogWarning("No packages found for airport {apt} ({sim}) when attempting to auto-select; aborting map load", airport, runningSim);
-                    return;
+                    return false;
                 }
                 package = airportPackages.First();
                 SceneryService.Instance.SetSelectedPackage(airport, runningSim, package);
@@ -463,7 +501,7 @@ public sealed class AirportStateHub
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed determining package for airport {apt}", airport);
-            return;
+            return false;
         }
 
         async Task<bool> TryFetchAsync(string pkg, bool isRetry)
@@ -489,12 +527,25 @@ public sealed class AirportStateHub
                 }
                 return false;
             }
-            var xmlInner = await respInner.Content.ReadAsStringAsync(ct);
+            var xmlInner = await ReadBoundedUtf8Async(respInner.Content, MaxMapBytes, ct).ConfigureAwait(false);
             try
             {
-                var docInner = XDocument.Parse(xmlInner);
-                ParseMap(docInner, airport);
-                _mapAirport = airport;
+                var docInner = ParseBarsXmlSecure(xmlInner);
+                if (docInner.Root == null || docInner.Root.Name.LocalName != "BarsLights")
+                {
+                    _logger.LogWarning("Airport map has an invalid root apt={apt} package={pkg}", airport, pkg);
+                    return false;
+                }
+                if (reloadVersion.HasValue &&
+                    reloadVersion.Value != Volatile.Read(ref _packageReloadVersion))
+                {
+                    return false;
+                }
+
+                var parsedMetadata = new Dictionary<string, PointMetadata>(StringComparer.Ordinal);
+                var parsedLayouts = new Dictionary<string, List<LightLayout>>(StringComparer.Ordinal);
+                ParseMap(docInner, airport, parsedMetadata, parsedLayouts);
+                CommitMap(airport, parsedMetadata, parsedLayouts);
                 _lastSnapshotUtc = DateTime.MinValue; // force fresh snapshot soon
                 try { MapLoaded?.Invoke(airport); } catch { }
                 return true;
@@ -506,19 +557,19 @@ public sealed class AirportStateHub
             }
         }
 
-        await TryFetchAsync(package, false);
+        return await TryFetchAsync(package, false);
     }
 
     public string? CreateOfflineSnapshot()
     {
         string? airport;
         PointMetadata[] metas;
-        lock (_mapLock)
+        lock (_mapStateSync)
         {
             airport = _mapAirport;
+            metas = _metadata.Values.ToArray();
         }
         if (string.IsNullOrWhiteSpace(airport)) return null;
-        metas = _metadata.Values.ToArray();
         if (metas.Length == 0) return null;
 
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -612,7 +663,11 @@ public sealed class AirportStateHub
                type.IndexOf("BAR", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
-    private void ParseMap(XDocument doc, string airport)
+    private void ParseMap(
+        XDocument doc,
+        string airport,
+        IDictionary<string, PointMetadata> metadata,
+        IDictionary<string, List<LightLayout>> layouts)
     {
         var root = doc.Root;
         if (root == null || root.Name.LocalName != "BarsLights") return;
@@ -646,7 +701,7 @@ public sealed class AirportStateHub
                 newLights.Add(new LightLayout(lat, lon, hdg, lColor, stateId, offStateId));
             }
 
-            if (_layouts.TryGetValue(id!, out var existingLights))
+            if (layouts.TryGetValue(id!, out var existingLights))
             {
                 // Merge duplicate definition: append lights
                 existingLights.AddRange(newLights);
@@ -656,9 +711,9 @@ public sealed class AirportStateHub
                 {
                     var avgLat = existingLights.Average(l => l.Latitude);
                     var avgLon = existingLights.Average(l => l.Longitude);
-                    if (_metadata.TryGetValue(id!, out var existingMeta))
+                    if (metadata.TryGetValue(id!, out var existingMeta))
                     {
-                        _metadata[id!] = existingMeta with { Latitude = avgLat, Longitude = avgLon, Type = type, Orientation = orientation, Color = color };
+                        metadata[id!] = existingMeta with { Latitude = avgLat, Longitude = avgLon, Type = type, Orientation = orientation, Color = color };
                     }
                 }
                 _logger.LogDebug("Merged duplicate BarsObject id={id} totalLights={cnt}", id, existingLights.Count);
@@ -669,7 +724,7 @@ public sealed class AirportStateHub
                 uniquePointIds++;
                 if (newLights.Count > 0)
                 {
-                    _layouts[id!] = newLights;
+                    layouts[id!] = newLights;
                 }
                 double repLat = 0, repLon = 0;
                 if (newLights.Count > 0)
@@ -678,7 +733,7 @@ public sealed class AirportStateHub
                     repLon = newLights.Average(l => l.Longitude);
                 }
                 var meta = new PointMetadata(id!, airport, type, id!, repLat, repLon, null, orientation, color, false, false);
-                _metadata[id!] = meta;
+                metadata[id!] = meta;
             }
 
             lightCount += newLights.Count;
@@ -686,6 +741,25 @@ public sealed class AirportStateHub
 
         _logger.LogInformation("Parsed map {apt} BarsObjects={raw} uniquePoints={uniq} duplicatesMerged={dups} lights={lights}", airport, barsObjectElements, uniquePointIds, duplicateMerged, lightCount);
     }
+
+    private void CommitMap(
+        string airport,
+        IReadOnlyDictionary<string, PointMetadata> metadata,
+        IReadOnlyDictionary<string, List<LightLayout>> layouts)
+    {
+        lock (_mapStateSync)
+        {
+            _metadata.Clear();
+            _layouts.Clear();
+            _states.Clear();
+            foreach (var item in metadata) _metadata[item.Key] = item.Value;
+            foreach (var item in layouts) _layouts[item.Key] = item.Value;
+            _mapAirport = airport;
+        }
+    }
+
+    private static bool IsOlder(long incomingTimestamp, long currentTimestamp) =>
+        incomingTimestamp > 0 && currentTimestamp > 0 && incomingTimestamp < currentTimestamp;
 
     private static XDocument ParseBarsXmlSecure(string xml)
     {
@@ -699,6 +773,32 @@ public sealed class AirportStateHub
         using var stringReader = new System.IO.StringReader(xml);
         using var xmlReader = XmlReader.Create(stringReader, settings);
         return XDocument.Load(xmlReader, LoadOptions.None);
+    }
+
+    private static async Task<string> ReadBoundedUtf8Async(
+        HttpContent content,
+        int maxBytes,
+        CancellationToken cancellationToken)
+    {
+        if (content.Headers.ContentLength is > 0 && content.Headers.ContentLength > maxBytes)
+        {
+            throw new InvalidDataException($"Airport map exceeded the {maxBytes / (1024 * 1024)} MB safety limit.");
+        }
+
+        await using var source = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using var destination = new MemoryStream();
+        var buffer = new byte[16 * 1024];
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            if (destination.Length + read > maxBytes)
+            {
+                throw new InvalidDataException($"Airport map exceeded the {maxBytes / (1024 * 1024)} MB safety limit.");
+            }
+            destination.Write(buffer, 0, read);
+        }
+        return Encoding.UTF8.GetString(destination.GetBuffer(), 0, checked((int)destination.Length));
     }
 
     private bool TryParseLatLon(string? csv, out double lat, out double lon)
@@ -733,11 +833,11 @@ public sealed class AirportStateHub
         }
     }
 
-    private Task RequestSnapshotAsync(string airport)
+    private Task RequestSnapshotAsync(string airport, bool force = false)
     {
         if (_testingMode) return Task.CompletedTask;
         if (_requestInFlight) return Task.CompletedTask;
-        if ((DateTime.UtcNow - _lastSnapshotRequestUtc) < _snapshotRequestMinInterval) return Task.CompletedTask;
+        if (!force && (DateTime.UtcNow - _lastSnapshotRequestUtc) < _snapshotRequestMinInterval) return Task.CompletedTask;
         _requestInFlight = true;
         try
         {

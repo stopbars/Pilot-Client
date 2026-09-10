@@ -1,5 +1,4 @@
 ﻿using System;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -8,7 +7,6 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Controls;
 using BARS_Client_V2.Application; // Contains SimulatorManager; no conflict if fully qualified below
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Infrastructure.Diagnostics;
@@ -29,20 +27,19 @@ namespace BARS_Client_V2
         private IHost? _host;
         private TaskbarIcon? _taskbarIcon;
         private MainWindow? _mainWindow;
-        private ContextMenu? _trayContextMenu;
-        private MenuItem? _autoMinimizeMenuItem;
-        private MenuItem? _discordPresenceMenuItem;
         private DiscordPresenceService? _discordPresenceService;
         private bool _startupAutoMinimizeRequested;
         private MainWindowViewModel? _mainWindowViewModel;
         private bool _suppressStateChanged;
-        private bool _startupDiscordPresenceEnabled = true;
+        private SettingsWindow? _settingsWindow;
         private CancellationTokenRegistration _applicationStoppingRegistration;
         private Mutex? _singleInstanceMutex;
         private bool _ownsSingleInstanceMutex;
         private CancellationTokenSource? _singleInstancePipeCts;
         private Task? _singleInstancePipeTask;
         private string? _pendingProtocolUrl;
+        private CancellationTokenSource? _removalsUpdateCts;
+        private Task? _removalsUpdateTask;
 
         protected override void OnStartup(StartupEventArgs e)
         {
@@ -81,6 +78,7 @@ namespace BARS_Client_V2
                         sp.GetRequiredService<Infrastructure.Simulators.XPlane.XPlaneSimulatorConnector>());
                     services.AddSingleton<IAirportRepository, Infrastructure.Networking.HttpAirportRepository>();
                     services.AddSingleton<ISettingsStore, Infrastructure.Settings.JsonSettingsStore>();
+                    services.AddSingleton<LightDrawDistanceSettings>();
                     services.AddSingleton<RemovalsUpdateService>();
                     services.AddSingleton<SimulatorManager>();
                     services.AddHostedService(sp => sp.GetRequiredService<SimulatorManager>()); // background stream
@@ -98,7 +96,8 @@ namespace BARS_Client_V2
                         var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>>();
                         var hub = sp.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
                         var simManager = sp.GetRequiredService<SimulatorManager>();
-                        return new BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController(connectors, logger, hub, simManager, null);
+                        return new BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController(
+                            connectors, logger, hub, simManager, null, sp.GetRequiredService<LightDrawDistanceSettings>());
                     });
                     services.AddHostedService(sp => sp.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>());
                     services.AddSingleton<BARS_Client_V2.Infrastructure.Simulators.XPlane.XPlanePointController>();
@@ -130,38 +129,22 @@ namespace BARS_Client_V2
             var vm = _host.Services.GetRequiredService<MainWindowViewModel>();
             StartupTrace.Write("MainWindowViewModel resolved");
             _discordPresenceService = _host.Services.GetRequiredService<DiscordPresenceService>();
-            _startupDiscordPresenceEnabled = _discordPresenceService.IsEnabled;
             ClientSettings startupSettings;
-            HashSet<string>? removalsUpdatedSims = null;
             try
             {
                 StartupTrace.Write("Preloading client settings");
                 var settingsStore = _host.Services.GetRequiredService<ISettingsStore>();
                 startupSettings = settingsStore.LoadAsync().ConfigureAwait(false).GetAwaiter().GetResult();
-
-                StartupTrace.Write("Checking for removals updates");
-                try
-                {
-                    var removalsService = _host.Services.GetRequiredService<RemovalsUpdateService>();
-                    var removalsResult = removalsService.CheckAndUpdateRemovalsAsync(startupSettings)
-                        .ConfigureAwait(false).GetAwaiter().GetResult();
-                    startupSettings = removalsResult.Settings;
-                    removalsUpdatedSims = removalsResult.UpdatedSimulators;
-                    StartupTrace.Write($"Removals update check complete, updated sims: {string.Join(", ", removalsUpdatedSims)}");
-                }
-                catch (Exception removalsEx)
-                {
-                    StartupTrace.Write($"Removals update check failed: {removalsEx.Message}");
-                }
             }
             catch (Exception ex)
             {
                 StartupTrace.Write($"Preloading client settings failed: {ex.Message}");
                 startupSettings = ClientSettings.Empty;
             }
-            vm.SeedSettings(startupSettings, removalsUpdatedSims);
+            _discordPresenceService.SetEnabled(startupSettings.DiscordPresenceEnabled);
+            _host.Services.GetRequiredService<LightDrawDistanceSettings>().SetMeters(startupSettings.LightDrawDistanceMeters);
+            vm.SeedSettings(startupSettings);
             _mainWindowViewModel = vm;
-            _mainWindowViewModel.PropertyChanged += MainWindowViewModelOnPropertyChanged;
             _startupAutoMinimizeRequested = startupSettings.AutoMinimizeOnStart;
             mainWindow.DataContext = vm;
             StartupTrace.Write("Resolving AirportWebSocketManager");
@@ -173,9 +156,17 @@ namespace BARS_Client_V2
             wsMgr.AttachHub(hub);
             wsMgr.Connected += () => vm.NotifyServerConnected();
             wsMgr.ConnectionError += code => vm.NotifyServerError(code);
-            wsMgr.MessageReceived += msg => { vm.NotifyServerMessage(); _ = hub.ProcessAsync(msg); };
+            wsMgr.MessageReceived += msg =>
+            {
+                vm.NotifyServerMessage();
+                return hub.ProcessAsync(msg);
+            };
             var pointController = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>();
-            wsMgr.OfflineSnapshotReceived += snapshot => { vm.NotifyOfflineSnapshot(); _ = hub.ProcessAsync(snapshot); };
+            wsMgr.OfflineSnapshotReceived += snapshot =>
+            {
+                vm.NotifyOfflineSnapshot();
+                return hub.ProcessAsync(snapshot);
+            };
             wsMgr.OfflineModeChanged += offline =>
             {
                 vm.NotifyServerOfflineMode(offline);
@@ -219,8 +210,6 @@ namespace BARS_Client_V2
             StartupTrace.Write("Event wiring complete");
 
             ConfigureTaskbarIcon(mainWindow);
-            UpdateAutoMinimizeMenuItem(_startupAutoMinimizeRequested);
-            UpdateDiscordPresenceMenuItem(_startupDiscordPresenceEnabled);
 
             _mainWindow = mainWindow;
             MainWindow = mainWindow;
@@ -244,6 +233,11 @@ namespace BARS_Client_V2
 
             mainWindow.Show();
             StartupTrace.Write("MainWindow shown");
+            _removalsUpdateCts = new CancellationTokenSource();
+            _removalsUpdateTask = CheckRemovalsInBackgroundAsync(
+                startupSettings,
+                vm,
+                _removalsUpdateCts.Token);
 
             if (_startupAutoMinimizeRequested)
             {
@@ -278,9 +272,103 @@ namespace BARS_Client_V2
             _pendingProtocolUrl = null;
         }
 
+        private async Task CheckRemovalsInBackgroundAsync(
+            ClientSettings startupSettings,
+            MainWindowViewModel viewModel,
+            CancellationToken cancellationToken)
+        {
+            var reconcilePending = false;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    StartupTrace.Write("Checking for removals updates in background");
+                    var service = _host?.Services.GetRequiredService<RemovalsUpdateService>();
+                    if (service == null) return;
+                    RemovalsUpdateService.RemovalsUpdateResult result;
+                    await RemovalFileAccess.MsfsTransactionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        result = await service.CheckAndUpdateRemovalsAsync(startupSettings, cancellationToken)
+                            .ConfigureAwait(false);
+                        viewModel.ApplyRemovalsUpdateResult(result);
+                        reconcilePending |= result.UpdatedSimulators.Count > 0;
+                        if (!cancellationToken.IsCancellationRequested &&
+                            reconcilePending)
+                        {
+                            try
+                            {
+                                var settingsStore = _host?.Services.GetRequiredService<ISettingsStore>();
+                                if (settingsStore != null)
+                                {
+                                    await SceneryService.Instance.SyncMsfsRemovalStatesFromSettingsAsync(
+                                        settingsStore,
+                                        cancellationToken).ConfigureAwait(false);
+                                    reconcilePending = false;
+                                }
+                            }
+                            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                            {
+                                throw;
+                            }
+                            catch (Exception syncError)
+                            {
+                                StartupTrace.Write($"Post-update removals reconciliation failed: {syncError.Message}");
+                                throw;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        RemovalFileAccess.MsfsTransactionGate.Release();
+                    }
+                    if (!cancellationToken.IsCancellationRequested)
+                    {
+                        viewModel.SetRemovalsUpdateError(result.FailedSimulators.Count == 0 ? null :
+                            $"Could not update removals for {string.Join(", ", result.FailedSimulators.Select(sim => sim == "msfs2024" ? "MSFS 2024" : "MSFS 2020"))}. Leave BARS open to retry automatically.");
+                    }
+                    StartupTrace.Write($"Removals update check complete, updated sims: {string.Join(", ", result.UpdatedSimulators)}");
+                    if (result.FailedSimulators.Count == 0) return;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    StartupTrace.Write("Removals update check cancelled");
+                    return;
+                }
+                catch (RemovalPackageInstaller.RecoveryException ex)
+                {
+                    StartupTrace.Write(ex.ToString());
+                    viewModel.SetRemovalsUpdateError("Removal update recovery failed. Close the simulator and contact BARS support with startup.log.");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    StartupTrace.Write($"Removals update check failed: {ex.Message}");
+                    viewModel.SetRemovalsUpdateError("Could not update removals. Leave BARS open to retry automatically.");
+                }
+                StartupTrace.Write("Retrying removals update in 30 seconds");
+                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         protected override async void OnExit(ExitEventArgs e)
         {
             StartupTrace.Write("OnExit begin");
+            if (_mainWindowViewModel != null)
+            {
+                try { await _mainWindowViewModel.PrepareForShutdownAsync(); }
+                catch (Exception ex) { StartupTrace.Write($"Active-mode shutdown cleanup failed: {ex.Message}"); }
+            }
+            _removalsUpdateCts?.Cancel();
+            if (_removalsUpdateTask != null)
+            {
+                try { await _removalsUpdateTask; }
+                catch (OperationCanceledException) { }
+                catch (Exception ex) { StartupTrace.Write($"Removals update shutdown error: {ex.Message}"); }
+            }
+            _removalsUpdateCts?.Dispose();
+            _removalsUpdateCts = null;
+            _removalsUpdateTask = null;
             if (_mainWindow != null)
             {
                 _mainWindow.StateChanged -= MainWindowOnStateChanged;
@@ -288,15 +376,8 @@ namespace BARS_Client_V2
             }
             if (_mainWindowViewModel != null)
             {
-                _mainWindowViewModel.PropertyChanged -= MainWindowViewModelOnPropertyChanged;
                 _mainWindowViewModel = null;
             }
-            if (_trayContextMenu != null)
-            {
-                _trayContextMenu.Opened -= TrayContextMenuOnOpened;
-                _trayContextMenu = null;
-            }
-            _autoMinimizeMenuItem = null;
             if (_host != null)
             {
                 try
@@ -620,13 +701,6 @@ namespace BARS_Client_V2
                 _taskbarIcon.ToolTipText = string.IsNullOrWhiteSpace(mainWindow.Title)
                     ? "BARS Client"
                     : mainWindow.Title;
-                if (_taskbarIcon.ContextMenu is ContextMenu menu)
-                {
-                    _trayContextMenu = menu;
-                    _trayContextMenu.Opened += TrayContextMenuOnOpened;
-                    _autoMinimizeMenuItem = FindAutoMinimizeMenuItem(menu);
-                    _discordPresenceMenuItem = FindDiscordPresenceMenuItem(menu);
-                }
                 StartupTrace.Write("Taskbar icon prepared");
             }
             else
@@ -687,67 +761,6 @@ namespace BARS_Client_V2
             }
         }
 
-        private void TrayContextMenuOnOpened(object? sender, RoutedEventArgs e)
-        {
-            var isChecked = _mainWindowViewModel?.AutoMinimizeOnStart ?? false;
-            UpdateAutoMinimizeMenuItem(isChecked);
-            var discordEnabled = _discordPresenceService?.IsEnabled ?? _startupDiscordPresenceEnabled;
-            UpdateDiscordPresenceMenuItem(discordEnabled);
-        }
-
-        private static MenuItem? FindAutoMinimizeMenuItem(ContextMenu menu) =>
-            menu.Items.OfType<MenuItem>().FirstOrDefault(item =>
-                item.Tag is string tag && string.Equals(tag, "AutoMinimizeToggle", StringComparison.Ordinal));
-
-        private static MenuItem? FindDiscordPresenceMenuItem(ContextMenu menu) =>
-            menu.Items.OfType<MenuItem>().FirstOrDefault(item =>
-                item.Tag is string tag && string.Equals(tag, "DiscordPresenceToggle", StringComparison.Ordinal));
-
-        private void UpdateAutoMinimizeMenuItem(bool isChecked)
-        {
-            if (_autoMinimizeMenuItem != null)
-            {
-                _autoMinimizeMenuItem.IsChecked = isChecked;
-            }
-        }
-
-        private void UpdateDiscordPresenceMenuItem(bool isChecked)
-        {
-            if (_discordPresenceMenuItem != null)
-            {
-                _discordPresenceMenuItem.IsChecked = isChecked;
-            }
-        }
-
-        private void MainWindowViewModelOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
-        {
-            if (!string.Equals(e.PropertyName, nameof(MainWindowViewModel.AutoMinimizeOnStart), StringComparison.Ordinal) || _mainWindowViewModel == null)
-            {
-                return;
-            }
-
-            void Apply() => UpdateAutoMinimizeMenuItem(_mainWindowViewModel.AutoMinimizeOnStart);
-
-            if (Dispatcher?.CheckAccess() == true)
-            {
-                Apply();
-            }
-            else
-            {
-                Dispatcher?.Invoke(Apply);
-            }
-        }
-
-        private void TaskbarIcon_AutoMinimizeMenuItem_OnClick(object? sender, RoutedEventArgs e)
-        {
-            if (_mainWindowViewModel == null || sender is not MenuItem menuItem)
-            {
-                return;
-            }
-
-            _mainWindowViewModel.AutoMinimizeOnStart = menuItem.IsChecked;
-        }
-
         private void TaskbarIcon_OnTrayLeftMouseUp(object? sender, RoutedEventArgs e)
         {
             RestoreMainWindowFromTray();
@@ -758,23 +771,38 @@ namespace BARS_Client_V2
             RestoreMainWindowFromTray();
         }
 
-        private void TaskbarIcon_DiscordPresenceMenuItem_OnClick(object? sender, RoutedEventArgs e)
+        internal void OpenSettings()
         {
-            if (sender is not MenuItem menuItem)
+            if (_settingsWindow != null)
+            {
+                _settingsWindow.Activate();
+                return;
+            }
+            if (_mainWindow == null || _mainWindowViewModel == null || _discordPresenceService == null)
             {
                 return;
             }
 
-            var requestedState = menuItem.IsChecked;
-            if (_discordPresenceService == null)
+            RestoreMainWindowFromTray();
+            var window = new SettingsWindow(_mainWindowViewModel, _discordPresenceService,
+                _host!.Services.GetRequiredService<LightDrawDistanceSettings>())
             {
-                _startupDiscordPresenceEnabled = requestedState;
-                UpdateDiscordPresenceMenuItem(requestedState);
-                return;
+                Owner = _mainWindow
+            };
+            _settingsWindow = window;
+            try
+            {
+                window.ShowDialog();
             }
+            finally
+            {
+                _settingsWindow = null;
+            }
+        }
 
-            _discordPresenceService.SetEnabled(requestedState);
-            UpdateDiscordPresenceMenuItem(_discordPresenceService.IsEnabled);
+        private void TaskbarIcon_SettingsMenuItem_OnClick(object? sender, RoutedEventArgs e)
+        {
+            OpenSettings();
         }
 
         private void TaskbarIcon_ExitMenuItem_OnClick(object? sender, RoutedEventArgs e)
@@ -790,12 +818,6 @@ namespace BARS_Client_V2
             }
 
             HideTrayIcon();
-            if (_trayContextMenu != null)
-            {
-                _trayContextMenu.Opened -= TrayContextMenuOnOpened;
-                _trayContextMenu = null;
-            }
-            _autoMinimizeMenuItem = null;
             _taskbarIcon.Dispose();
             _taskbarIcon = null;
         }

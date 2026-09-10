@@ -19,7 +19,7 @@ internal static class StartupTrace
         {
             if (File.Exists(LogPath))
             {
-                File.Delete(LogPath);
+                File.Move(LogPath, LogPath + ".previous", overwrite: true);
             }
         });
     }

@@ -16,6 +16,7 @@ using BARS_Client_V2.Services;
 using BARS_Client_V2.Infrastructure.Diagnostics;
 using BARS_Client_V2.Infrastructure.Networking;
 using BARS_Client_V2.Infrastructure.Simulators.Msfs;
+using BARS_Client_V2.Infrastructure.Simulators.XPlane;
 
 namespace BARS_Client_V2.Presentation.ViewModels;
 
@@ -64,6 +65,10 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private bool _xplaneRemovalSyncFailed;
     private int _xplaneRemovalRetryAttempt;
     private DateTime _xplaneRemovalRetryNotBeforeUtc;
+    private readonly Dictionary<string, SemaphoreSlim> _removalChangeGates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _removalChangeVersions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _pendingMsfsRemovalBaselines = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _externalMsfsRestartSims = new(StringComparer.OrdinalIgnoreCase);
     private const int ApiTokenLength = 69;
 
     public ObservableCollection<AirportRowViewModel> Airports { get; } = new();
@@ -132,7 +137,29 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     public string OnGroundText => OnGround ? "On Ground" : "Airborne";
     public string SimulatorName { get => _simulatorName; set { if (value != _simulatorName) { _simulatorName = value; OnPropertyChanged(); } } }
-    public bool SimulatorConnected { get => _simConnected; set { if (value != _simConnected) { _simConnected = value; if (!value) { _msfsNeedsRestartSim = null; if (_debugModeActive) DebugModeActive = false; } OnPropertyChanged(); OnPropertyChanged(nameof(SimulatorConnectionText)); OnPropertyChanged(nameof(SimulatorStatusColor)); OnPropertyChanged(nameof(MsfsNeedsRestartVisibility)); OnPropertyChanged(nameof(MsfsNeedsRestartText)); } } }
+    public bool SimulatorConnected
+    {
+        get => _simConnected;
+        set
+        {
+            if (value == _simConnected) return;
+            _simConnected = value;
+            if (!value && _debugModeActive)
+            {
+                _pointController?.ToggleDebugMode();
+            }
+            if (value)
+            {
+                var runningSimulator = GetRunningMsfsSim();
+                if (runningSimulator != null) RefreshMsfsRestartBanner(runningSimulator);
+            }
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(SimulatorConnectionText));
+            OnPropertyChanged(nameof(SimulatorStatusColor));
+            OnPropertyChanged(nameof(MsfsNeedsRestartVisibility));
+            OnPropertyChanged(nameof(MsfsNeedsRestartText));
+        }
+    }
     public string SimulatorConnectionText => SimulatorConnected ? "Connected" : "Disconnected";
     public string SimulatorStatusColor => SimulatorConnected ? "LimeGreen" : "Gray";
     public bool ServerConnected
@@ -243,14 +270,23 @@ public class MainWindowViewModel : INotifyPropertyChanged
     /// <summary>
     /// Visibility of the MSFS restart banner.
     /// </summary>
-    public string MsfsNeedsRestartVisibility => !string.IsNullOrEmpty(_msfsNeedsRestartSim) ? "Visible" : "Collapsed";
+    private string? _removalsUpdateError;
+    public void SetRemovalsUpdateError(string? message) => RunOnDispatcher(() =>
+    {
+        _removalsUpdateError = message;
+        OnPropertyChanged(nameof(MsfsNeedsRestartVisibility));
+        OnPropertyChanged(nameof(MsfsNeedsRestartText));
+        OnPropertyChanged(nameof(XPlaneNeedsRestartVisibility));
+    });
+
+    public string MsfsNeedsRestartVisibility => !string.IsNullOrEmpty(_removalsUpdateError) || !string.IsNullOrEmpty(_msfsNeedsRestartSim) ? "Visible" : "Collapsed";
 
     /// <summary>
     /// Text for the MSFS restart banner.
     /// </summary>
-    public string MsfsNeedsRestartText => string.IsNullOrEmpty(_msfsNeedsRestartSim)
+    public string MsfsNeedsRestartText => _removalsUpdateError ?? (string.IsNullOrEmpty(_msfsNeedsRestartSim)
         ? string.Empty
-        : $"Restart {(_msfsNeedsRestartSim == "msfs2024" ? "MSFS 2024" : "MSFS 2020")} for removal changes to apply";
+        : $"Restart {(_msfsNeedsRestartSim == "msfs2024" ? "MSFS 2024" : "MSFS 2020")} for removal changes to apply");
 
     private void SetMsfsNeedsRestart(string simulator)
     {
@@ -262,7 +298,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         }
     }
 
-    public string XPlaneNeedsRestartVisibility => _xplaneNeedsRestart ? "Visible" : "Collapsed";
+    public string XPlaneNeedsRestartVisibility => _xplaneNeedsRestart && _removalsUpdateError == null ? "Visible" : "Collapsed";
     public string XPlaneRestartText => _xplaneRemovalSyncFailed
         ? "BARS could not apply X-Plane removal changes. Retry now or leave BARS open to retry automatically."
         : "Close X-Plane, wait for BARS to apply removal changes, then restart it";
@@ -477,6 +513,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             var runningSim = GetRunningMsfsSim();
             if (runningSim != null && _removalsUpdatedSims.Contains(runningSim))
             {
+                _externalMsfsRestartSims.Add(runningSim);
                 SetMsfsNeedsRestart(runningSim);
             }
             _removalsUpdatedSims = null;
@@ -488,6 +525,25 @@ public class MainWindowViewModel : INotifyPropertyChanged
         await DiscoverXPlanePackageSelectionsAsync();
         _ = SyncRemovalStatesOnStartupAsync();
         StartupTrace.Write("InitializeAsync completed initial search");
+    }
+
+    public void ApplyRemovalsUpdateResult(RemovalsUpdateService.RemovalsUpdateResult result)
+    {
+        RunOnDispatcher(() =>
+        {
+            _msfs2020RemovalsEtag = result.Settings.Msfs2020RemovalsEtag;
+            _msfs2024RemovalsEtag = result.Settings.Msfs2024RemovalsEtag;
+            foreach (var simulator in result.UpdatedSimulators)
+            {
+                if (!simulator.Equals("xplane", StringComparison.OrdinalIgnoreCase))
+                {
+                    _externalMsfsRestartSims.Add(simulator);
+                }
+            }
+
+            var runningSimulator = GetRunningMsfsSim();
+            if (runningSimulator != null) RefreshMsfsRestartBanner(runningSimulator);
+        });
     }
 
     private IDictionary<string, string> _savedPackages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -802,30 +858,68 @@ public class MainWindowViewModel : INotifyPropertyChanged
         if (e.PropertyName == nameof(AirportRowViewModel.SelectedPackage) && row.SelectedPackage != null)
         {
             var key = $"{row.ICAO}:{configuredSim}";
+            var changeVersion = BeginRemovalChange(key);
+            var changeGate = GetRemovalChangeGate(key);
             var hadPreviousPackage = _savedPackages.TryGetValue(key, out var previousPackageName);
             var previousSelection = hadPreviousPackage
                 ? row.SceneryPackages.FirstOrDefault(package =>
                     string.Equals(package.Name, previousPackageName, StringComparison.Ordinal))
                 : null;
             var newPackageName = row.SelectedPackage.Name;
-            var removalApplied = false;
+            var newToggleKey = $"{row.ICAO}:{configuredSim}:{newPackageName}";
+            var newRemovalEnabled = !_savedRemovalToggles.TryGetValue(newToggleKey, out var savedToggle) || savedToggle;
+            var previousToggleKey = $"{row.ICAO}:{configuredSim}:{previousPackageName}";
+            var previousRemovalEnabled = hadPreviousPackage &&
+                (!_savedRemovalToggles.TryGetValue(previousToggleKey, out var previousToggle) || previousToggle);
+            var baselineCreated = TrackMsfsRemovalBaselineBeforeChange(key, configuredSim);
+            var removalStarted = false;
 
+            _suppressSelectionNotifications = true;
+            try { row.SceneryRemovalEnabled = newRemovalEnabled; }
+            finally { _suppressSelectionNotifications = false; }
+
+            await changeGate.WaitAsync();
+            var msfsTransactionHeld = false;
             try
             {
-                if (row.SceneryRemovalAvailable && row.SceneryRemovalEnabled)
+                if (!configuredSim.Equals("xplane", StringComparison.OrdinalIgnoreCase))
                 {
-                    var changed = await SceneryService.Instance.ApplySceneryRemovalAsync(
+                    await RemovalFileAccess.MsfsTransactionGate.WaitAsync();
+                    msfsTransactionHeld = true;
+                }
+                if (!IsLatestRemovalChange(key, changeVersion))
+                {
+                    return;
+                }
+
+                var changed = false;
+                if (row.SceneryRemovalAvailable)
+                {
+                    removalStarted = true;
+                    changed = await SceneryService.Instance.ApplySceneryRemovalAsync(
                         row.ICAO,
                         configuredSim,
                         newPackageName,
-                        true);
-                    removalApplied = true;
-                    await HandleAppliedRemovalChangeAsync(configuredSim, changed);
+                        newRemovalEnabled);
+                }
+
+                if (!IsLatestRemovalChange(key, changeVersion))
+                {
+                    if (removalStarted)
+                    {
+                        await TryRestoreRemovalStateAsync(
+                            row.ICAO,
+                            configuredSim,
+                            hadPreviousPackage ? previousPackageName! : newPackageName,
+                            hadPreviousPackage && previousRemovalEnabled);
+                    }
+                    return;
                 }
 
                 _savedPackages[key] = newPackageName;
                 SceneryService.Instance.SetSelectedPackage(row.ICAO, configuredSim, newPackageName);
                 await PersistSettingsAsync();
+                UpdateRestartStateAfterRemovalChange(key, configuredSim, changed, baselineCreated);
                 StartupTrace.Write($"PersistSettingsAsync after selection {row.ICAO}");
             }
             catch (Exception ex)
@@ -839,64 +933,231 @@ public class MainWindowViewModel : INotifyPropertyChanged
                     _savedPackages.Remove(key);
                 }
 
-                if (removalApplied)
+                if (removalStarted)
                 {
-                    try
-                    {
-                        var previousToggleKey = $"{row.ICAO}:{configuredSim}:{previousPackageName}";
-                        var previousEnabled = hadPreviousPackage &&
-                            (!_savedRemovalToggles.TryGetValue(previousToggleKey, out var saved) || saved);
-                        await SceneryService.Instance.ApplySceneryRemovalAsync(
-                            row.ICAO,
-                            configuredSim,
-                            previousPackageName ?? string.Empty,
-                            previousEnabled);
-                    }
-                    catch (Exception rollbackError)
-                    {
-                        StartupTrace.Write($"Package selection rollback failed for {row.ICAO}: {rollbackError}");
-                    }
+                    await TryRestoreRemovalStateAsync(
+                        row.ICAO,
+                        configuredSim,
+                        hadPreviousPackage ? previousPackageName! : newPackageName,
+                        hadPreviousPackage && previousRemovalEnabled);
                 }
 
-                if (hadPreviousPackage)
+                if (!IsLatestRemovalChange(key, changeVersion))
                 {
-                    SceneryService.Instance.SetSelectedPackage(row.ICAO, configuredSim, previousPackageName!);
+                    return;
                 }
+
+                TryRestoreSelectedPackage(
+                    row.ICAO,
+                    configuredSim,
+                    hadPreviousPackage ? previousPackageName! : string.Empty);
                 _suppressSelectionNotifications = true;
                 try { row.SelectedPackage = previousSelection; }
                 finally { _suppressSelectionNotifications = false; }
+                CancelMsfsRemovalBaseline(key, configuredSim, baselineCreated);
+                UpdateRestartStateAfterRemovalChange(key, configuredSim, changed: false, baselineCreated: false);
                 ReportRemovalError(row.ICAO, ex);
+            }
+            finally
+            {
+                if (msfsTransactionHeld) RemovalFileAccess.MsfsTransactionGate.Release();
+                changeGate.Release();
             }
         }
         else if (e.PropertyName == nameof(AirportRowViewModel.SceneryRemovalEnabled))
         {
             if (!row.SceneryRemovalAvailable) return;
             var packageName = row.SelectedPackage?.Name ?? string.Empty;
+            var key = $"{row.ICAO}:{configuredSim}";
+            var changeVersion = BeginRemovalChange(key);
+            var changeGate = GetRemovalChangeGate(key);
             var toggleKey = $"{row.ICAO}:{configuredSim}:{packageName}";
             var previousEnabled = !_savedRemovalToggles.TryGetValue(toggleKey, out var previousSaved) || previousSaved;
-            _savedRemovalToggles[toggleKey] = row.SceneryRemovalEnabled;
+            var requestedEnabled = row.SceneryRemovalEnabled;
+            var baselineCreated = TrackMsfsRemovalBaselineBeforeChange(key, configuredSim);
 
+            await changeGate.WaitAsync();
+            var msfsTransactionHeld = false;
             try
             {
+                if (!configuredSim.Equals("xplane", StringComparison.OrdinalIgnoreCase))
+                {
+                    await RemovalFileAccess.MsfsTransactionGate.WaitAsync();
+                    msfsTransactionHeld = true;
+                }
+                if (!IsLatestRemovalChange(key, changeVersion))
+                {
+                    return;
+                }
+
                 var changed = await SceneryService.Instance.ApplySceneryRemovalAsync(
                     row.ICAO,
                     configuredSim,
                     packageName,
-                    row.SceneryRemovalEnabled);
-                await HandleAppliedRemovalChangeAsync(configuredSim, changed);
+                    requestedEnabled);
+
+                if (!IsLatestRemovalChange(key, changeVersion))
+                {
+                    await TryRestoreRemovalStateAsync(
+                        row.ICAO,
+                        configuredSim,
+                        packageName,
+                        previousEnabled);
+                    return;
+                }
+
+                _savedRemovalToggles[toggleKey] = requestedEnabled;
+                await PersistSettingsAsync();
+                UpdateRestartStateAfterRemovalChange(key, configuredSim, changed, baselineCreated);
+                StartupTrace.Write($"PersistSettingsAsync after toggle {row.ICAO}");
             }
             catch (Exception ex)
             {
+                await TryRestoreRemovalStateAsync(
+                    row.ICAO,
+                    configuredSim,
+                    packageName,
+                    previousEnabled);
+
+                if (!IsLatestRemovalChange(key, changeVersion))
+                {
+                    return;
+                }
+
                 _savedRemovalToggles[toggleKey] = previousEnabled;
                 _suppressSelectionNotifications = true;
                 try { row.SceneryRemovalEnabled = previousEnabled; }
                 finally { _suppressSelectionNotifications = false; }
+                CancelMsfsRemovalBaseline(key, configuredSim, baselineCreated);
+                UpdateRestartStateAfterRemovalChange(key, configuredSim, changed: false, baselineCreated: false);
                 ReportRemovalError(row.ICAO, ex);
             }
-
-            try { await PersistSettingsAsync(); StartupTrace.Write($"PersistSettingsAsync after toggle {row.ICAO}"); }
-            catch (Exception ex) { LogLines.Add(ex.Message); StartupTrace.Write($"PersistSettingsAsync error: {ex.Message}"); }
+            finally
+            {
+                if (msfsTransactionHeld) RemovalFileAccess.MsfsTransactionGate.Release();
+                changeGate.Release();
+            }
         }
+    }
+
+    private int BeginRemovalChange(string key)
+    {
+        var next = _removalChangeVersions.TryGetValue(key, out var current) ? current + 1 : 1;
+        _removalChangeVersions[key] = next;
+        return next;
+    }
+
+    private static async Task TryRestoreRemovalStateAsync(
+        string icao,
+        string simulator,
+        string packageName,
+        bool enabled)
+    {
+        try
+        {
+            await SceneryService.Instance.ApplySceneryRemovalAsync(
+                icao,
+                simulator,
+                packageName,
+                enabled);
+        }
+        catch (Exception rollbackError)
+        {
+            StartupTrace.Write($"Removal rollback failed for {icao}: {rollbackError}");
+        }
+    }
+
+    private static void TryRestoreSelectedPackage(string icao, string simulator, string packageName)
+    {
+        try
+        {
+            SceneryService.Instance.SetSelectedPackage(icao, simulator, packageName);
+        }
+        catch (Exception rollbackError)
+        {
+            // Keep the original operation error user-visible. A failed settings
+            // rollback is logged as additional recovery context instead of
+            // escaping this async UI event handler.
+            StartupTrace.Write($"Package selection settings rollback failed for {icao}: {rollbackError}");
+        }
+    }
+
+    private bool IsLatestRemovalChange(string key, int version) =>
+        _removalChangeVersions.TryGetValue(key, out var current) && current == version;
+
+    private SemaphoreSlim GetRemovalChangeGate(string key)
+    {
+        if (!_removalChangeGates.TryGetValue(key, out var gate))
+        {
+            gate = new SemaphoreSlim(1, 1);
+            _removalChangeGates[key] = gate;
+        }
+        return gate;
+    }
+
+    private bool TrackMsfsRemovalBaselineBeforeChange(string key, string simulator)
+    {
+        if (simulator.Equals("xplane", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(GetRunningMsfsSim(), simulator, StringComparison.OrdinalIgnoreCase) ||
+            _pendingMsfsRemovalBaselines.ContainsKey(key))
+        {
+            return false;
+        }
+
+        _pendingMsfsRemovalBaselines[key] = GetEffectiveRemovalSelection(key);
+        return true;
+    }
+
+    private string GetEffectiveRemovalSelection(string key)
+    {
+        if (!_savedPackages.TryGetValue(key, out var packageName) || string.IsNullOrWhiteSpace(packageName))
+        {
+            return string.Empty;
+        }
+
+        var toggleKey = $"{key}:{packageName}";
+        var enabled = !_savedRemovalToggles.TryGetValue(toggleKey, out var saved) || saved;
+        return enabled ? packageName : string.Empty;
+    }
+
+    private void UpdateRestartStateAfterRemovalChange(string key, string simulator, bool changed, bool baselineCreated)
+    {
+        if (simulator.Equals("xplane", StringComparison.OrdinalIgnoreCase))
+        {
+            if (changed) ShowXPlaneRestartAlert();
+            return;
+        }
+
+        if (!_pendingMsfsRemovalBaselines.TryGetValue(key, out var baseline))
+        {
+            return;
+        }
+
+        if ((baselineCreated && !changed) ||
+            string.Equals(baseline, GetEffectiveRemovalSelection(key), StringComparison.Ordinal))
+        {
+            _pendingMsfsRemovalBaselines.Remove(key);
+        }
+
+        RefreshMsfsRestartBanner(simulator);
+    }
+
+    private void CancelMsfsRemovalBaseline(string key, string simulator, bool baselineCreated)
+    {
+        if (baselineCreated)
+        {
+            _pendingMsfsRemovalBaselines.Remove(key);
+            RefreshMsfsRestartBanner(simulator);
+        }
+    }
+
+    private void RefreshMsfsRestartBanner(string simulator)
+    {
+        var suffix = $":{simulator}";
+        var hasUiChanges = _pendingMsfsRemovalBaselines.Keys.Any(key =>
+            key.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+        var shouldShow = _externalMsfsRestartSims.Contains(simulator) || hasUiChanges;
+        SetMsfsNeedsRestart(shouldShow ? simulator : string.Empty);
     }
 
     private async Task SyncRemovalStatesOnStartupAsync()
@@ -908,7 +1169,11 @@ public class MainWindowViewModel : INotifyPropertyChanged
             var runningSim = GetRunningMsfsSim();
             if (runningSim != null && changedSimulators.Contains(runningSim))
             {
-                RunOnDispatcher(() => SetMsfsNeedsRestart(runningSim));
+                RunOnDispatcher(() =>
+                {
+                    _externalMsfsRestartSims.Add(runningSim);
+                    SetMsfsNeedsRestart(runningSim);
+                });
             }
             if (changedSimulators.Contains("xplane"))
             {
@@ -924,29 +1189,6 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 LogLines.Add(Status);
             });
         }
-    }
-
-    private Task HandleAppliedRemovalChangeAsync(string simulator, bool changed)
-    {
-        if (!changed)
-        {
-            return Task.CompletedTask;
-        }
-
-        if (simulator.Equals("xplane", StringComparison.OrdinalIgnoreCase))
-        {
-            ShowXPlaneRestartAlert();
-            return Task.CompletedTask;
-        }
-
-        var runningSim = GetRunningMsfsSim();
-        if (runningSim != null &&
-            string.Equals(runningSim, simulator, StringComparison.OrdinalIgnoreCase))
-        {
-            SetMsfsNeedsRestart(runningSim);
-        }
-
-        return Task.CompletedTask;
     }
 
     private void ShowXPlaneRestartAlert()
@@ -1248,7 +1490,41 @@ public class MainWindowViewModel : INotifyPropertyChanged
         if (_testingModeActive && _stateHub != null)
         {
             Status = "Ending Testing Mode...";
+            var testingAirport = _stateHub.TestingAirport;
             await _stateHub.EndTestingModeAsync();
+            if (!string.IsNullOrWhiteSpace(testingAirport) &&
+                SceneryService.Instance.CurrentSimulator.Equals("xplane", StringComparison.OrdinalIgnoreCase))
+            {
+                if (IsXPlaneRunning())
+                {
+                    _xplaneRemovalSyncPending = true;
+                    _xplaneRemovalSyncFailed = false;
+                    ShowXPlaneRestartAlert();
+                }
+                else
+                {
+                    try
+                    {
+                        var packageKey = $"{testingAirport}:xplane";
+                        var hasPackage = _savedPackages.TryGetValue(packageKey, out var selectedPackage) &&
+                            !string.IsNullOrWhiteSpace(selectedPackage);
+                        var toggleKey = $"{packageKey}:{selectedPackage}";
+                        var enabled = hasPackage &&
+                            (!_savedRemovalToggles.TryGetValue(toggleKey, out var savedToggle) || savedToggle);
+                        await SceneryService.Instance.ApplySceneryRemovalAsync(
+                            testingAirport,
+                            "xplane",
+                            selectedPackage ?? string.Empty,
+                            enabled);
+                    }
+                    catch (Exception ex)
+                    {
+                        _xplaneRemovalSyncPending = true;
+                        _xplaneRemovalSyncFailed = true;
+                        LogLines.Add($"Could not restore X-Plane removals after testing: {ex.Message}");
+                    }
+                }
+            }
             return;
         }
 
@@ -1370,12 +1646,26 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
         if (!string.IsNullOrEmpty(_msfsNeedsRestartSim) && !IsMsfsRunning())
         {
+            _externalMsfsRestartSims.Clear();
+            _pendingMsfsRemovalBaselines.Clear();
             SetMsfsNeedsRestart(string.Empty);
         }
 
         if (_xplaneRemovalSyncPending && !IsXPlaneRunning())
         {
             await ApplyPendingXPlaneRemovalChangesAsync();
+        }
+    }
+
+    public async Task PrepareForShutdownAsync()
+    {
+        if (_testingModeActive)
+        {
+            await EndActiveModeAsync();
+        }
+        else if (_debugModeActive)
+        {
+            _pointController?.ToggleDebugMode();
         }
     }
 
@@ -1394,6 +1684,26 @@ public class MainWindowViewModel : INotifyPropertyChanged
         }
     }
 
+    public async Task SavePreferencesAsync(bool autoMinimizeOnStart, bool discordPresenceEnabled, int lightDrawDistanceMeters)
+    {
+        await _settingsSaveGate.WaitAsync();
+        try
+        {
+            await _settingsStore.UpdateAsync(current => current with
+            {
+                AutoMinimizeOnStart = autoMinimizeOnStart,
+                DiscordPresenceEnabled = discordPresenceEnabled,
+                LightDrawDistanceMeters = LightDrawDistanceSettings.Normalize(lightDrawDistanceMeters)
+            });
+            _autoMinimizeOnStart = autoMinimizeOnStart;
+            OnPropertyChanged(nameof(AutoMinimizeOnStart));
+        }
+        finally
+        {
+            _settingsSaveGate.Release();
+        }
+    }
+
     private async Task PersistSettingsAsync()
     {
         StartupTrace.Write("PersistSettingsAsync begin");
@@ -1402,7 +1712,15 @@ public class MainWindowViewModel : INotifyPropertyChanged
         {
             var copy = new Dictionary<string, string>(_savedPackages, StringComparer.OrdinalIgnoreCase);
             var togglesCopy = new Dictionary<string, bool>(_savedRemovalToggles, StringComparer.OrdinalIgnoreCase);
-            await _settingsStore.SaveAsync(new ClientSettings(ApiToken, copy, togglesCopy, _autoMinimizeOnStart, _msfs2020RemovalsEtag, _msfs2024RemovalsEtag));
+            var updated = await _settingsStore.UpdateAsync(current => current with
+            {
+                ApiToken = ApiToken,
+                AirportPackages = copy,
+                SceneryRemovalToggles = togglesCopy,
+                AutoMinimizeOnStart = _autoMinimizeOnStart
+            });
+            _msfs2020RemovalsEtag = updated.Msfs2020RemovalsEtag;
+            _msfs2024RemovalsEtag = updated.Msfs2024RemovalsEtag;
             StartupTrace.Write("PersistSettingsAsync save complete");
         }
         finally
@@ -1426,22 +1744,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private static bool IsMsfsRunning() => GetRunningMsfsSim() != null;
 
-    private static bool IsXPlaneRunning()
-    {
-        try
-        {
-            var processes = Process.GetProcessesByName("X-Plane");
-            try { return processes.Length > 0; }
-            finally
-            {
-                foreach (var process in processes) process.Dispose();
-            }
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    private static bool IsXPlaneRunning() => XPlaneLocalRemovalsService.IsXPlaneProcessRunning();
 
     /// <summary>
     /// Returns the identifier of the currently running MSFS simulator, or null if none is running.
@@ -1451,10 +1754,25 @@ public class MainWindowViewModel : INotifyPropertyChanged
     {
         try
         {
-            if (Process.GetProcessesByName("FlightSimulator2024").Length > 0)
-                return "msfs2024";
-            if (Process.GetProcessesByName("FlightSimulator").Length > 0)
-                return "msfs2020";
+            var msfs2024Processes = Process.GetProcessesByName("FlightSimulator2024");
+            try
+            {
+                if (msfs2024Processes.Length > 0) return "msfs2024";
+            }
+            finally
+            {
+                foreach (var process in msfs2024Processes) process.Dispose();
+            }
+
+            var msfs2020Processes = Process.GetProcessesByName("FlightSimulator");
+            try
+            {
+                if (msfs2020Processes.Length > 0) return "msfs2020";
+            }
+            finally
+            {
+                foreach (var process in msfs2020Processes) process.Dispose();
+            }
             return null;
         }
         catch

@@ -45,6 +45,9 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
     private readonly SimulatorManager _simManager;
     private readonly ISimulatorConnector _connector;
     private readonly MsfsPointControllerOptions _options;
+    private readonly LightDrawDistanceSettings? _drawDistance;
+    private double _visibilityRadiusMeters;
+    private double RequestedVisibilityRadiusMeters => _drawDistance?.Meters ?? _options.VisibilityRadiusMeters;
     private static readonly FieldInfo? MsfsConnectorClientField = typeof(MsfsSimulatorConnector)
         .GetField("_client", BindingFlags.NonPublic | BindingFlags.Instance);
 
@@ -53,11 +56,13 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
     private readonly ConcurrentDictionary<string, IReadOnlyList<AirportStateHub.LightLayout>> _layoutCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _updateVersions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, AlternatingTransition> _alternatingTransitions = new(StringComparer.Ordinal);
-    private readonly Channel<string> _pendingUpdates = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
+    private readonly ConcurrentDictionary<string, byte> _queuedUpdates = new(StringComparer.Ordinal);
+    private readonly Channel<string> _pendingUpdates = Channel.CreateBounded<string>(new BoundedChannelOptions(8192)
     {
         AllowSynchronousContinuations = false,
         SingleReader = true,
-        SingleWriter = false
+        SingleWriter = false,
+        FullMode = BoundedChannelFullMode.Wait
     });
 
     private readonly object _visibilityLock = new();
@@ -78,6 +83,9 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
     private (double Lat, double Lon)? _lastCenter;
     private volatile bool _suspended;
     private volatile string? _currentAirportIcao;
+    private volatile bool _mapResetInProgress;
+    private long _mapGeneration;
+    private int _queueOverflowed;
 
     // Debug mode fields
     private static readonly int[] DebugStateSequence = { 0, 1, 2, 3, 4, 5, 6, 7, 20, 21, 22, 23, 24, 25, 26, 27 };
@@ -102,12 +110,15 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
                                ILogger<MsfsPointController> logger,
                                AirportStateHub hub,
                                SimulatorManager simManager,
-                               MsfsPointControllerOptions? options = null)
+                               MsfsPointControllerOptions? options = null,
+                               LightDrawDistanceSettings? drawDistance = null)
     {
         _logger = logger;
         _hub = hub;
         _simManager = simManager;
         _options = options ?? new MsfsPointControllerOptions();
+        _drawDistance = drawDistance;
+        _visibilityRadiusMeters = RequestedVisibilityRadiusMeters;
         _connector = connectors.FirstOrDefault(c => c.SimulatorId.Equals("MSFS", StringComparison.OrdinalIgnoreCase))
                      ?? connectors.First();
 
@@ -376,20 +387,20 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MsfsPointController (distance-based) started radius={radius}m", _options.VisibilityRadiusMeters);
+        _logger.LogInformation("MsfsPointController (distance-based) started radius={radius}m", RequestedVisibilityRadiusMeters);
         var workset = new HashSet<string>(StringComparer.Ordinal);
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                if (_suspended)
+                if (_suspended || _mapResetInProgress)
                 {
                     await Task.Delay(_options.IdleDelayMs, stoppingToken);
                     continue;
                 }
 
-                if (!_connector.IsConnected || !IsObjectManagerReady())
+                if (_simManager.ActiveConnector != _connector || !_connector.IsConnected || !IsObjectManagerReady())
                 {
                     await Task.Delay(_options.DisconnectedDelayMs, stoppingToken);
                     continue;
@@ -412,12 +423,14 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
 
                 var center = (Lat: flight.Latitude, Lon: flight.Longitude);
                 var geoCenter = new GeoReference(center.Lat, center.Lon);
-                if (ShouldReevaluateVisibility(center))
-                {
-                    ApplyVisibilityChanges(geoCenter, workset);
-                }
+                RefreshVisibility(center, workset);
 
                 QueueVisibilityRechecks(workset);
+
+                if (Interlocked.Exchange(ref _queueOverflowed, 0) != 0)
+                {
+                    foreach (var pointId in _serverStates.Keys) workset.Add(pointId);
+                }
 
                 DrainPendingUpdates(workset);
 
@@ -430,11 +443,12 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
                 OrderWorksetByDistance(workset, geoCenter, _orderedWorkset);
                 foreach (var pointId in _orderedWorkset)
                 {
+                    if (RequestedVisibilityRadiusMeters != _visibilityRadiusMeters) break;
                     await SyncPointAsync(pointId, geoCenter, stoppingToken);
                 }
 
                 _orderedWorkset.Clear();
-                workset.Clear();
+                if (RequestedVisibilityRadiusMeters == _visibilityRadiusMeters) workset.Clear();
             }
             catch (OperationCanceledException)
             {
@@ -452,15 +466,19 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
     {
         while (_pendingUpdates.Reader.TryRead(out var id))
         {
+            _queuedUpdates.TryRemove(id, out _);
             workset.Add(id);
         }
     }
 
     private void QueuePointSync(string pointId)
     {
+        if (_suspended || _simManager.ActiveConnector != _connector) return;
+        if (!_queuedUpdates.TryAdd(pointId, 0)) return;
         if (!_pendingUpdates.Writer.TryWrite(pointId))
         {
-            _ = _pendingUpdates.Writer.WriteAsync(pointId);
+            _queuedUpdates.TryRemove(pointId, out _);
+            Interlocked.Exchange(ref _queueOverflowed, 1);
         }
     }
 
@@ -476,6 +494,12 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
 
     private bool AbortIfSuperseded(string pointId, long versionToken)
     {
+        if (RequestedVisibilityRadiusMeters != _visibilityRadiusMeters)
+        {
+            QueuePointSync(pointId);
+            return true;
+        }
+
         if (!_updateVersions.TryGetValue(pointId, out var latest) || latest <= versionToken)
         {
             return false;
@@ -500,7 +524,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
 
         var pool = ArrayPool<WorkItem>.Shared;
         var buffer = pool.Rent(workset.Count);
-        var radius = _options.VisibilityRadiusMeters;
+        var radius = _visibilityRadiusMeters;
         var length = 0;
 
         try
@@ -542,6 +566,17 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
         return double.MaxValue;
     }
 
+    private void RefreshVisibility((double Lat, double Lon) center, HashSet<string> workset)
+    {
+        var requestedRadius = RequestedVisibilityRadiusMeters;
+        var distanceChanged = requestedRadius != _visibilityRadiusMeters;
+        _visibilityRadiusMeters = requestedRadius;
+        if (ShouldReevaluateVisibility(center) || distanceChanged)
+        {
+            ApplyVisibilityChanges(new GeoReference(center.Lat, center.Lon), workset, distanceChanged);
+        }
+    }
+
     private bool ShouldReevaluateVisibility((double Lat, double Lon) center)
     {
         if (!_lastCenter.HasValue)
@@ -560,10 +595,15 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
         return false;
     }
 
-    private void ApplyVisibilityChanges(in GeoReference center, HashSet<string> workset)
+    private void ApplyVisibilityChanges(in GeoReference center, HashSet<string> workset, bool distanceChanged = false)
     {
-        var entryRadius = _options.VisibilityRadiusMeters;
-        var exitRadius = entryRadius + _options.VisibilityHysteresisMeters;
+        var entryRadius = _visibilityRadiusMeters;
+        // A settings change uses the exact new boundary; movement keeps its existing hysteresis.
+        var exitRadius = entryRadius + (distanceChanged ? 0 : _options.VisibilityHysteresisMeters);
+        if (distanceChanged)
+        {
+            foreach (var pointId in _spawnedPoints.Keys) workset.Add(pointId);
+        }
         var staleIds = _staleVisibilityIds;
         staleIds.Clear();
 
@@ -793,7 +833,8 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
             return layout.OffStateId.Value;
         }
 
-        return 0;
+        // Keep the elevated fixture visible when the map omits its off state.
+        return layout.StateId is 6 or 7 ? 7 : 0;
     }
 
     private bool ResolveAlternatingTargetState(string pointId, bool finalIsOn, int slotIndex)
@@ -815,6 +856,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
 
     private void ScheduleTransitionFinalize(string pointId, DateTime phaseTwoUtc)
     {
+        var mapGeneration = Volatile.Read(ref _mapGeneration);
         _ = Task.Run(async () =>
         {
             var delay = phaseTwoUtc - DateTime.UtcNow;
@@ -824,7 +866,8 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
                 catch { return; }
             }
 
-            if (_alternatingTransitions.TryGetValue(pointId, out var transition) &&
+            if (mapGeneration == Volatile.Read(ref _mapGeneration) &&
+                _alternatingTransitions.TryGetValue(pointId, out var transition) &&
                 transition.PhaseTwoUtc <= DateTime.UtcNow)
             {
                 QueuePointSync(pointId);
@@ -895,7 +938,7 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
             return null;
         }
 
-        if (_options.VisibilityRadiusMeters <= 0)
+        if (_visibilityRadiusMeters <= 0)
         {
             return null;
         }
@@ -985,12 +1028,12 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
     private bool IsWithinRadius(string pointId, PointState state, GeoReference center)
     {
         var dist = DistanceMeters(center, state.Metadata.Latitude, state.Metadata.Longitude);
-        if (dist <= _options.VisibilityRadiusMeters)
+        if (dist <= _visibilityRadiusMeters)
         {
             return true;
         }
 
-        var exitRadius = _options.VisibilityRadiusMeters + _options.VisibilityHysteresisMeters;
+        var exitRadius = _visibilityRadiusMeters + _options.VisibilityHysteresisMeters;
         lock (_visibilityLock)
         {
             if (_visiblePointIds.Contains(pointId) && dist <= exitRadius)
@@ -1052,6 +1095,8 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
 
     private async void OnMapLoaded(string airport)
     {
+        var mapGeneration = Interlocked.Increment(ref _mapGeneration);
+        _mapResetInProgress = true;
         try
         {
             _currentAirportIcao = airport?.Trim().ToUpperInvariant();
@@ -1061,6 +1106,10 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
                 _visiblePointIds.Clear();
             }
             _serverStates.Clear();
+            _alternatingTransitions.Clear();
+            _updateVersions.Clear();
+            _queuedUpdates.Clear();
+            while (_pendingUpdates.Reader.TryRead(out _)) { }
             _nextVisibilitySweepUtc = DateTime.MinValue;
             Volatile.Write(ref _cachedManager, null);
             await DespawnAllAsync();
@@ -1068,6 +1117,13 @@ public sealed class MsfsPointController : BackgroundService, IPointStateListener
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "[MapReload] Failed to reset controller for {apt}", airport);
+        }
+        finally
+        {
+            if (mapGeneration == Volatile.Read(ref _mapGeneration))
+            {
+                _mapResetInProgress = false;
+            }
         }
     }
 

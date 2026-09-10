@@ -21,6 +21,14 @@ public partial class MainWindow : Window
         InputBindings.Add(debugModeBinding);
     }
 
+    private void SettingsButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (System.Windows.Application.Current is App app)
+        {
+            app.OpenSettings();
+        }
+    }
+
     private static string GetAppVersion()
     {
         var assembly = Assembly.GetExecutingAssembly();

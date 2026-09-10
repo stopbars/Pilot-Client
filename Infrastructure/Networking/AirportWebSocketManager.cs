@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
@@ -17,6 +18,8 @@ internal sealed class AirportWebSocketManager : BackgroundService
     private readonly ISettingsStore _settingsStore;
     private readonly ILogger<AirportWebSocketManager> _logger;
     private readonly object _sync = new();
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
+    private readonly SemaphoreSlim _disconnectGate = new(1, 1);
 
     private ClientWebSocket? _ws;
     private string? _connectedAirport;
@@ -29,21 +32,23 @@ internal sealed class AirportWebSocketManager : BackgroundService
     private string? _tokenUsedForConnection;
     private string? _desiredAirport;
     private int _consecutiveForbiddenFailures;
+    private long _connectionVersion;
     private bool _offlineMode;
     private Task? _offlineSnapshotTask;
     private const int ForbiddenThresholdForOffline = 3;
     private AirportStateHub? _stateHub;
     private static readonly TimeSpan OfflineReconnectInterval = TimeSpan.FromSeconds(45);
+    private const int MaxMessageBytes = 16 * 1024 * 1024;
 
     public string? ConnectedAirport { get { lock (_sync) return _connectedAirport; } }
     public bool IsConnected { get { lock (_sync) return _ws?.State == WebSocketState.Open; } }
     public bool IsOfflineMode { get { lock (_sync) return _offlineMode; } }
-    public event Action<string>? MessageReceived;
+    public event Func<string, Task>? MessageReceived;
     public event Action? Connected;
     public event Action<int>? ConnectionError; // status code (e.g. 401, 403)
     public event Action<string>? Disconnected; // reason
     public event Action<bool>? OfflineModeChanged;
-    public event Action<string>? OfflineSnapshotReceived;
+    public event Func<string, Task>? OfflineSnapshotReceived;
 
     public AirportWebSocketManager(
         SimulatorManager simManager,
@@ -62,7 +67,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
         hub.OutboundPacketRequested += (airport, rawJson) =>
         {
             if (hub.IsTestingMode) return;
-            try { _ = SendRawAsync(rawJson); } catch { }
+            _ = SendRawSafelyAsync(rawJson);
         };
         hub.TestingModeChanged += e =>
         {
@@ -186,6 +191,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
     private async Task ConnectAsync(string icao, string token, CancellationToken ct)
     {
         await DisconnectAsync("Processing");
+        var connectionVersion = Interlocked.Increment(ref _connectionVersion);
         var uri = new Uri($"wss://v2.stopbars.com/connect?airport={icao.ToUpperInvariant()}&key={token}");
         var ws = new ClientWebSocket();
         try
@@ -199,14 +205,26 @@ internal sealed class AirportWebSocketManager : BackgroundService
                 _nextConnectAttemptUtc = DateTime.UtcNow + TimeSpan.FromSeconds(10); // generic backoff
                 return;
             }
+            var receiveCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var connectionWasSuperseded = false;
             lock (_sync)
             {
-                _ws = ws;
-                _connectedAirport = icao;
-                _receiveCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                _receiveLoopTask = Task.Run(() => ReceiveLoopAsync(_receiveCts.Token));
-                _tokenUsedForConnection = token;
-                _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_receiveCts.Token));
+                connectionWasSuperseded = connectionVersion != Volatile.Read(ref _connectionVersion);
+                if (!connectionWasSuperseded)
+                {
+                    _ws = ws;
+                    _connectedAirport = icao;
+                    _receiveCts = receiveCts;
+                    _receiveLoopTask = Task.Run(() => ReceiveLoopAsync(receiveCts.Token));
+                    _tokenUsedForConnection = token;
+                    _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(ws, receiveCts.Token));
+                }
+            }
+            if (connectionWasSuperseded)
+            {
+                receiveCts.Dispose();
+                ws.Dispose();
+                return;
             }
             _logger.LogInformation("Airport WebSocket connected for {icao}", icao);
             _nextConnectAttemptUtc = DateTime.MinValue; // reset on success
@@ -368,7 +386,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
                 }
             }
 
-            try { OfflineSnapshotReceived?.Invoke(snapshot); } catch { }
+            await InvokeMessageHandlersAsync(OfflineSnapshotReceived, snapshot).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -425,7 +443,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
         {
             while (!ct.IsCancellationRequested && localWs.State == WebSocketState.Open)
             {
-                var sb = new StringBuilder();
+                using var messageBuffer = new MemoryStream();
                 WebSocketReceiveResult? result;
                 do
                 {
@@ -433,19 +451,26 @@ internal sealed class AirportWebSocketManager : BackgroundService
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
                         _logger.LogInformation("Airport WebSocket closed by server: {status} {desc}", result.CloseStatus, result.CloseStatusDescription);
-                        await DisconnectAsync("Server closed");
+                        await DisconnectAsync("Server closed", localWs).ConfigureAwait(false);
                         return;
                     }
                     if (result.MessageType == WebSocketMessageType.Text)
                     {
-                        sb.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+                        if (messageBuffer.Length + result.Count > MaxMessageBytes)
+                        {
+                            throw new WebSocketException("Airport WebSocket message exceeded the safety limit.");
+                        }
+                        messageBuffer.Write(buffer, 0, result.Count);
                     }
                 } while (!result.EndOfMessage);
 
-                if (sb.Length > 0)
+                if (messageBuffer.Length > 0)
                 {
-                    var msg = sb.ToString();
-                    try { MessageReceived?.Invoke(msg); } catch { }
+                    var msg = Encoding.UTF8.GetString(
+                        messageBuffer.GetBuffer(),
+                        0,
+                        checked((int)messageBuffer.Length));
+                    await InvokeMessageHandlersAsync(MessageReceived, msg).ConfigureAwait(false);
                 }
             }
         }
@@ -460,81 +485,158 @@ internal sealed class AirportWebSocketManager : BackgroundService
         }
         finally
         {
-            await DisconnectAsync("Receive loop ended");
+            await DisconnectAsync("Receive loop ended", localWs).ConfigureAwait(false);
         }
     }
 
-    private Task SendRawAsync(string raw)
+    private async Task SendRawAsync(string raw)
     {
-        ClientWebSocket? ws;
-        lock (_sync) ws = _ws;
-        if (ws == null || ws.State != WebSocketState.Open) return Task.CompletedTask;
-        var payload = System.Text.Encoding.UTF8.GetBytes(raw);
-        return ws.SendAsync(payload, WebSocketMessageType.Text, true, CancellationToken.None);
-    }
-
-    private async Task DisconnectAsync(string reason)
-    {
-        ClientWebSocket? ws;
-        CancellationTokenSource? rcts;
-        lock (_sync)
+        await _sendGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            ws = _ws;
-            rcts = _receiveCts;
-            _ws = null;
-            _receiveCts = null;
-            _receiveLoopTask = null;
-            _heartbeatTask = null;
-            if (_connectedAirport != null)
-            {
-                _logger.LogInformation("Disconnecting airport WebSocket ({airport}) - {reason}", _connectedAirport, reason);
-            }
-            _connectedAirport = null;
-            _tokenUsedForConnection = null;
+            ClientWebSocket? ws;
+            lock (_sync) ws = _ws;
+            if (ws == null || ws.State != WebSocketState.Open) return;
+            var payload = Encoding.UTF8.GetBytes(raw);
+            using var sendCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await ws.SendAsync(payload, WebSocketMessageType.Text, true, sendCts.Token)
+                .ConfigureAwait(false);
         }
-        try { rcts?.Cancel(); } catch { }
-        if (ws != null)
+        finally
+        {
+            _sendGate.Release();
+        }
+    }
+
+    private async Task SendRawSafelyAsync(string raw)
+    {
+        try
+        {
+            await SendRawAsync(raw).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Airport WebSocket send failed");
+        }
+    }
+
+    private async Task DisconnectAsync(string reason, ClientWebSocket? expectedSocket = null)
+    {
+        await _disconnectGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            ClientWebSocket? ws;
+            CancellationTokenSource? rcts;
+            bool hadConnection;
+            lock (_sync)
+            {
+                if (expectedSocket != null && !ReferenceEquals(_ws, expectedSocket))
+                {
+                    return;
+                }
+
+                Interlocked.Increment(ref _connectionVersion);
+
+                ws = _ws;
+                rcts = _receiveCts;
+                hadConnection = ws != null || _connectedAirport != null;
+                _ws = null;
+                _receiveCts = null;
+                _receiveLoopTask = null;
+                _heartbeatTask = null;
+                if (_connectedAirport != null)
+                {
+                    _logger.LogInformation("Disconnecting airport WebSocket ({airport}) - {reason}", _connectedAirport, reason);
+                }
+                _connectedAirport = null;
+                _tokenUsedForConnection = null;
+            }
+            try { rcts?.Cancel(); } catch { }
+            if (ws != null)
+            {
+                await _sendGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseReceived)
+                    {
+                        try
+                        {
+                            var payload = Encoding.UTF8.GetBytes("{ \"type\": \"CLOSE\" }");
+                            using var sendCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                            await ws.SendAsync(payload, WebSocketMessageType.Text, true, sendCts.Token)
+                                .ConfigureAwait(false);
+                        }
+                        catch { }
+                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                        await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, reason, cts.Token)
+                            .ConfigureAwait(false);
+                    }
+                }
+                catch { }
+                finally
+                {
+                    _sendGate.Release();
+                    ws.Dispose();
+                }
+            }
+            rcts?.Dispose();
+            if (hadConnection)
+            {
+                try { Disconnected?.Invoke(reason); } catch { }
+            }
+        }
+        finally
+        {
+            _disconnectGate.Release();
+        }
+    }
+
+    private async Task InvokeMessageHandlersAsync(Func<string, Task>? handlers, string message)
+    {
+        if (handlers == null) return;
+        foreach (Func<string, Task> handler in handlers.GetInvocationList())
         {
             try
             {
-                if (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseReceived)
-                {
-                    // Attempt to send CLOSE message before closing websocket
-                    try
-                    {
-                        var payload = Encoding.UTF8.GetBytes("{ \"type\": \"CLOSE\" }");
-                        using var sendCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                        await ws.SendAsync(payload, WebSocketMessageType.Text, true, sendCts.Token);
-                    }
-                    catch { }
-                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, reason, cts.Token);
-                }
+                await handler(message).ConfigureAwait(false);
             }
-            catch { }
-            finally { ws.Dispose(); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Airport message handler failed");
+            }
         }
-        try { Disconnected?.Invoke(reason); } catch { }
     }
 
-    private async Task HeartbeatLoopAsync(CancellationToken ct)
+    private async Task HeartbeatLoopAsync(ClientWebSocket expectedSocket, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             try { await Task.Delay(TimeSpan.FromSeconds(60), ct); } catch { break; }
             if (ct.IsCancellationRequested) break;
-            ClientWebSocket? ws;
-            lock (_sync) ws = _ws;
-            if (ws == null || ws.State != WebSocketState.Open) continue;
+            await _sendGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                lock (_sync)
+                {
+                    if (!ReferenceEquals(_ws, expectedSocket) || expectedSocket.State != WebSocketState.Open)
+                    {
+                        return;
+                    }
+                }
                 var hb = Encoding.UTF8.GetBytes("{ \"type\": \"HEARTBEAT\" }");
-                using var sendCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                await ws.SendAsync(hb, WebSocketMessageType.Text, true, sendCts.Token);
+                using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                sendCts.CancelAfter(TimeSpan.FromSeconds(5));
+                await expectedSocket.SendAsync(hb, WebSocketMessageType.Text, true, sendCts.Token)
+                    .ConfigureAwait(false);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Heartbeat send failed");
+            }
+            finally
+            {
+                _sendGate.Release();
             }
         }
     }
