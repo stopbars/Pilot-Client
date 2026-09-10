@@ -341,6 +341,10 @@ MigrationBackup/
 FodyWeavers.xsd
 
 # Custom additions for this project
+# Local development tests and diagnostics
+/Tests/
+/.diagnostics/
+
 *.user
 debug.log
 *.dll.config
