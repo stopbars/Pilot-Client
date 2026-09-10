@@ -32,6 +32,7 @@ internal sealed class DiscordPresenceService : BackgroundService
     private string? _lastLargeText;
     private string _serverStatus = "Disconnected";
     private DateTime _lastSendUtc = DateTime.MinValue;
+    private DateTime _lastAttemptUtc = DateTime.MinValue;
     private bool _forceUpdate;
     private volatile bool _isEnabled = true;
     private bool _presenceCleared;
@@ -186,22 +187,13 @@ internal sealed class DiscordPresenceService : BackgroundService
         {
             force = _forceUpdate;
             changed = force || details != _lastDetails || state != _lastState || smallKey != _lastSmallKey || smallText != _lastSmallText || largeText != _lastLargeText;
-            if (changed)
-            {
-                _lastDetails = details;
-                _lastState = state;
-                _lastSmallKey = smallKey;
-                _lastSmallText = smallText;
-                _lastLargeText = largeText;
-                _forceUpdate = false;
-            }
         }
 
         var now = DateTime.UtcNow;
         if (!changed && (now - _lastSendUtc) < TimeSpan.FromMinutes(5)) return; // periodic keepalive every 5 min
-        if (!force && (now - _lastSendUtc) < MinUpdateInterval) return;
+        if (!force && (now - _lastAttemptUtc) < MinUpdateInterval) return;
 
-        _lastSendUtc = now;
+        _lastAttemptUtc = now;
 
         try
         {
@@ -224,6 +216,16 @@ internal sealed class DiscordPresenceService : BackgroundService
                 }
             };
             client.SetPresence(presence);
+            lock (_stateLock)
+            {
+                _lastDetails = details;
+                _lastState = state;
+                _lastSmallKey = smallKey;
+                _lastSmallText = smallText;
+                _lastLargeText = largeText;
+                _forceUpdate = false;
+                _lastSendUtc = now;
+            }
             _logger.LogDebug("Discord presence updated: details='{details}', state='{state}', smallKey='{smallKey}'", details, state, smallKey);
         }
         catch (Exception ex)
@@ -249,6 +251,7 @@ internal sealed class DiscordPresenceService : BackgroundService
             _lastSmallText = null;
             _lastLargeText = null;
             _lastSendUtc = DateTime.MinValue;
+            _lastAttemptUtc = DateTime.MinValue;
             _forceUpdate = false;
             shouldClear = true;
         }
@@ -286,6 +289,7 @@ internal sealed class DiscordPresenceService : BackgroundService
             _isEnabled = enabled;
             _forceUpdate = true;
             _lastSendUtc = DateTime.MinValue;
+            _lastAttemptUtc = DateTime.MinValue;
             stateChanged = true;
 
             if (enabled)

@@ -12,7 +12,7 @@ using BARS_Client_V2.Services;
 
 namespace BARS_Client_V2.Infrastructure.Networking;
 
-// Fetches approved contributions once and caches them. Filters by simulator locally.
+// Fetches approved contributions and caches them briefly. Filters by simulator locally.
 internal sealed class HttpAirportRepository : IAirportRepository
 {
     private readonly IHttpClientFactory _httpClientFactory;
@@ -21,6 +21,8 @@ internal sealed class HttpAirportRepository : IAirportRepository
     private IReadOnlyList<ApprovedContributionMetadata>? _cachedContributions;
     private Dictionary<string, string>? _cachedAirportNames;
     private readonly SemaphoreSlim _cacheLock = new(1, 1);
+    private DateTime _cacheLoadedUtc = DateTime.MinValue;
+    private static readonly TimeSpan CacheFreshness = TimeSpan.FromMinutes(5);
 
     public HttpAirportRepository(IHttpClientFactory httpClientFactory)
     {
@@ -33,27 +35,38 @@ internal sealed class HttpAirportRepository : IAirportRepository
     }
 
     /// <summary>
-    /// Ensures contributions are fetched and cached. Only fetches from API once.
+    /// Ensures contributions and airport names are available as one complete cache entry.
     /// </summary>
     private async Task EnsureCacheLoadedAsync(CancellationToken ct)
     {
-        if (_cachedContributions != null) return;
+        if (IsCacheFresh()) return;
 
         await _cacheLock.WaitAsync(ct);
         try
         {
-            if (_cachedContributions != null) return; // Double-check after acquiring lock
+            if (IsCacheFresh()) return;
 
-            var client = _httpClientFactory.CreateClient();
-            _cachedContributions = await ApprovedContributionsCache
-                .GetAsync(client, cancellationToken: ct)
-                .ConfigureAwait(false);
+            try
+            {
+                var client = _httpClientFactory.CreateClient();
+                var contributions = await ApprovedContributionsCache
+                    .GetAsync(client, cancellationToken: ct)
+                    .ConfigureAwait(false);
 
-            // Pre-fetch airport names for all contributions
-            var allIcaos = _cachedContributions
-                .Select(c => c.AirportIcao.Trim().ToUpperInvariant())
-                .Distinct(StringComparer.OrdinalIgnoreCase);
-            _cachedAirportNames = await FetchAirportNamesAsync(client, allIcaos, ct);
+                var allIcaos = contributions
+                    .Select(c => c.AirportIcao.Trim().ToUpperInvariant())
+                    .Distinct(StringComparer.OrdinalIgnoreCase);
+                var airportNames = await FetchAirportNamesAsync(client, allIcaos, ct);
+
+                // Publish both values only after the complete refresh succeeds.
+                _cachedAirportNames = airportNames;
+                _cachedContributions = contributions;
+                _cacheLoadedUtc = DateTime.UtcNow;
+            }
+            catch when (!ct.IsCancellationRequested && _cachedContributions != null && _cachedAirportNames != null)
+            {
+                // Keep the last complete cache entry. A later request will retry.
+            }
         }
         finally
         {
@@ -63,7 +76,7 @@ internal sealed class HttpAirportRepository : IAirportRepository
 
     public async Task<(IReadOnlyList<Airport> Items, int TotalCount)> SearchAsync(string? search, int page, int pageSize, CancellationToken ct = default)
     {
-        // Ensure data is cached (fetched only once)
+        // Ensure a recent complete cache entry is available.
         await EnsureCacheLoadedAsync(ct);
 
         // Get the configured simulator from SceneryService to filter packages (UI toggle selection)
@@ -90,6 +103,11 @@ internal sealed class HttpAirportRepository : IAirportRepository
         return (items, total);
     }
 
+    private bool IsCacheFresh() =>
+        _cachedContributions != null &&
+        _cachedAirportNames != null &&
+        DateTime.UtcNow - _cacheLoadedUtc < CacheFreshness;
+
     public async Task<IReadOnlyList<Airport>> GetAllForSimulatorAsync(
         string simulator,
         CancellationToken ct = default)
@@ -105,7 +123,9 @@ internal sealed class HttpAirportRepository : IAirportRepository
         var normalizedSimulator = simulator.Trim().ToLowerInvariant();
 
         // Group by airport -> collect distinct package names for the requested simulator only.
-        var grouped = _cachedContributions!
+        var contributions = _cachedContributions ?? Array.Empty<ApprovedContributionMetadata>();
+        var airportNames = _cachedAirportNames ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var grouped = contributions
             .Where(c =>
             {
                 // Default to "msfs2020" if simulator is null or empty (matches SceneryService behavior)
@@ -131,7 +151,7 @@ internal sealed class HttpAirportRepository : IAirportRepository
         return grouped
             .Select(g =>
             {
-                _cachedAirportNames!.TryGetValue(g.ICAO, out var name);
+                airportNames.TryGetValue(g.ICAO, out var name);
                 return new Airport(g.ICAO, name, g.Packages);
             })
             .ToList();
@@ -169,16 +189,13 @@ internal sealed class HttpAirportRepository : IAirportRepository
 
             using var req = new HttpRequestMessage(HttpMethod.Get, $"https://v2.stopbars.com/airports?icao={payload}");
             using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-            if (!resp.IsSuccessStatusCode)
-            {
-                continue;
-            }
+            resp.EnsureSuccessStatusCode();
 
             await using var stream = await resp.Content.ReadAsStreamAsync(ct);
             var data = await JsonSerializer.DeserializeAsync<Dictionary<string, AirportMetadataDto>>(stream, _jsonOptions, ct);
             if (data == null)
             {
-                continue;
+                throw new InvalidOperationException("The airport metadata response was invalid.");
             }
 
             foreach (var entry in data)

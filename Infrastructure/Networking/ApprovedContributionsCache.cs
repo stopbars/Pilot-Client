@@ -77,7 +77,7 @@ internal static class ApprovedContributionsCache
             _lastSuccessfulFetchUtc = DateTime.UtcNow;
             return _lastKnownGood;
         }
-        catch when (_lastKnownGood != null)
+        catch when (!cancellationToken.IsCancellationRequested && _lastKnownGood != null)
         {
             return _lastKnownGood;
         }
