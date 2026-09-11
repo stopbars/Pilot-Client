@@ -19,8 +19,8 @@ namespace BARS_Client_V2.Services;
 /// </summary>
 public sealed class RemovalsUpdateService
 {
-    private const string Msfs2020RemovalsUrl = "https://dev-cdn.stopbars.com/packages/bars-removals-2020.zip";
-    private const string Msfs2024RemovalsUrl = "https://dev-cdn.stopbars.com/packages/bars-removals-2024.zip";
+    private const string Msfs2020RemovalsUrl = "https://cdn.stopbars.com/packages/bars-removals-2020.zip";
+    private const string Msfs2024RemovalsUrl = "https://cdn.stopbars.com/packages/bars-removals-2024.zip";
     private const string RemovalsFolderName = "bars-removals";
     private const string InstallerSettingsFilename = "settings.json";
     private static readonly Random CacheBusterRandom = new();

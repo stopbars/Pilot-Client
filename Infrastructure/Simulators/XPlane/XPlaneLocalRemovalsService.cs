@@ -469,7 +469,7 @@ internal sealed class XPlaneLocalRemovalsService
         var url = !string.IsNullOrWhiteSpace(removalArtifactKey)
             ? BuildCoreArtifactUrl(removalArtifactKey)
             : new Uri(
-                $"https://dev-cdn.stopbars.com/RemovalObjects/" +
+                $"https://cdn.stopbars.com/RemovalObjects/" +
                 $"{icao}_{Uri.EscapeDataString(legacySafePackage)}_xplane_removals.json");
         using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
             .ConfigureAwait(false);
