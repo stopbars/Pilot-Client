@@ -37,6 +37,36 @@ public sealed class RemovalsUpdateService
         _logger = logger;
     }
 
+    internal static string InstalledRemovalsFolderName(string simulator) =>
+        simulator.Equals("msfs2020", StringComparison.OrdinalIgnoreCase) ? "z-bars-removals" : RemovalsFolderName;
+
+    private static async Task<bool> MigrateRemovalsFolderAsync(string simulator, string communityPath, CancellationToken cancellationToken)
+    {
+        if (!simulator.Equals("msfs2020", StringComparison.OrdinalIgnoreCase)) return false;
+        await RemovalFileAccess.MsfsGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var legacy = Path.Combine(communityPath, RemovalsFolderName);
+            var destination = Path.Combine(communityPath, InstalledRemovalsFolderName(simulator));
+            if (!Directory.Exists(legacy)) return false;
+            if (Directory.Exists(destination))
+            {
+                if (!Directory.Exists(Path.Combine(destination, "Scenery", "removals")))
+                    throw new InvalidDataException("The installed z-bars-removals package is incomplete; the legacy package was preserved.");
+                Directory.Delete(legacy, recursive: true);
+            }
+            else
+            {
+                Directory.Move(legacy, destination);
+            }
+            return true;
+        }
+        finally
+        {
+            RemovalFileAccess.MsfsGate.Release();
+        }
+    }
+
     /// <summary>
     /// Result of checking and updating removals packages.
     /// </summary>
@@ -148,6 +178,7 @@ public sealed class RemovalsUpdateService
     {
         try
         {
+            var migrated = await MigrateRemovalsFolderAsync(simulator, communityPath, cancellationToken).ConfigureAwait(false);
             var cacheBustedUrl = AppendCacheBuster(url);
             _logger.LogInformation("Checking removals for {Simulator} at {Url}", simulator, cacheBustedUrl);
             StartupTrace.Write($"CheckAndUpdateSingleSimulatorAsync: simulator={simulator}, communityPath={communityPath}, storedEtag={storedEtag}");
@@ -180,14 +211,14 @@ public sealed class RemovalsUpdateService
 
             StartupTrace.Write($"{simulator} normalized ETags - current: '{normalizedCurrent}', stored: '{normalizedStored}'");
 
-            var removalsDestPath = Path.Combine(communityPath, RemovalsFolderName);
+            var removalsDestPath = Path.Combine(communityPath, InstalledRemovalsFolderName(simulator));
             if (Directory.Exists(removalsDestPath) &&
                 normalizedCurrent != null &&
                 string.Equals(normalizedCurrent, normalizedStored, StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogInformation("{Simulator} removals are up to date", simulator);
                 StartupTrace.Write($"{simulator} removals are up to date (ETags match)");
-                return (false, storedEtag, false);
+                return (migrated, storedEtag, false);
             }
 
             _logger.LogInformation("{Simulator} removals have changed, downloading update...", simulator);
@@ -236,7 +267,7 @@ public sealed class RemovalsUpdateService
 
         var operationId = Guid.NewGuid().ToString("N");
         var tempZipPath = Path.Combine(tempDir, $"bars-removals-{simulator}-{operationId}.zip");
-        var removalsDestPath = Path.Combine(communityPath, RemovalsFolderName);
+        var removalsDestPath = Path.Combine(communityPath, InstalledRemovalsFolderName(simulator));
         var stageRoot = Path.Combine(communityPath, $".{RemovalsFolderName}-stage-{operationId}");
         var stagePackagePath = Path.Combine(stageRoot, RemovalsFolderName);
         var backupPath = Path.Combine(communityPath, $".{RemovalsFolderName}-backup-{operationId}");

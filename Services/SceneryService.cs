@@ -459,7 +459,7 @@ namespace BARS_Client_V2.Services
                 var communityPath = TryResolveCommunityPath(sim);
                 if (string.IsNullOrWhiteSpace(communityPath)) continue;
 
-                var removalsRoot = Path.Combine(communityPath, "bars-removals", "Scenery", "removals");
+                var removalsRoot = Path.Combine(communityPath, RemovalsUpdateService.InstalledRemovalsFolderName(sim), "Scenery", "removals");
                 if (!Directory.Exists(removalsRoot)) continue;
 
                 foreach (var icaoDir in Directory.EnumerateDirectories(removalsRoot))
@@ -635,7 +635,7 @@ namespace BARS_Client_V2.Services
                     $"The {normalizedSim} Community folder is not configured in the BARS Installer.");
             }
 
-            var removalsPath = Path.Combine(communityPath, "bars-removals", "Scenery", "removals", normalizedIcao);
+            var removalsPath = Path.Combine(communityPath, RemovalsUpdateService.InstalledRemovalsFolderName(normalizedSim), "Scenery", "removals", normalizedIcao);
             if (!Directory.Exists(removalsPath))
             {
                 throw new DirectoryNotFoundException(
