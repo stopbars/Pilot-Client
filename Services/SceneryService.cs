@@ -20,6 +20,22 @@ namespace BARS_Client_V2.Services
         private const string SETTINGS_FILENAME = "settings.json";
         private readonly HttpClient _httpClient;
         private readonly XPlaneLocalRemovalsService _xplaneRemovals;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _unavailableRemovals =
+            new(StringComparer.OrdinalIgnoreCase);
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _checkedRemovals =
+            new(StringComparer.OrdinalIgnoreCase);
+        public event Action? RemovalAvailabilityChanged;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _verifiedGenerations = new(StringComparer.OrdinalIgnoreCase);
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _verifiedThisSession = new(StringComparer.OrdinalIgnoreCase);
+        private sealed record StartupAvailability(string Stamp, string Generation);
+
+        public bool AreRemovalsCompatible(string icao, string simulator, string packageName) =>
+            !simulator.Equals("xplane", StringComparison.OrdinalIgnoreCase) ||
+            (_checkedRemovals.ContainsKey($"{icao}:{simulator}:{packageName}") &&
+             !_unavailableRemovals.ContainsKey($"{icao}:{simulator}:{packageName}"));
+
+        public bool AreRemovalsUnavailable(string icao, string simulator, string packageName) =>
+            _unavailableRemovals.ContainsKey($"{icao}:{simulator}:{packageName}");
         // Key format: "ICAO:simulator" (e.g., "YSCB:msfs2020" or "YSCB:msfs2024")
         private Dictionary<string, string> _selectedPackages;
         private readonly object _selectionLock = new();
@@ -116,6 +132,52 @@ namespace BARS_Client_V2.Services
             _httpClient = new HttpClient();
             _xplaneRemovals = new XPlaneLocalRemovalsService(_httpClient);
             _selectedPackages = LoadSelectedPackages();
+            RestoreRemovalAvailability();
+        }
+
+        private static string AvailabilityCachePath => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "BARS", "Client", "removal-availability.json");
+
+        private void RestoreRemovalAvailability()
+        {
+            try
+            {
+                if (!File.Exists(AvailabilityCachePath)) return;
+                var saved = JsonSerializer.Deserialize<Dictionary<string, StartupAvailability>>(File.ReadAllText(AvailabilityCachePath));
+                foreach (var entry in saved ?? [])
+                {
+                    var parts = entry.Key.Split(':', 3);
+                    if (parts.Length == 3 && parts[1] == "xplane" &&
+                        entry.Value.Stamp == _xplaneRemovals.GetAvailabilityStamp(parts[0], parts[2]))
+                    {
+                        _checkedRemovals[entry.Key] = true;
+                        _verifiedGenerations[entry.Key] = entry.Value.Generation;
+                    }
+                }
+                Infrastructure.Diagnostics.StartupTrace.Write($"Restored {_checkedRemovals.Count} verified removal toggle states");
+            }
+            catch { /* A missing or invalid UI cache falls back to normal validation. */ }
+        }
+
+        private void SaveRemovalAvailability()
+        {
+            try
+            {
+                var saved = new Dictionary<string, StartupAvailability>(StringComparer.OrdinalIgnoreCase);
+                foreach (var key in _verifiedThisSession.Keys)
+                {
+                    if (_unavailableRemovals.ContainsKey(key)) continue;
+                    var parts = key.Split(':', 3);
+                    if (parts.Length != 3 || parts[1] != "xplane") continue;
+                    var stamp = _xplaneRemovals.GetAvailabilityStamp(parts[0], parts[2]);
+                    if (stamp != null) saved[key] = new(stamp, _verifiedGenerations.GetValueOrDefault(key, ""));
+                }
+                Directory.CreateDirectory(Path.GetDirectoryName(AvailabilityCachePath)!);
+                var temporary = AvailabilityCachePath + ".tmp";
+                File.WriteAllText(temporary, JsonSerializer.Serialize(saved));
+                File.Move(temporary, AvailabilityCachePath, overwrite: true);
+            }
+            catch { /* UI persistence must not interrupt scenery updates. */ }
         }
 
         /// <summary>
@@ -322,21 +384,20 @@ namespace BARS_Client_V2.Services
             var packageSnapshot = new Dictionary<string, string>(savedPackages, StringComparer.OrdinalIgnoreCase);
             var toggleSnapshot = new Dictionary<string, bool>(savedToggles, StringComparer.OrdinalIgnoreCase);
 
-            HashSet<string> changedSims;
-            await RemovalFileAccess.MsfsTransactionGate.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                changedSims = await SyncMsfsRemovalStatesAsync(packageSnapshot, toggleSnapshot)
-                    .ConfigureAwait(false);
-            }
-            finally
-            {
-                RemovalFileAccess.MsfsTransactionGate.Release();
-            }
-            var xplaneChanged = await SyncXPlaneRemovalStatesAsync(packageSnapshot, toggleSnapshot)
-                .ConfigureAwait(false);
+            var xplaneTask = SyncXPlaneRemovalStatesAsync(packageSnapshot, toggleSnapshot);
+            var msfsTask = SyncMsfsAsync();
+            await Task.WhenAll(xplaneTask, msfsTask).ConfigureAwait(false);
+            var changedSims = await msfsTask.ConfigureAwait(false);
+            var xplaneChanged = await xplaneTask.ConfigureAwait(false);
             if (xplaneChanged) changedSims.Add("xplane");
             return changedSims;
+
+            async Task<HashSet<string>> SyncMsfsAsync()
+            {
+                await RemovalFileAccess.MsfsTransactionGate.WaitAsync().ConfigureAwait(false);
+                try { return await SyncMsfsRemovalStatesAsync(packageSnapshot, toggleSnapshot).ConfigureAwait(false); }
+                finally { RemovalFileAccess.MsfsTransactionGate.Release(); }
+            }
         }
 
         private bool IsPackageCacheFresh() =>
@@ -445,6 +506,10 @@ namespace BARS_Client_V2.Services
             IDictionary<string, string> savedPackages,
             IDictionary<string, bool> savedToggles)
         {
+            Infrastructure.Diagnostics.StartupTrace.Write("X-Plane removal synchronization started");
+            using var readSession = XPlaneLocalRemovalsService.BeginReadSession(
+                savedPackages.Keys.Where(key => key.EndsWith(":xplane", StringComparison.OrdinalIgnoreCase))
+                    .Select(key => key.Split(':')[0]));
             var changed = false;
             var refreshMetadata = true;
             foreach (var selection in savedPackages.Where(item =>
@@ -461,14 +526,22 @@ namespace BARS_Client_V2.Services
                         refreshMetadata)
                     .ConfigureAwait(false);
                 refreshMetadata = false;
+                if (_verifiedGenerations.TryGetValue(toggleKey, out var previousGeneration) &&
+                    previousGeneration != (artifact?.ArtifactGenerationId ?? ""))
+                {
+                    _checkedRemovals.TryRemove(toggleKey, out _);
+                    _verifiedThisSession.TryRemove(toggleKey, out _);
+                    RemovalAvailabilityChanged?.Invoke();
+                }
                 // Enabled removals are refreshed once per launch so a newly
                 // published artifact cannot be hidden by an older local patch.
                 if (!enabled && _xplaneRemovals.IsStateApplied(icao, enabled))
                 {
+                    _checkedRemovals[toggleKey] = true;
+                    RemovalAvailabilityChanged?.Invoke();
                     continue;
                 }
-                changed |= await _xplaneRemovals
-                    .ApplyAsync(
+                changed |= await ApplyXPlaneRemovalAsync(
                         icao,
                         selection.Value,
                         enabled,
@@ -478,8 +551,46 @@ namespace BARS_Client_V2.Services
                     .ConfigureAwait(false);
             }
             changed |= await _xplaneRemovals.RestoreTestingArtifactsAsync().ConfigureAwait(false);
+            SaveRemovalAvailability();
+            Infrastructure.Diagnostics.StartupTrace.Write("X-Plane removal synchronization completed");
             return changed;
         }
+
+        private async Task<bool> ApplyXPlaneRemovalAsync(
+            string icao, string packageName, bool enabled, string? artifactKey,
+            string? artifactIdentity, string? artifactGenerationId)
+        {
+            var key = $"{icao}:xplane:{packageName}";
+            var simulatorWasRunning = XPlaneLocalRemovalsService.IsXPlaneProcessRunning();
+            try
+            {
+                var changed = await _xplaneRemovals.ApplyAsync(
+                    icao, packageName, enabled, artifactKey, artifactIdentity, artifactGenerationId)
+                    .ConfigureAwait(false);
+                if (!simulatorWasRunning && !XPlaneLocalRemovalsService.IsXPlaneProcessRunning())
+                {
+                    _unavailableRemovals.TryRemove(key, out _);
+                    _checkedRemovals[key] = true;
+                    _verifiedGenerations[key] = artifactGenerationId ?? "";
+                    _verifiedThisSession[key] = true;
+                    SaveRemovalAvailability();
+                    RemovalAvailabilityChanged?.Invoke();
+                }
+                return changed;
+            }
+            catch (Exception error) when (IsRemovalUnavailableError(error))
+            {
+                _unavailableRemovals[key] = error.Message;
+                SaveRemovalAvailability();
+                Infrastructure.Diagnostics.StartupTrace.Write($"Removals unavailable for {key}: {error.Message}");
+                RemovalAvailabilityChanged?.Invoke();
+                return false;
+            }
+        }
+
+        private static bool IsRemovalUnavailableError(Exception error) =>
+            error is XPlaneRemovalMismatchException ||
+            error is HttpRequestException { StatusCode: System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.Gone };
 
         public async Task<bool> ApplySceneryRemovalAsync(string icao, string simulator, string packageName, bool enabled)
         {
@@ -502,8 +613,7 @@ namespace BARS_Client_V2.Services
                             normalizedPackage,
                             forceRefresh: enabled)
                         .ConfigureAwait(false);
-                    return await _xplaneRemovals
-                        .ApplyAsync(
+                    return await ApplyXPlaneRemovalAsync(
                             normalizedIcao,
                             normalizedPackage,
                             enabled,

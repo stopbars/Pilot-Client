@@ -63,6 +63,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private bool _xplaneRemovalSyncPending;
     private bool _xplaneRemovalSyncInProgress;
     private bool _xplaneRemovalSyncFailed;
+    private string? _xplaneRemovalFailureDetails;
     private int _xplaneRemovalRetryAttempt;
     private DateTime _xplaneRemovalRetryNotBeforeUtc;
     private readonly Dictionary<string, SemaphoreSlim> _removalChangeGates = new(StringComparer.OrdinalIgnoreCase);
@@ -300,8 +301,9 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     public string XPlaneNeedsRestartVisibility => _xplaneNeedsRestart && _removalsUpdateError == null ? "Visible" : "Collapsed";
     public string XPlaneRestartText => _xplaneRemovalSyncFailed
-        ? "BARS could not apply X-Plane removal changes. Retry now or leave BARS open to retry automatically."
-        : "Close X-Plane, wait for BARS to apply removal changes, then restart it";
+        ? "X-Plane removals failed. Retrying when X-Plane is closed."
+        : "Close X-Plane. Wait for removals to finish, then restart it.";
+    public string? XPlaneRemovalFailureDetails => _xplaneRemovalFailureDetails;
     public string XPlaneRetryVisibility => _xplaneRemovalSyncFailed ? "Visible" : "Collapsed";
 
     private void SetXPlaneNeedsRestart(bool needsRestart)
@@ -426,7 +428,16 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
         // Subscribe to configured simulator changes to refresh airport list when toggle changes
         SceneryService.Instance.ConfiguredSimulatorChanged += OnConfiguredSimulatorChanged;
+        SceneryService.Instance.RemovalAvailabilityChanged += OnRemovalAvailabilityChanged;
     }
+
+    private void OnRemovalAvailabilityChanged() => RunOnDispatcher(() =>
+    {
+        var simulator = SceneryService.Instance.ConfiguredSimulator;
+        foreach (var row in Airports)
+            if (row.SelectedPackage != null)
+                SyncRemovalToggle(row, row.ICAO, simulator, row.SelectedPackage.Name);
+    });
 
     private void OnConfiguredSimulatorChanged(string newSimulator)
     {
@@ -507,6 +518,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             ? new Dictionary<string, bool>(settings.SceneryRemovalToggles, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         StartupTrace.Write($"InitializeAsync settings loaded; packages={_savedPackages.Count}");
+        _ = SyncRemovalStatesOnStartupAsync();
 
         if (_removalsUpdatedSims != null && _removalsUpdatedSims.Count > 0)
         {
@@ -522,8 +534,6 @@ public class MainWindowViewModel : INotifyPropertyChanged
         await RefreshFromStateAsync();
         StartupTrace.Write("InitializeAsync state refreshed");
         await RunSearchAsync(resetPage: true);
-        await DiscoverXPlanePackageSelectionsAsync();
-        _ = SyncRemovalStatesOnStartupAsync();
         StartupTrace.Write("InitializeAsync completed initial search");
     }
 
@@ -652,6 +662,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
                 var newRow = new AirportRowViewModel(airport);
                 newRow.PropertyChanged += AirportRowOnPropertyChanged;
+                packagesChanged |= SyncPackageSelection(newRow, airport);
                 if (i <= Airports.Count)
                 {
                     Airports.Insert(i, newRow);
@@ -660,7 +671,6 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 {
                     Airports.Add(newRow);
                 }
-                packagesChanged |= SyncPackageSelection(newRow, airport);
             }
 
             for (var index = Airports.Count - 1; index >= 0; index--)
@@ -721,7 +731,6 @@ public class MainWindowViewModel : INotifyPropertyChanged
         var selectionChanged = false;
 
         var configuredSim = SceneryService.Instance.ConfiguredSimulator;
-        row.SceneryRemovalAvailable = true;
         var key = $"{airport.ICAO}:{configuredSim}";
 
         if (_savedPackages.TryGetValue(key, out var savedPackage))
@@ -783,9 +792,15 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private void SyncRemovalToggle(AirportRowViewModel row, string icao, string simulator, string packageName)
     {
-        if (!row.SceneryRemovalAvailable) return;
+        row.SceneryRemovalAvailable = SceneryService.Instance.AreRemovalsCompatible(icao, simulator, packageName);
+        row.SceneryRemovalToolTip = row.SceneryRemovalAvailable
+            ? "Toggle scenery removals for this airport"
+            : SceneryService.Instance.AreRemovalsUnavailable(icao, simulator, packageName)
+                ? "Removals are unavailable for this scenery. The contribution or local scenery needs updating. BARS lights still work."
+                : "Checking removals. Keep X-Plane closed until the check finishes. BARS lights are still available.";
         var toggleKey = $"{icao}:{simulator}:{packageName}";
-        var enabled = !_savedRemovalToggles.TryGetValue(toggleKey, out var saved) || saved;
+        var enabled = row.SceneryRemovalAvailable &&
+            (!_savedRemovalToggles.TryGetValue(toggleKey, out var saved) || saved);
         if (row.SceneryRemovalEnabled != enabled)
         {
             _suppressSelectionNotifications = true;
@@ -874,9 +889,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             var baselineCreated = TrackMsfsRemovalBaselineBeforeChange(key, configuredSim);
             var removalStarted = false;
 
-            _suppressSelectionNotifications = true;
-            try { row.SceneryRemovalEnabled = newRemovalEnabled; }
-            finally { _suppressSelectionNotifications = false; }
+            SyncRemovalToggle(row, row.ICAO, configuredSim, newPackageName);
 
             await changeGate.WaitAsync();
             var msfsTransactionHeld = false;
@@ -893,7 +906,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 }
 
                 var changed = false;
-                if (row.SceneryRemovalAvailable)
+                if (!SceneryService.Instance.AreRemovalsUnavailable(row.ICAO, configuredSim, newPackageName))
                 {
                     removalStarted = true;
                     changed = await SceneryService.Instance.ApplySceneryRemovalAsync(
@@ -954,6 +967,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 _suppressSelectionNotifications = true;
                 try { row.SelectedPackage = previousSelection; }
                 finally { _suppressSelectionNotifications = false; }
+                if (previousSelection != null)
+                    SyncRemovalToggle(row, row.ICAO, configuredSim, previousSelection.Name);
                 CancelMsfsRemovalBaseline(key, configuredSim, baselineCreated);
                 UpdateRestartStateAfterRemovalChange(key, configuredSim, changed: false, baselineCreated: false);
                 ReportRemovalError(row.ICAO, ex);
@@ -1164,6 +1179,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     {
         try
         {
+            await DiscoverXPlanePackageSelectionsAsync();
             var changedSimulators = await SceneryService.Instance
                 .SyncAllRemovalStatesAsync(_savedPackages, _savedRemovalToggles);
             var runningSim = GetRunningMsfsSim();
@@ -1187,6 +1203,18 @@ public class MainWindowViewModel : INotifyPropertyChanged
             {
                 Status = $"Could not sync scenery removals: {ex.Message}";
                 LogLines.Add(Status);
+                if (_savedPackages.Keys.Any(key => key.EndsWith(":xplane", StringComparison.OrdinalIgnoreCase)))
+                {
+                    _xplaneRemovalSyncPending = true;
+                    _xplaneRemovalSyncFailed = true;
+                    _xplaneRemovalRetryAttempt = 0;
+                    _xplaneRemovalRetryNotBeforeUtc = DateTime.MinValue;
+                    SetXPlaneRemovalFailure(ex);
+                    SetXPlaneNeedsRestart(true);
+                    OnPropertyChanged(nameof(XPlaneRestartText));
+                    OnPropertyChanged(nameof(XPlaneRetryVisibility));
+                    (RetryXPlaneRemovalSyncCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+                }
             });
         }
     }
@@ -1243,6 +1271,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             _xplaneRemovalRetryAttempt++;
             var retryDelaySeconds = Math.Min(60, 5 * (1 << Math.Min(3, _xplaneRemovalRetryAttempt - 1)));
             _xplaneRemovalRetryNotBeforeUtc = DateTime.UtcNow.AddSeconds(retryDelaySeconds);
+            SetXPlaneRemovalFailure(ex);
             SetXPlaneNeedsRestart(true);
             OnPropertyChanged(nameof(XPlaneRestartText));
             OnPropertyChanged(nameof(XPlaneRetryVisibility));
@@ -1255,6 +1284,12 @@ public class MainWindowViewModel : INotifyPropertyChanged
             _xplaneRemovalSyncInProgress = false;
             (RetryXPlaneRemovalSyncCommand as DelegateCommand)?.RaiseCanExecuteChanged();
         }
+    }
+
+    private void SetXPlaneRemovalFailure(Exception error)
+    {
+        _xplaneRemovalFailureDetails = error.Message;
+        OnPropertyChanged(nameof(XPlaneRemovalFailureDetails));
     }
 
     private void ReportRemovalError(string icao, Exception error)
@@ -1810,14 +1845,16 @@ public sealed class AirportRowViewModel : INotifyPropertyChanged
 {
     private BARS_Client_V2.Domain.Airport _airport;
     private BARS_Client_V2.Domain.SceneryPackage? _selected;
-    private bool _sceneryRemovalEnabled = true;
-    private bool _sceneryRemovalAvailable = true;
+    private bool _sceneryRemovalEnabled;
+    private bool _sceneryRemovalAvailable;
+    private string _sceneryRemovalToolTip = "Checking removals.";
     public string ICAO => _airport.ICAO;
     public string? Name => _airport.Name;
     public IReadOnlyList<BARS_Client_V2.Domain.SceneryPackage> SceneryPackages => _airport.SceneryPackages;
     public BARS_Client_V2.Domain.SceneryPackage? SelectedPackage { get => _selected; set { if (value != _selected) { _selected = value; OnPropertyChanged(); } } }
     public bool SceneryRemovalEnabled { get => _sceneryRemovalEnabled; set { if (value != _sceneryRemovalEnabled) { _sceneryRemovalEnabled = value; OnPropertyChanged(); } } }
     public bool SceneryRemovalAvailable { get => _sceneryRemovalAvailable; set { if (value != _sceneryRemovalAvailable) { _sceneryRemovalAvailable = value; OnPropertyChanged(); } } }
+    public string SceneryRemovalToolTip { get => _sceneryRemovalToolTip; set { if (value != _sceneryRemovalToolTip) { _sceneryRemovalToolTip = value; OnPropertyChanged(); } } }
     public AirportRowViewModel(BARS_Client_V2.Domain.Airport airport) { _airport = airport; }
     public bool IsEquivalentTo(BARS_Client_V2.Domain.Airport airport) =>
         string.Equals(_airport.ICAO, airport.ICAO, StringComparison.OrdinalIgnoreCase)

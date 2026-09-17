@@ -994,21 +994,31 @@
                 Background="#FF8C00"
                 CornerRadius="4"
                 Padding="10,5"
-                HorizontalAlignment="Right"
+                HorizontalAlignment="Stretch"
                 VerticalAlignment="Top"
                 Visibility="{Binding XPlaneNeedsRestartVisibility}">
-            <StackPanel Orientation="Horizontal">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
                 <TextBlock Text="ℹ"
                            FontSize="14"
                            Foreground="White"
                            Margin="0,0,8,0"
                            VerticalAlignment="Center"/>
                 <TextBlock Text="{Binding XPlaneRestartText}"
+                           ToolTip="{Binding XPlaneRemovalFailureDetails}"
+                           Grid.Column="1"
+                           TextWrapping="Wrap"
                            FontWeight="Bold"
                            FontSize="12"
                             Foreground="White"
                             VerticalAlignment="Center"/>
                 <Button Content="Retry now"
+                        Grid.Column="2"
                         Command="{Binding RetryXPlaneRemovalSyncCommand}"
                         Visibility="{Binding XPlaneRetryVisibility}"
                         Margin="10,0,0,0"
@@ -1019,6 +1029,7 @@
                         Foreground="White"
                         Cursor="Hand"/>
                 <Button Content="Dismiss"
+                        Grid.Column="3"
                         Command="{Binding DismissXPlaneRestartCommand}"
                         Margin="10,0,0,0"
                         Padding="8,2"
@@ -1027,7 +1038,7 @@
                         BorderThickness="1"
                         Foreground="White"
                         Cursor="Hand"/>
-            </StackPanel>
+            </Grid>
         </Border>
 
         <!-- API Token and Search in vertical layout -->
@@ -1265,8 +1276,15 @@
                                                       IsEnabled="{Binding SceneryRemovalAvailable}"
                                                       HorizontalAlignment="Center"
                                                       VerticalAlignment="Center"
-                                                      ToolTip="Toggle scenery removals for this airport"
-                                                      Style="{StaticResource ToggleSwitchStyle}"/>
+                                                      ToolTipService.ShowOnDisabled="True"
+                                                      Style="{StaticResource ToggleSwitchStyle}">
+                                                <CheckBox.ToolTip>
+                                                    <ToolTip MaxWidth="300">
+                                                        <TextBlock Text="{Binding SceneryRemovalToolTip}"
+                                                                   TextWrapping="Wrap"/>
+                                                    </ToolTip>
+                                                </CheckBox.ToolTip>
+                                            </CheckBox>
                                         </Grid>
                                     </Border>
                                 </DataTemplate>
