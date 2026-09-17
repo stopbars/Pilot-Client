@@ -17,7 +17,7 @@ internal sealed record ApprovedContributionMetadata(
 internal static class ApprovedContributionsCache
 {
     private const string MetadataUrl =
-        "https://v2.stopbars.com/contributions?projection=metadata";
+        "https://v2.stopbars.com/contributions?projection=metadata&status=approved";
     private const string LegacySimpleUrl =
         "https://v2.stopbars.com/contributions?status=approved&simple=true";
     private const int MaxMetadataBytes = 1024 * 1024;
