@@ -19,6 +19,17 @@ internal sealed class XPlaneLocalRemovalsService
     private static readonly HashSet<int> NodeCodes = [111, 112, 113, 114, 115, 116];
     private readonly HttpClient _httpClient;
     private static readonly SemaphoreSlim _gate = new(1, 1);
+    private static readonly AsyncLocal<AirportReadSession?> ReadSession = new();
+
+    internal static IDisposable BeginReadSession(IEnumerable<string> airports)
+    {
+        var session = new AirportReadSession(airports, ReadSession.Value);
+        ReadSession.Value = session;
+        return session;
+    }
+
+    internal static void InvalidateReadCache(string path) => ReadSession.Value?.Invalidate(path);
+    internal static void ReleaseCachedReads() => ReadSession.Value?.Clear();
     private readonly Dictionary<string, DownloadedArtifact> _artifactCache =
         new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions StateJsonOptions = new(JsonSerializerDefaults.Web)
@@ -269,7 +280,7 @@ internal sealed class XPlaneLocalRemovalsService
             item.Icao.Equals(icao, StringComparison.OrdinalIgnoreCase));
 
         var activeSource = await FindActiveAirportSourceAsync(root, icao, cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidOperationException($"{icao} was not found in active X-Plane scenery.");
+            ?? throw new XPlaneRemovalMismatchException($"{icao} was not found in active X-Plane scenery.");
         var sourcePath = activeSource.Path;
         var previousSourcePath = existing == null
             ? null
@@ -309,14 +320,51 @@ internal sealed class XPlaneLocalRemovalsService
         var current = await ReadAirportBlockAsync(sourcePath, icao, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException($"{icao} disappeared from its active apt.dat.");
         if (existingForSource != null &&
-            !BlockHash(current).Equals(existingForSource.PatchedSha256, StringComparison.OrdinalIgnoreCase) &&
-            !BlockHash(current).Equals(existingForSource.OriginalSha256, StringComparison.OrdinalIgnoreCase))
+            !MatchesPatchedBlock(current, existingForSource) &&
+            !RampIndependentHash(current).Equals(RampIndependentHash(original), StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException(
-                $"{icao}'s active apt.dat changed outside BARS. Restart with removals disabled before applying it again.");
+            _ = PatchAirportBlock(current, artifact);
+            var previousArtifact = artifact;
+            var previousArtifactVerified = false;
+            var reproducesPreviousPatch = false;
+            try { reproducesPreviousPatch = MatchesPatchedBlock(PatchAirportBlock(original, artifact), existingForSource); }
+            catch (XPlaneRemovalMismatchException) { }
+            if (!reproducesPreviousPatch)
+            {
+                if (string.IsNullOrWhiteSpace(existingForSource.ArtifactGenerationId) ||
+                    string.IsNullOrWhiteSpace(existingForSource.ArtifactIdentity))
+                    throw new XPlaneRemovalMismatchException("The previous removal artifact cannot be verified. The saved backup was preserved.");
+                var previous = await DownloadArtifactAsync(icao, existingForSource.PackageName,
+                    $"ContributionArtifacts/{icao}/{existingForSource.ArtifactIdentity}/xplane/{existingForSource.ArtifactGenerationId}/removals.json",
+                    existingForSource.ArtifactIdentity, existingForSource.ArtifactGenerationId, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!previous.Sha256.Equals(existingForSource.ArtifactSha256, StringComparison.OrdinalIgnoreCase))
+                    throw new XPlaneRemovalMismatchException("The previous removal artifact failed verification. The saved backup was preserved.");
+                previousArtifact = previous.Artifact;
+                previousArtifactVerified = true;
+            }
+            ValidateReplacementBaseline(original, current, artifact, previousArtifact, existingForSource, previousArtifactVerified);
+            // Replace only this airport in a new copy of the verified baseline.
+            // Other airports may still have active patches sharing the same source.
+            var refreshedFile = $"source-refresh-{Guid.NewGuid():N}.apt.dat";
+            var refreshedPath = ResolveBackupPath(root, refreshedFile);
+            await CopyFileAsync(fullBackupPath, refreshedPath, cancellationToken).ConfigureAwait(false);
+            await ReplaceAirportBlockAtomicallyAsync(refreshedPath, icao, current, cancellationToken)
+                .ConfigureAwait(false);
+            state.SourceBackups.Remove(sourceBackup);
+            state.SourceBackups.Add(new SourceFileBackup
+            {
+                SourceRelativePath = sourceBackup.SourceRelativePath,
+                BackupFile = refreshedFile,
+                OriginalSha256 = await FileSha256Async(refreshedPath, cancellationToken).ConfigureAwait(false)
+            });
+            original = current;
+            backupFile = $"{icao}-{BlockHash(original)[..16]}.apt";
+            await WriteAtomicallyIfChangedAsync(ResolveBackupPath(root, backupFile),
+                NormalizeBlock(original), cancellationToken).ConfigureAwait(false);
         }
 
-        var patched = PatchAirportBlock(original, artifact);
+        var patched = PreserveRampMetadata(PatchAirportBlock(original, artifact), current);
         var patchedHash = BlockHash(patched);
         var targetChanged = !BlockHash(current).Equals(patchedHash, StringComparison.OrdinalIgnoreCase);
 
@@ -336,13 +384,11 @@ internal sealed class XPlaneLocalRemovalsService
                     $"{icao} disappeared from its previous active apt.dat; package selection was not changed.");
             }
             var previousCurrentHash = BlockHash(previousSourceCurrent);
-            previousSourceWasPatched = previousCurrentHash.Equals(
-                existing.PatchedSha256,
-                StringComparison.OrdinalIgnoreCase);
+            previousSourceWasPatched = MatchesPatchedBlock(previousSourceCurrent, existing);
             if (!previousSourceWasPatched &&
                 !previousCurrentHash.Equals(existing.OriginalSha256, StringComparison.OrdinalIgnoreCase))
             {
-                throw new InvalidOperationException(
+                throw new XPlaneRemovalMismatchException(
                     $"{icao}'s previous active apt.dat changed outside BARS; package selection was not changed.");
             }
 
@@ -366,6 +412,7 @@ internal sealed class XPlaneLocalRemovalsService
                 throw new InvalidOperationException(
                     $"{icao}'s previous source backup does not match its saved removal state.");
             }
+            previousSourceOriginal = PreserveRampMetadata(previousSourceOriginal, previousSourceCurrent);
         }
 
         var previousState = existing == null ? null : existing.Copy();
@@ -375,6 +422,7 @@ internal sealed class XPlaneLocalRemovalsService
         existing.BackupFile = backupFile;
         existing.OriginalSha256 = BlockHash(original);
         existing.PatchedSha256 = patchedHash;
+        existing.PatchedRampIndependentSha256 = RampIndependentHash(patched);
         existing.ArtifactIdentity = artifactIdentity;
         existing.ArtifactGenerationId = artifactGenerationId;
         existing.ArtifactSha256 = artifactSha256;
@@ -444,6 +492,75 @@ internal sealed class XPlaneLocalRemovalsService
         changed |= await RemoveLegacyOverrideForAirportAsync(root, icao, cancellationToken)
             .ConfigureAwait(false);
         return changed;
+    }
+
+    private static void ValidateReplacementBaseline(
+        string original, string current, RemovalArtifact artifact, RemovalArtifact previousArtifact, AppliedAirportPatch existing,
+        bool previousArtifactVerified)
+    {
+        // Every selected source feature must still be pristine in the replacement.
+        // Validate this first so outdated contributions report their missing selectors.
+        _ = PatchAirportBlock(current, artifact);
+        var previousPatched = PatchAirportBlock(original, previousArtifact);
+        // Older patcher versions can serialize the same owned edits differently.
+        // The caller verifies both the saved original and pinned artifact hashes.
+        if (!MatchesPatchedBlock(previousPatched, existing) && !previousArtifactVerified)
+        {
+            throw new XPlaneRemovalMismatchException(
+                "The scenery changed and the previous removal ownership could not be verified. The saved backup was preserved.");
+        }
+        var originalFeatures = AirportFeatureIds(original);
+        var changedFeatures = AirportFeatureIds(previousPatched);
+        changedFeatures.ExceptWith(originalFeatures);
+        if (changedFeatures.Overlaps(AirportFeatureIds(current)))
+            throw new XPlaneRemovalMismatchException("The updated scenery still contains previous BARS removals. The saved backup was preserved.");
+    }
+
+    internal string? GetAvailabilityStamp(string icao, string packageName)
+    {
+        var root = ResolveXPlaneRoot();
+        return root == null ? null : AvailabilityStamp(root, icao, packageName);
+    }
+
+    private static string? AvailabilityStamp(string root, string icao, string packageName)
+    {
+        if (XPlanePatchTransaction.HasPending(GetStateRoot(root))) return null;
+        var state = LoadPatchState(root);
+        var airport = state.Airports.FirstOrDefault(item => item.Icao.Equals(icao, StringComparison.OrdinalIgnoreCase)
+            && item.PackageName.Equals(packageName, StringComparison.Ordinal));
+        var dsfFiles = XPlaneDsfRemovals.AvailabilityFiles(root, GetStateRoot(root), icao, packageName);
+        if (airport == null && dsfFiles == null) return null;
+        var paths = new List<string>(dsfFiles ?? []);
+        if (airport != null)
+        {
+            var backup = state.SourceBackups.FirstOrDefault(item => item.SourceRelativePath.Equals(airport.SourceRelativePath, StringComparison.OrdinalIgnoreCase));
+            if (backup == null) return null;
+            paths.AddRange([GetStatePath(root), ResolveStateSourcePath(root, airport.SourceRelativePath), ResolveBackupPath(root, backup.BackupFile)]);
+        }
+        var ini = new FileInfo(Path.Combine(root, "Custom Scenery", "scenery_packs.ini"));
+        var stamps = new List<string> { ini.Exists ? $"{ini.FullName}|{ini.Length}|{ini.LastWriteTimeUtc.Ticks}" : $"{ini.FullName}|missing" };
+        foreach (var path in paths)
+        {
+            var file = new FileInfo(path);
+            if (!file.Exists) return null;
+            stamps.Add($"{file.FullName}|{file.Length}|{file.LastWriteTimeUtc.Ticks}");
+        }
+        return string.Join('\n', stamps);
+    }
+
+    private static HashSet<string> AirportFeatureIds(string airport)
+    {
+        var lines = airport.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < lines.Length; index++)
+        {
+            if (!StartsWithRecord(lines[index], 120)) continue;
+            var end = index + 1;
+            while (end < lines.Length && (string.IsNullOrWhiteSpace(lines[end]) || IsNodeRecord(lines[end]))) end++;
+            result.Add(FeatureId(lines[index..end]));
+            index = end - 1;
+        }
+        return result;
     }
 
     private async Task<DownloadedArtifact> DownloadArtifactAsync(
@@ -584,7 +701,7 @@ internal sealed class XPlaneLocalRemovalsService
                 .Where(selector => !matchedSelectors.Contains(selector))
                 .Take(12)
                 .Select(selector => $"{selector.Feature}:{selector.Code}:run{selector.Run}");
-            throw new InvalidOperationException(
+            throw new XPlaneRemovalMismatchException(
                 $"Installed apt.dat did not match {artifact.Selectors.Count - matchedSelectors.Count} " +
                 $"of {artifact.Selectors.Count} X-Plane removal selectors " +
                 $"({string.Join(", ", unmatched)}).");
@@ -654,41 +771,122 @@ internal sealed class XPlaneLocalRemovalsService
         }
     }
 
-    private static async Task<string?> ReadAirportBlockAsync(
+    private static Task<string?> ReadAirportBlockAsync(
         string path,
         string icao,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken) => Task.Run(() => ReadAirportBlock(path, icao, cancellationToken), cancellationToken);
+
+    private static string? ReadAirportBlock(string path, string icao, CancellationToken cancellationToken)
     {
-        using var reader = new StreamReader(path);
-        List<string>? block = null;
-        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        if (ReadSession.Value is { } session && session.Airports.Contains(icao))
         {
-            var fields = SplitFields(line);
+            var file = session.GetFile(path);
+            file.Blocks ??= ReadAirportBlocks(path, session.Airports, cancellationToken);
+            return file.Blocks.GetValueOrDefault(icao);
+        }
+        return ReadAirportBlocks(path, new HashSet<string>([icao], StringComparer.OrdinalIgnoreCase), cancellationToken)
+            .GetValueOrDefault(icao);
+    }
+
+    private static Dictionary<string, string> ReadAirportBlocks(
+        string path, HashSet<string> airports, CancellationToken cancellationToken)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            128 * 1024, FileOptions.SequentialScan);
+        using var reader = new StreamReader(stream, Encoding.UTF8, true, 128 * 1024);
+        StringBuilder? block = null;
+        var matches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        void SaveBlock()
+        {
+            if (block == null || matches.Count == 0) return;
+            var text = block.ToString().TrimEnd();
+            foreach (var match in matches) result.TryAdd(match, text);
+        }
+        while (reader.ReadLine() is { } line)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // Geometry dominates global apt.dat files. Only headers and the end
+            // marker need tokenizing while locating an airport.
+            var record = FirstField(line);
+            if (record is not ("1" or "16" or "17" or "99"))
+            {
+                block?.Append(line).Append(Environment.NewLine);
+                if (block != null && record is "1302")
+                {
+                    var metadata = SplitFields(line.ToString());
+                    if (metadata.Count >= 3 &&
+                        metadata[1].Equals("icao_code", StringComparison.OrdinalIgnoreCase) &&
+                        airports.Contains(metadata[2])) matches.Add(metadata[2]);
+                }
+                continue;
+            }
+            var fields = SplitFields(line.ToString());
             var isHeader = fields.Count >= 5 && fields[0] is "1" or "16" or "17";
             if (fields.Count > 0 && fields[0] == "99")
             {
-                return block != null && AirportBlockMatches(block, icao)
-                    ? string.Join(Environment.NewLine, block).TrimEnd()
-                    : null;
+                SaveBlock();
+                return result;
             }
             if (isHeader)
             {
-                if (block != null && AirportBlockMatches(block, icao))
-                {
-                    return string.Join(Environment.NewLine, block).TrimEnd();
-                }
-                block = [line];
+                SaveBlock();
+                if (result.Count == airports.Count) return result;
+                block ??= new StringBuilder();
+                block.Clear();
+                block.Append(line).Append(Environment.NewLine);
+                matches.Clear();
+                if (airports.Contains(fields[4])) matches.Add(fields[4]);
                 continue;
             }
             if (block != null)
             {
-                block.Add(line);
+                block.Append(line).Append(Environment.NewLine);
             }
         }
-        return block != null && AirportBlockMatches(block, icao)
-            ? string.Join(Environment.NewLine, block).TrimEnd()
-            : null;
+        SaveBlock();
+        return result;
     }
+
+    private sealed class AirportReadSession(IEnumerable<string> airports, AirportReadSession? previous) : IDisposable
+    {
+        internal HashSet<string> Airports { get; } = new(airports, StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, LockedAirportFile> _files = new(StringComparer.OrdinalIgnoreCase);
+
+        internal LockedAirportFile GetFile(string path)
+        {
+            path = Path.GetFullPath(path);
+            if (!_files.TryGetValue(path, out var file)) _files.Add(path, file = new LockedAirportFile(path));
+            return file;
+        }
+
+        internal void Invalidate(string path)
+        {
+            if (_files.Remove(Path.GetFullPath(path), out var file)) file.Dispose();
+        }
+
+        public void Dispose()
+        {
+            Clear();
+            ReadSession.Value = previous;
+        }
+
+        internal void Clear()
+        {
+            foreach (var file in _files.Values) file.Dispose();
+            _files.Clear();
+        }
+    }
+
+    private sealed class LockedAirportFile(string path) : IDisposable
+    {
+        // Deny both writes and deletion for the entire lifetime of cached data.
+        private readonly FileStream _lease = new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        internal Dictionary<string, string>? Blocks { get; set; }
+        internal string? Sha256 { get; set; }
+        public void Dispose() => _lease.Dispose();
+    }
+
 
     private static bool AirportBlockMatches(IReadOnlyList<string> block, string icao)
     {
@@ -699,12 +897,21 @@ internal sealed class XPlaneLocalRemovalsService
         }
         return block.Any(line =>
         {
+            if (FirstField(line) is not "1302") return false;
             var fields = SplitFields(line);
             return fields.Count >= 3 &&
                    fields[0] == "1302" &&
                    fields[1].Equals("icao_code", StringComparison.OrdinalIgnoreCase) &&
                    fields[2].Equals(icao, StringComparison.OrdinalIgnoreCase);
         });
+    }
+
+    private static ReadOnlySpan<char> FirstField(ReadOnlySpan<char> line)
+    {
+        var text = line.TrimStart();
+        var length = 0;
+        while (length < text.Length && !char.IsWhiteSpace(text[length])) length++;
+        return text[..length];
     }
 
     private static async Task<bool> RestoreAptAirportAsync(
@@ -737,8 +944,7 @@ internal sealed class XPlaneLocalRemovalsService
             }
             var current = await ReadAirportBlockAsync(sourcePath, icao, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"{icao} disappeared from its active apt.dat.");
-            var currentHash = BlockHash(current);
-            if (currentHash.Equals(applied.PatchedSha256, StringComparison.OrdinalIgnoreCase))
+            if (MatchesPatchedBlock(current, applied))
             {
                 // Restore only the owned airport block. A full-file backup is
                 // disaster-recovery evidence, not a normal rollback source: an
@@ -747,14 +953,14 @@ internal sealed class XPlaneLocalRemovalsService
                 await ReplaceAirportBlockAtomicallyAsync(
                         sourcePath,
                         icao,
-                        original,
+                        PreserveRampMetadata(original, current),
                         cancellationToken)
                     .ConfigureAwait(false);
                 changed = true;
             }
-            else if (!currentHash.Equals(applied.OriginalSha256, StringComparison.OrdinalIgnoreCase))
+            else if (!RampIndependentHash(current).Equals(RampIndependentHash(original), StringComparison.OrdinalIgnoreCase))
             {
-                throw new InvalidOperationException(
+                throw new XPlaneRemovalMismatchException(
                     $"{icao}'s active apt.dat changed outside BARS. Its original backup was preserved and no overwrite was attempted.");
             }
 
@@ -885,6 +1091,22 @@ internal sealed class XPlaneLocalRemovalsService
         state.SourceBackups = state.SourceBackups
             .OrderBy(item => item.SourceRelativePath, StringComparer.OrdinalIgnoreCase)
             .ToList();
+        foreach (var source in state.SourceBackups)
+        {
+            var sourcePath = ResolveStateSourcePath(root, source.SourceRelativePath);
+            if (!File.Exists(sourcePath)) continue;
+            var activeAirports = new List<string>();
+            foreach (var airport in state.Airports
+                .Where(airport => airport.SourceRelativePath.Equals(source.SourceRelativePath, StringComparison.OrdinalIgnoreCase))
+                .ToArray())
+            {
+                var current = await ReadAirportBlockAsync(sourcePath, airport.Icao, cancellationToken).ConfigureAwait(false);
+                if (current != null && MatchesPatchedBlock(current, airport)) activeAirports.Add(airport.Icao);
+            }
+            var marker = JsonSerializer.Serialize(new { schema = "bars-xplane-source-status/v1", airports = activeAirports });
+            await WriteAtomicallyIfChangedAsync(sourcePath + ".bars-removals.json",
+                marker, cancellationToken).ConfigureAwait(false);
+        }
         var json = JsonSerializer.Serialize(state, StateJsonOptions) + Environment.NewLine;
         await WriteAtomicallyIfChangedAsync(GetStatePath(root), json, cancellationToken)
             .ConfigureAwait(false);
@@ -1053,6 +1275,10 @@ internal sealed class XPlaneLocalRemovalsService
         string path,
         CancellationToken cancellationToken)
     {
+        // Temporary backup files are renamed after hashing and must not be leased.
+        cancellationToken.ThrowIfCancellationRequested();
+        var cached = path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase) ? null : ReadSession.Value?.GetFile(path);
+        if (cached?.Sha256 is { } verifiedHash) return verifiedHash;
         await using var stream = new FileStream(
             path,
             FileMode.Open,
@@ -1061,7 +1287,9 @@ internal sealed class XPlaneLocalRemovalsService
             1024 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
         var hash = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
-        return Convert.ToHexString(hash).ToLowerInvariant();
+        var value = Convert.ToHexString(hash).ToLowerInvariant();
+        if (cached != null) cached.Sha256 = value;
+        return value;
     }
 
     private static bool IsSha256(string? value) =>
@@ -1130,12 +1358,44 @@ internal sealed class XPlaneLocalRemovalsService
                         .TrimEnd())))
             .ToLowerInvariant();
 
-    private static async Task ReplaceAirportBlockAtomicallyAsync(
+    // Ramp metadata is unrelated to light removals. Keep every other record,
+    // including the ramp locations and metadata record positions, hash-bound.
+    private static string RampIndependentHash(string block) => BlockHash(string.Join('\n',
+        block.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').TrimEnd().Split('\n')
+            .Select(line => FirstField(line) is "1301" ? "1301" : line)));
+
+    private static bool MatchesPatchedBlock(string current, AppliedAirportPatch applied) =>
+        BlockHash(current).Equals(applied.PatchedSha256, StringComparison.OrdinalIgnoreCase) ||
+        (IsSha256(applied.PatchedRampIndependentSha256 ?? "") &&
+         RampIndependentHash(current).Equals(applied.PatchedRampIndependentSha256, StringComparison.OrdinalIgnoreCase));
+
+    private static string PreserveRampMetadata(string target, string current)
+    {
+        static string[] Lines(string block) => block.Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n').TrimEnd().Split('\n');
+        static IEnumerable<string> RampStructure(IEnumerable<string> lines) => lines
+            .Where(line => FirstField(line) is "1300" or "1301")
+            .Select(line => FirstField(line) is "1301" ? "1301" : line);
+        var targetLines = Lines(target);
+        var currentLines = Lines(current);
+        if (!RampStructure(targetLines).SequenceEqual(RampStructure(currentLines)))
+            throw new InvalidOperationException("X-Plane ramp locations changed outside BARS; no overwrite was attempted.");
+        var metadata = new Queue<string>(currentLines.Where(line => FirstField(line) is "1301"));
+        return string.Join(Environment.NewLine, targetLines.Select(line =>
+            FirstField(line) is "1301" ? metadata.Dequeue() : line));
+    }
+
+    private static Task ReplaceAirportBlockAtomicallyAsync(
+        string aptPath, string icao, string replacement, CancellationToken cancellationToken) =>
+        Task.Run(() => ReplaceAirportBlockCoreAsync(aptPath, icao, replacement, cancellationToken), cancellationToken);
+
+    private static async Task ReplaceAirportBlockCoreAsync(
         string aptPath,
         string icao,
         string replacement,
         CancellationToken cancellationToken)
     {
+        ReadSession.Value?.Invalidate(aptPath);
         if (!File.Exists(aptPath))
         {
             throw new InvalidOperationException($"The active apt.dat for {icao} no longer exists.");
@@ -1146,11 +1406,14 @@ internal sealed class XPlaneLocalRemovalsService
         var replaced = false;
         try
         {
-            using var reader = new StreamReader(aptPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            using var stream = new FileStream(aptPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                128 * 1024, FileOptions.SequentialScan);
+            using var reader = new StreamReader(stream, Encoding.UTF8, true, 128 * 1024);
             await using var writer = new StreamWriter(
                 temporary,
                 append: false,
-                new UTF8Encoding(false))
+                new UTF8Encoding(false),
+                bufferSize: 128 * 1024)
             {
                 NewLine = newLine
             };
@@ -1169,6 +1432,9 @@ internal sealed class XPlaneLocalRemovalsService
                     {
                         writer.WriteLine(replacementLine);
                     }
+                    var trailing = lines.Count;
+                    while (trailing > 0 && string.IsNullOrWhiteSpace(lines[trailing - 1])) trailing--;
+                    for (var index = trailing; index < lines.Count; index++) writer.WriteLine(lines[index]);
                     replaced = true;
                     return;
                 }
@@ -1179,10 +1445,11 @@ internal sealed class XPlaneLocalRemovalsService
                 }
             }
 
-            while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+            while (reader.ReadLine() is { } line)
             {
-                var fields = SplitFields(line);
-                var isHeader = fields.Count >= 5 && fields[0] is "1" or "16" or "17";
+                cancellationToken.ThrowIfCancellationRequested();
+                var record = FirstField(line);
+                var isHeader = record is "1" or "16" or "17" && SplitFields(line).Count >= 5;
                 if (isHeader)
                 {
                     if (block != null)
@@ -1193,7 +1460,7 @@ internal sealed class XPlaneLocalRemovalsService
                     continue;
                 }
 
-                if (fields.Count > 0 && fields[0] == "99")
+                if (record is "99")
                 {
                     if (block != null)
                     {
@@ -1544,6 +1811,7 @@ internal sealed class XPlaneLocalRemovalsService
         public string BackupFile { get; set; } = string.Empty;
         public string OriginalSha256 { get; set; } = string.Empty;
         public string PatchedSha256 { get; set; } = string.Empty;
+        public string? PatchedRampIndependentSha256 { get; set; }
         public string? ArtifactIdentity { get; set; }
         public string? ArtifactGenerationId { get; set; }
         public string? ArtifactSha256 { get; set; }
@@ -1556,6 +1824,7 @@ internal sealed class XPlaneLocalRemovalsService
             BackupFile = BackupFile,
             OriginalSha256 = OriginalSha256,
             PatchedSha256 = PatchedSha256,
+            PatchedRampIndependentSha256 = PatchedRampIndependentSha256,
             ArtifactIdentity = ArtifactIdentity,
             ArtifactGenerationId = ArtifactGenerationId,
             ArtifactSha256 = ArtifactSha256

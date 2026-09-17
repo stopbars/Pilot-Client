@@ -93,6 +93,7 @@ internal sealed class XPlanePatchTransaction
 
     private void Enlist(string path, string nextHash)
     {
+        XPlaneLocalRemovalsService.InvalidateReadCache(path);
         path = Path.GetFullPath(path);
         ValidatePath(path);
         Directory.CreateDirectory(_directory);
@@ -120,6 +121,7 @@ internal sealed class XPlanePatchTransaction
 
     private void Rollback()
     {
+        if (_journal.Entries.Count != 0) XPlaneLocalRemovalsService.ReleaseCachedReads();
         EnsureSimulatorClosed();
         // Validate every backup and target before restoring the first file.
         foreach (var entry in _journal.Entries)

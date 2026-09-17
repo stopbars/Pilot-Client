@@ -30,6 +30,22 @@ internal static class XPlaneDsfRemovals
 
     internal sealed record Plan(bool Changed, Action Apply);
 
+
+    internal static string[]? AvailabilityFiles(string root, string stateRoot, string icao, string packageName)
+    {
+        var state = Load(stateRoot);
+        var airport = state.Airports.FirstOrDefault(a => a.Icao == icao && a.PackageName == packageName);
+        if (airport == null) return null;
+        var files = new List<string> { StatePath(stateRoot) };
+        foreach (var selection in airport.Selections)
+        {
+            var source = state.Files.Single(f => f.SourcePath == selection.SourcePath);
+            files.Add(Resolve(root, source.SourcePath));
+            files.Add(Backup(stateRoot, source.OriginalSha256));
+        }
+        return files.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
     public static Plan Prepare(string root, string stateRoot, string icao, string packageName, IReadOnlyCollection<XPlaneDsfSelector> selectors)
     {
         var state = Load(stateRoot);
@@ -47,7 +63,7 @@ internal static class XPlaneDsfRemovals
                 var saved = state.Files.FirstOrDefault(f => f.SourcePath.Equals(relative, StringComparison.OrdinalIgnoreCase));
                 return (saved?.OriginalSha256 ?? XPlaneDsfPatcher.Hash(File.ReadAllBytes(path))) == selector.Sha256;
             }).ToArray();
-            if (matches.Length != 1) throw new InvalidDataException($"Expected one active scenery source for {selector.Source}; found {matches.Length}. Regenerate removals for the installed package.");
+            if (matches.Length != 1) throw new XPlaneRemovalMismatchException($"Expected one active scenery source for {selector.Source}; found {matches.Length}. Regenerate removals for the installed package.");
             var target = matches[0];
             Resolve(root, Path.GetRelativePath(root, target));
             selections.AddRange(group.Select(member => new Selection { SourcePath = Path.GetRelativePath(root, target), Selector = member }));
@@ -73,7 +89,7 @@ internal static class XPlaneDsfRemovals
             }
             else
             {
-                if (currentHash != saved.PatchedSha256) throw new IOException($"{relative} changed outside BARS. Its original backup has been retained.");
+                if (currentHash != saved.PatchedSha256) throw new XPlaneRemovalMismatchException($"{relative} changed outside BARS. Its original backup has been retained.");
                 original = File.ReadAllBytes(Backup(stateRoot, saved.OriginalSha256));
                 if (XPlaneDsfPatcher.Hash(original) != saved.OriginalSha256) throw new InvalidDataException("DSF backup checksum mismatch.");
             }
