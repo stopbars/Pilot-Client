@@ -1,9 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using BARS_Client_V2.Domain;
+using BARS_Client_V2.Services;
+using BARS_Client_V2.Infrastructure.Simulators.Msfs;
+using BARS_Client_V2.Infrastructure.Simulators.XPlane;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -32,53 +36,87 @@ public sealed class SimulatorManager : BackgroundService
         if (connector == null) return false;
         if (connector == _active && connector.IsConnected) return true;
 
-        if (_active != null && _active.IsConnected)
+        if (_active != null)
         {
             try { await _active.DisconnectAsync(ct); } catch (Exception ex) { _logger.LogWarning(ex, "Error disconnecting previous simulator"); }
+            lock (_lock) _active = null;
         }
+
+        ClearLatestState();
 
         if (await connector.ConnectAsync(ct))
         {
             lock (_lock) _active = connector;
             _logger.LogInformation("Activated simulator {sim}", connector.DisplayName);
+
+            // Update SceneryService with the detected simulator version
+            UpdateCurrentSimulator(connector);
+
             return true;
         }
         return false;
     }
 
+    /// <summary>
+    /// Updates the SceneryService.CurrentSimulator based on the connected simulator.
+    /// </summary>
+    private void UpdateCurrentSimulator(ISimulatorConnector connector)
+    {
+        try
+        {
+            if (connector is MsfsSimulatorConnector msfsConnector)
+            {
+                var is2024 = msfsConnector.IsMsfs2024;
+                if (is2024 == true)
+                {
+                    SceneryService.Instance.CurrentSimulator = "msfs2024";
+                    _logger.LogInformation("Detected MSFS 2024 - setting CurrentSimulator to msfs2024");
+                }
+                else if (is2024 == false)
+                {
+                    SceneryService.Instance.CurrentSimulator = "msfs2020";
+                    _logger.LogInformation("Detected MSFS 2020 - setting CurrentSimulator to msfs2020");
+                }
+                else
+                {
+                    // Unknown - default to 2020
+                    SceneryService.Instance.CurrentSimulator = "msfs2020";
+                    _logger.LogInformation("MSFS version unknown - defaulting CurrentSimulator to msfs2020");
+                }
+            }
+            else
+            {
+                SceneryService.Instance.CurrentSimulator = connector is XPlaneSimulatorConnector
+                    ? "xplane"
+                    : "msfs2020";
+                _logger.LogInformation("Detected simulator {simulatorId}", SceneryService.Instance.CurrentSimulator);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to update CurrentSimulator");
+        }
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var first = _connectors.FirstOrDefault();
-        if (first != null)
-        {
-            await ActivateAsync(first.SimulatorId, stoppingToken);
-        }
-
         while (!stoppingToken.IsCancellationRequested)
         {
             var active = ActiveConnector;
             if (active == null || !active.IsConnected)
             {
-                // Attempt reconnect periodically when disconnected
-                if (first != null)
+                ClearLatestState();
+                if (!await TryActivateAvailableAsync(stoppingToken))
                 {
-                    try
-                    {
-                        await ActivateAsync(first.SimulatorId, stoppingToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "Reconnect attempt failed");
-                    }
+                    await Task.Delay(2000, stoppingToken);
                 }
-                await Task.Delay(2000, stoppingToken);
                 continue;
             }
             try
             {
                 await foreach (var raw in active.StreamRawAsync(stoppingToken))
                 {
-                    lock (_lock) _latest = new FlightState(raw.Latitude, raw.Longitude, raw.OnGround);
+                    lock (_lock) _latest = new FlightState(raw.Latitude, raw.Longitude, raw.OnGround, raw.HeadingDeg);
                 }
             }
             catch (OperationCanceledException) { }
@@ -88,6 +126,76 @@ public sealed class SimulatorManager : BackgroundService
                 // small backoff
                 await Task.Delay(2000, stoppingToken);
             }
+        }
+    }
+
+    private async Task<bool> TryActivateAvailableAsync(CancellationToken ct)
+    {
+        var candidates = _connectors
+            .Where(IsSimulatorProcessRunning)
+            .OrderBy(c => c.SimulatorId, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        foreach (var connector in candidates)
+        {
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            attempt.CancelAfter(TimeSpan.FromSeconds(5));
+            try
+            {
+                if (await ActivateAsync(connector.SimulatorId, attempt.Token))
+                {
+                    return true;
+                }
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogDebug("Simulator connection attempt timed out for {sim}", connector.DisplayName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Simulator connection attempt failed for {sim}", connector.DisplayName);
+            }
+        }
+        return false;
+    }
+
+    private static bool IsSimulatorProcessRunning(ISimulatorConnector connector)
+    {
+        try
+        {
+            if (connector is XPlaneSimulatorConnector)
+            {
+                return IsProcessRunning("X-Plane");
+            }
+            if (connector is MsfsSimulatorConnector)
+            {
+                return IsProcessRunning("FlightSimulator2024") ||
+                       IsProcessRunning("FlightSimulator");
+            }
+        }
+        catch
+        {
+        }
+        return false;
+    }
+
+    private static bool IsProcessRunning(string processName)
+    {
+        var processes = Process.GetProcessesByName(processName);
+        try
+        {
+            return processes.Length > 0;
+        }
+        finally
+        {
+            foreach (var process in processes) process.Dispose();
+        }
+    }
+
+    private void ClearLatestState()
+    {
+        lock (_lock)
+        {
+            _latest = null;
         }
     }
 }

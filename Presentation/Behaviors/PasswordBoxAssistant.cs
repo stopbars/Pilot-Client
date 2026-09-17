@@ -19,6 +19,12 @@ public static class PasswordBoxAssistant
         typeof(PasswordBoxAssistant),
         new PropertyMetadata(false, OnBindPasswordChanged));
 
+    public static readonly DependencyProperty RemoveWhitespaceProperty = DependencyProperty.RegisterAttached(
+        "RemoveWhitespace",
+        typeof(bool),
+        typeof(PasswordBoxAssistant),
+        new PropertyMetadata(false));
+
     private static readonly DependencyProperty UpdatingPasswordProperty = DependencyProperty.RegisterAttached(
         "UpdatingPassword",
         typeof(bool),
@@ -30,6 +36,9 @@ public static class PasswordBoxAssistant
 
     public static bool GetBindPassword(DependencyObject dp) => (bool)dp.GetValue(BindPasswordProperty);
     public static void SetBindPassword(DependencyObject dp, bool value) => dp.SetValue(BindPasswordProperty, value);
+
+    public static bool GetRemoveWhitespace(DependencyObject dp) => (bool)dp.GetValue(RemoveWhitespaceProperty);
+    public static void SetRemoveWhitespace(DependencyObject dp, bool value) => dp.SetValue(RemoveWhitespaceProperty, value);
 
     private static bool GetUpdatingPassword(DependencyObject dp) => (bool)dp.GetValue(UpdatingPasswordProperty);
     private static void SetUpdatingPassword(DependencyObject dp, bool value) => dp.SetValue(UpdatingPasswordProperty, value);
@@ -43,6 +52,11 @@ public static class PasswordBoxAssistant
         if (GetUpdatingPassword(box)) return;
 
         var newPassword = e.NewValue as string ?? string.Empty;
+        if (GetRemoveWhitespace(box))
+        {
+            newPassword = RemoveWhitespace(newPassword);
+        }
+
         if (box.Password != newPassword)
         {
             box.Password = newPassword;
@@ -66,8 +80,44 @@ public static class PasswordBoxAssistant
     private static void HandlePasswordChanged(object sender, RoutedEventArgs e)
     {
         if (sender is not PasswordBox box) return;
+        if (GetUpdatingPassword(box)) return;
+
+        var password = box.Password;
+        if (GetRemoveWhitespace(box))
+        {
+            password = RemoveWhitespace(password);
+        }
+
         SetUpdatingPassword(box, true);
-        SetBoundPassword(box, box.Password);
-        SetUpdatingPassword(box, false);
+        try
+        {
+            if (box.Password != password)
+            {
+                box.Password = password;
+            }
+
+            SetBoundPassword(box, password);
+        }
+        finally
+        {
+            SetUpdatingPassword(box, false);
+        }
+    }
+
+    private static string RemoveWhitespace(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return value;
+
+        var buffer = new char[value.Length];
+        var index = 0;
+        foreach (var character in value)
+        {
+            if (!char.IsWhiteSpace(character))
+            {
+                buffer[index++] = character;
+            }
+        }
+
+        return index == value.Length ? value : new string(buffer, 0, index);
     }
 }

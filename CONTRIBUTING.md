@@ -25,7 +25,6 @@ Thank you for your interest in contributing to the BARS Pilot Client! This guide
    Open `BARS-Client-V2.sln` in Visual Studio.
 
 3. **Set Build Configuration**
-
    - Set the build configuration to `Release` and platform to `Any CPU` for final builds
    - Use `Debug|Any CPU` for development and testing
 
@@ -35,10 +34,9 @@ Thank you for your interest in contributing to the BARS Pilot Client! This guide
    dotnet build BARS-Client-V2.sln --configuration Release
    ```
 
-   The compiled application will be available in `bin\Release\net8.0-windows\`.
+   The compiled application will be available in `bin\Release\net10.0-windows7.0\`.
 
 5. **Available Build Configurations**
-
    - `Debug|Any CPU` - Development build with debug symbols
    - `Release|Any CPU` - Production build optimized
 

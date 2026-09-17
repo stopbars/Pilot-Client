@@ -1,9 +1,10 @@
-﻿<Window x:Class="BARS_Client_V2.MainWindow"
+<Window x:Class="BARS_Client_V2.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:BARS_Client_V2"
+        xmlns:behaviors="clr-namespace:BARS_Client_V2.Presentation.Behaviors"
         mc:Ignorable="d"
         Title="BARS Client"
         Height="674"
@@ -11,12 +12,143 @@
         Background="#1E1E1E"
         FontFamily="Segoe UI"
         WindowStartupLocation="CenterScreen"
-        ResizeMode="NoResize">
+        ResizeMode="CanMinimize">
 
     <Window.Resources>
         <!-- Converters -->
         <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter"/>
         <local:NullOrEmptyToVisibilityConverter x:Key="NullOrEmptyToVisibilityConverter"/>
+        <local:IndexToBoolConverter x:Key="IndexToBoolConverter"/>
+
+        <Style x:Key="ToggleSwitchStyle"
+               TargetType="CheckBox">
+            <Setter Property="Cursor"
+                    Value="Hand"/>
+            <Setter Property="ForceCursor"
+                    Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Grid x:Name="templateRoot">
+                            <Border x:Name="track"
+                                    Width="40"
+                                    Height="20"
+                                    CornerRadius="10"
+                                    Background="#555555"
+                                    BorderThickness="0"/>
+                            <Border x:Name="thumb"
+                                    Width="16"
+                                    Height="16"
+                                    CornerRadius="8"
+                                    Background="White"
+                                    HorizontalAlignment="Left"
+                                    Margin="2,0,0,0"
+                                    VerticalAlignment="Center"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked"
+                                     Value="True">
+                                <Setter TargetName="thumb"
+                                        Property="Margin"
+                                        Value="22,0,0,0"/>
+                                <Setter TargetName="track"
+                                        Property="Background"
+                                        Value="#007ACC"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="templateRoot" Property="Opacity" Value="0.45"/>
+                                <Setter Property="Cursor" Value="Arrow"/>
+                            </Trigger>
+                            <EventTrigger RoutedEvent="CheckBox.Checked">
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <ThicknessAnimation Storyboard.TargetName="thumb"
+                                                            Storyboard.TargetProperty="Margin"
+                                                            From="2,0,0,0"
+                                                            To="22,0,0,0"
+                                                            Duration="0:0:0.2"
+                                                            FillBehavior="Stop">
+                                            <ThicknessAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </ThicknessAnimation.EasingFunction>
+                                        </ThicknessAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </EventTrigger>
+                            <EventTrigger RoutedEvent="CheckBox.Unchecked">
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <ThicknessAnimation Storyboard.TargetName="thumb"
+                                                            Storyboard.TargetProperty="Margin"
+                                                            From="22,0,0,0"
+                                                            To="2,0,0,0"
+                                                            Duration="0:0:0.2"
+                                                            FillBehavior="Stop">
+                                            <ThicknessAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </ThicknessAnimation.EasingFunction>
+                                        </ThicknessAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </EventTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Simulator Toggle RadioButton Style -->
+        <Style x:Key="SimulatorToggleRadioButton"
+               TargetType="RadioButton">
+            <Setter Property="Background"
+                    Value="Transparent"/>
+            <Setter Property="Foreground"
+                    Value="#AAAAAA"/>
+            <Setter Property="BorderThickness"
+                    Value="0"/>
+            <Setter Property="Cursor"
+                    Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="border"
+                                Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}"
+                                CornerRadius="2">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked"
+                                     Value="True">
+                                <Setter Property="Background"
+                                        Value="#007ACC"
+                                        TargetName="border"/>
+                                <Setter Property="Foreground"
+                                        Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver"
+                                     Value="True">
+                                <Setter Property="Background"
+                                        Value="#3E3E42"
+                                        TargetName="border"/>
+                            </Trigger>
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="IsMouseOver"
+                                               Value="True"/>
+                                    <Condition Property="IsChecked"
+                                               Value="True"/>
+                                </MultiTrigger.Conditions>
+                                <Setter Property="Background"
+                                        Value="#1C97EA"
+                                        TargetName="border"/>
+                            </MultiTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
 
         <!-- Animation Resources -->
         <Storyboard x:Key="FadeIn">
@@ -41,19 +173,59 @@
             </ThicknessAnimation>
         </Storyboard>
 
+        <Storyboard x:Key="WindowIntroStoryboard">
+            <DoubleAnimation Storyboard.TargetName="RootLayout"
+                             Storyboard.TargetProperty="Opacity"
+                             To="1"
+                             Duration="0:0:0.45">
+                <DoubleAnimation.EasingFunction>
+                    <CubicEase EasingMode="EaseOut"/>
+                </DoubleAnimation.EasingFunction>
+            </DoubleAnimation>
+            <DoubleAnimation Storyboard.TargetName="RootLayout"
+                             Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)"
+                             To="1"
+                             Duration="0:0:0.45">
+                <DoubleAnimation.EasingFunction>
+                    <CubicEase EasingMode="EaseOut"/>
+                </DoubleAnimation.EasingFunction>
+            </DoubleAnimation>
+            <DoubleAnimation Storyboard.TargetName="RootLayout"
+                             Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleY)"
+                             To="1"
+                             Duration="0:0:0.45">
+                <DoubleAnimation.EasingFunction>
+                    <CubicEase EasingMode="EaseOut"/>
+                </DoubleAnimation.EasingFunction>
+            </DoubleAnimation>
+            <DoubleAnimation Storyboard.TargetName="RootLayout"
+                             Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[1].(TranslateTransform.Y)"
+                             To="0"
+                             Duration="0:0:0.45">
+                <DoubleAnimation.EasingFunction>
+                    <CubicEase EasingMode="EaseOut"/>
+                </DoubleAnimation.EasingFunction>
+            </DoubleAnimation>
+        </Storyboard>
+
+        <Style x:Key="KeyboardFocus" TargetType="Control">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate>
+                        <Border BorderBrush="#66BCFF" BorderThickness="2" CornerRadius="3" Margin="2"/>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style TargetType="Button">
-            <Setter Property="Background"
-                    Value="#2D2D30"/>
-            <Setter Property="Foreground"
-                    Value="White"/>
-            <Setter Property="Padding"
-                    Value="10,5"/>
-            <Setter Property="BorderBrush"
-                    Value="#3E3E42"/>
-            <Setter Property="BorderThickness"
-                    Value="1"/>
-            <Setter Property="Cursor"
-                    Value="Hand"/>
+            <Setter Property="Background" Value="#2D2D30"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Padding" Value="10,5"/>
+            <Setter Property="BorderBrush" Value="#3E3E42"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FocusVisualStyle" Value="{StaticResource KeyboardFocus}"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
@@ -62,85 +234,26 @@
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
                                 CornerRadius="3">
-                            <ContentPresenter x:Name="contentPresenter"
-                                              HorizontalAlignment="Center"
-                                              VerticalAlignment="Center"/>
+                            <Grid>
+                                <Border x:Name="highlight" Background="White" Opacity="0"
+                                        CornerRadius="2" IsHitTestVisible="False"/>
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Grid>
                         </Border>
                         <ControlTemplate.Triggers>
-                            <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard>
-                                    <Storyboard>
-                                        <ColorAnimation Storyboard.TargetName="border"
-                                                        Storyboard.TargetProperty="(Border.Background).(SolidColorBrush.Color)"
-                                                        To="White"
-                                                        Duration="0:0:0.15"/>
-                                        <ColorAnimation Storyboard.TargetName="contentPresenter"
-                                                        Storyboard.TargetProperty="(TextBlock.Foreground).(SolidColorBrush.Color)"
-                                                        To="#2D2D30"
-                                                        Duration="0:0:0.15"/>
-                                    </Storyboard>
-                                </BeginStoryboard>
-                            </EventTrigger>
-                            <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard>
-                                    <Storyboard>
-                                        <ColorAnimation Storyboard.TargetName="border"
-                                                        Storyboard.TargetProperty="(Border.Background).(SolidColorBrush.Color)"
-                                                        To="#2D2D30"
-                                                        Duration="0:0:0.15"/>
-                                        <ColorAnimation Storyboard.TargetName="contentPresenter"
-                                                        Storyboard.TargetProperty="(TextBlock.Foreground).(SolidColorBrush.Color)"
-                                                        To="White"
-                                                        Duration="0:0:0.15"/>
-                                    </Storyboard>
-                                </BeginStoryboard>
-                            </EventTrigger>
-                            <EventTrigger RoutedEvent="PreviewMouseDown">
-                                <BeginStoryboard>
-                                    <Storyboard>
-                                        <DoubleAnimation Storyboard.TargetName="border"
-                                                         Storyboard.TargetProperty="Opacity"
-                                                         To="0.8"
-                                                         Duration="0:0:0.05"/>
-                                        <DoubleAnimation Storyboard.TargetName="border"
-                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
-                                                         To="0.98"
-                                                         Duration="0:0:0.05"/>
-                                        <DoubleAnimation Storyboard.TargetName="border"
-                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
-                                                         To="0.98"
-                                                         Duration="0:0:0.05"/>
-                                    </Storyboard>
-                                </BeginStoryboard>
-                            </EventTrigger>
-                            <EventTrigger RoutedEvent="PreviewMouseUp">
-                                <BeginStoryboard>
-                                    <Storyboard>
-                                        <DoubleAnimation Storyboard.TargetName="border"
-                                                         Storyboard.TargetProperty="Opacity"
-                                                         To="1"
-                                                         Duration="0:0:0.05"/>
-                                        <DoubleAnimation Storyboard.TargetName="border"
-                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
-                                                         To="1"
-                                                         Duration="0:0:0.05"/>
-                                        <DoubleAnimation Storyboard.TargetName="border"
-                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
-                                                         To="1"
-                                                         Duration="0:0:0.05"/>
-                                    </Storyboard>
-                                </BeginStoryboard>
-                            </EventTrigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="highlight" Property="Opacity" Value="0.07"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="highlight" Property="Opacity" Value="0.12"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="border" Property="Opacity" Value="0.45"/>
+                                <Setter TargetName="highlight" Property="Opacity" Value="0"/>
+                                <Setter Property="Cursor" Value="Arrow"/>
+                            </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
-                </Setter.Value>
-            </Setter>
-            <Setter Property="RenderTransformOrigin"
-                    Value="0.5,0.5"/>
-            <Setter Property="RenderTransform">
-                <Setter.Value>
-                    <ScaleTransform ScaleX="1"
-                                    ScaleY="1"/>
                 </Setter.Value>
             </Setter>
         </Style>
@@ -181,9 +294,6 @@
                                      Value="True">
                                 <Setter Property="BorderBrush"
                                         Value="#66BCFF"
-                                        TargetName="border"/>
-                                <Setter Property="BorderThickness"
-                                        Value="2"
                                         TargetName="border"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
@@ -228,9 +338,6 @@
                                 <Setter Property="BorderBrush"
                                         Value="#66BCFF"
                                         TargetName="border"/>
-                                <Setter Property="BorderThickness"
-                                        Value="2"
-                                        TargetName="border"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -258,6 +365,7 @@
                     <ControlTemplate TargetType="ComboBox">
                         <Grid>
                             <ToggleButton x:Name="ToggleButton"
+                                          Cursor="Hand"
                                           BorderBrush="{TemplateBinding BorderBrush}"
                                           Background="{TemplateBinding Background}"
                                           Foreground="{TemplateBinding Foreground}"
@@ -398,6 +506,7 @@
                     <ControlTemplate TargetType="ComboBox">
                         <Grid>
                             <ToggleButton x:Name="ToggleButton"
+                                          Cursor="Hand"
                                           BorderBrush="{TemplateBinding BorderBrush}"
                                           Background="{TemplateBinding Background}"
                                           Foreground="{TemplateBinding Foreground}"
@@ -431,9 +540,6 @@
                                         <ControlTemplate.Triggers>
                                             <Trigger Property="IsMouseOver"
                                                      Value="True">
-                                                <Setter Property="BorderThickness"
-                                                        Value="2"
-                                                        TargetName="Border"/>
                                                 <Setter Property="BorderBrush"
                                                         Value="#66BCFF"
                                                         TargetName="Border"/>
@@ -515,9 +621,74 @@
                 </Setter.Value>
             </Setter>
         </Style>
+
+        <Style x:Key="AirportRowEntranceStyle"
+               TargetType="Border">
+            <Setter Property="Opacity"
+                    Value="0"/>
+            <Setter Property="RenderTransform">
+                <Setter.Value>
+                    <TranslateTransform Y="16"/>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="Effect">
+                <Setter.Value>
+                    <DropShadowEffect Color="#FF000000"
+                                      BlurRadius="14"
+                                      ShadowDepth="0"
+                                      Opacity="0"/>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <EventTrigger RoutedEvent="Loaded">
+                    <BeginStoryboard>
+                        <Storyboard>
+                            <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                             From="0"
+                                             To="1"
+                                             Duration="0:0:0.22">
+                                <DoubleAnimation.EasingFunction>
+                                    <QuadraticEase EasingMode="EaseOut"/>
+                                </DoubleAnimation.EasingFunction>
+                            </DoubleAnimation>
+                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.Y)"
+                                             To="0"
+                                             Duration="0:0:0.26">
+                                <DoubleAnimation.EasingFunction>
+                                    <QuinticEase EasingMode="EaseOut"/>
+                                </DoubleAnimation.EasingFunction>
+                            </DoubleAnimation>
+                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.Effect).(DropShadowEffect.Opacity)"
+                                             To="0.12"
+                                             Duration="0:0:0.26">
+                                <DoubleAnimation.EasingFunction>
+                                    <QuadraticEase EasingMode="EaseOut"/>
+                                </DoubleAnimation.EasingFunction>
+                            </DoubleAnimation>
+                        </Storyboard>
+                    </BeginStoryboard>
+                </EventTrigger>
+            </Style.Triggers>
+        </Style>
     </Window.Resources>
 
-    <Grid Margin="15">
+    <Window.Triggers>
+        <EventTrigger RoutedEvent="Loaded">
+            <BeginStoryboard Storyboard="{StaticResource WindowIntroStoryboard}"/>
+        </EventTrigger>
+    </Window.Triggers>
+
+    <Grid x:Name="RootLayout"
+          Margin="15"
+          Opacity="0"
+          RenderTransformOrigin="0.5,0.5">
+        <Grid.RenderTransform>
+            <TransformGroup>
+                <ScaleTransform ScaleX="0.985"
+                                ScaleY="0.985"/>
+                <TranslateTransform Y="12"/>
+            </TransformGroup>
+        </Grid.RenderTransform>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -535,11 +706,53 @@
             </Grid.ColumnDefinitions>
 
             <StackPanel Grid.Column="0">
-                <TextBlock Text="BARS Client"
-                           FontSize="24"
-                           FontWeight="Bold"
-                           Margin="0,0,0,10"
-                           Foreground="White"/>
+                <StackPanel Orientation="Horizontal"
+                            Margin="0,0,0,10">
+                    <TextBlock Text="BARS Client"
+                               FontSize="24"
+                               FontWeight="Bold"
+                               VerticalAlignment="Center"
+                               Foreground="White"/>
+                    <Button x:Name="SettingsButton"
+                            Width="32"
+                            Height="32"
+                            Margin="2,0,0,0"
+                            VerticalAlignment="Center"
+                            FontFamily="Segoe MDL2 Assets"
+                            FontSize="14"
+                            Content="&#xE713;"
+                            AutomationProperties.Name="Settings"
+                            Click="SettingsButton_OnClick"
+                            ToolTip="Settings">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Setter Property="Background" Value="Transparent"/>
+                                <Setter Property="Foreground" Value="#AAAAAA"/>
+                                <Setter Property="Cursor" Value="Hand"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="Button">
+                                            <Border Background="{TemplateBinding Background}"
+                                                    CornerRadius="3">
+                                                <ContentPresenter HorizontalAlignment="Center"
+                                                                  VerticalAlignment="Center">
+                                                    <ContentPresenter.RenderTransform>
+                                                        <TranslateTransform Y="2"/>
+                                                    </ContentPresenter.RenderTransform>
+                                                </ContentPresenter>
+                                            </Border>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                                <Style.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter Property="Foreground" Value="#DDDDDD"/>
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Button.Style>
+                    </Button>
+                </StackPanel>
 
                 <Grid>
                     <Grid.ColumnDefinitions>
@@ -615,6 +828,219 @@
             </StackPanel>
         </Grid>
 
+        <!-- Debug Mode Indicator -->
+        <Border Grid.Row="0"
+                Margin="0,4,0,0"
+                CornerRadius="4"
+                Padding="10,5"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                RenderTransformOrigin="1,0">
+            <Border.RenderTransform>
+                <ScaleTransform ScaleX="1" ScaleY="1"/>
+            </Border.RenderTransform>
+            <Border.Style>
+                <Style TargetType="Border">
+                    <Setter Property="Background" Value="#CC0000"/>
+                    <Setter Property="Opacity" Value="0"/>
+                    <Setter Property="Visibility" Value="Collapsed"/>
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding IsTestingModeActive}" Value="True">
+                            <Setter Property="Background" Value="#EAB308"/>
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding DebugModeActive}" Value="True">
+                            <DataTrigger.EnterActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetProperty="Visibility">
+                                            <DiscreteObjectKeyFrame KeyTime="0:0:0" Value="{x:Static Visibility.Visible}"/>
+                                        </ObjectAnimationUsingKeyFrames>
+                                        <DoubleAnimation Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.2">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.ScaleX" To="1" From="0.9" Duration="0:0:0.2">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.ScaleY" To="1" From="0.9" Duration="0:0:0.2">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </DataTrigger.EnterActions>
+                            <DataTrigger.ExitActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.15">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseIn"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.ScaleX" To="0.9" Duration="0:0:0.15">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseIn"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetProperty="RenderTransform.ScaleY" To="0.9" Duration="0:0:0.15">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseIn"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetProperty="Visibility">
+                                            <DiscreteObjectKeyFrame KeyTime="0:0:0.15" Value="{x:Static Visibility.Collapsed}"/>
+                                        </ObjectAnimationUsingKeyFrames>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </DataTrigger.ExitActions>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Border.Style>
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="⚠"
+                           FontSize="14"
+                           Foreground="White"
+                           Margin="0,-2,8,0"
+                           VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding DebugModeText}"
+                           FontWeight="Bold"
+                           FontSize="12"
+                           Foreground="White"
+                           VerticalAlignment="Center"/>
+                <Button Command="{Binding EndActiveModeCommand}"
+                        Width="18"
+                        Height="18"
+                        Margin="8,0,0,0"
+                        Padding="0"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Foreground="White"
+                        Cursor="Hand"
+                        Focusable="False"
+                        ToolTip="End testing mode">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Setter Property="Opacity" Value="0.82"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="Button">
+                                        <Border Background="{TemplateBinding Background}"
+                                                CornerRadius="9">
+                                            <ContentPresenter HorizontalAlignment="Center"
+                                                              VerticalAlignment="Center"/>
+                                        </Border>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Opacity" Value="1"/>
+                                    <Setter Property="Background" Value="#26FFFFFF"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter Property="Background" Value="#40FFFFFF"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                    <Viewbox Width="13"
+                             Height="13">
+                        <Canvas Width="14"
+                                Height="14">
+                            <Path Data="M 3 3 L 11 11 M 11 3 L 3 11"
+                                  Stroke="White"
+                                  StrokeThickness="2.2"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"/>
+                        </Canvas>
+                    </Viewbox>
+                </Button>
+            </StackPanel>
+        </Border>
+
+        <!-- MSFS Restart Banner -->
+        <Border Grid.Row="0"
+                Margin="0,0,0,0"
+                Background="#FF8C00"
+                CornerRadius="4"
+                Padding="10,5"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                Visibility="{Binding MsfsNeedsRestartVisibility}">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="ℹ"
+                           FontSize="14"
+                           Foreground="White"
+                           Margin="0,0,8,0"
+                           VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding MsfsNeedsRestartText}"
+                           MaxWidth="440"
+                           TextWrapping="Wrap"
+                           FontWeight="Bold"
+                           FontSize="12"
+                           Foreground="White"
+                           VerticalAlignment="Center"/>
+            </StackPanel>
+        </Border>
+
+        <!-- X-Plane Restart Banner -->
+        <Border Grid.Row="0"
+                Margin="0,0,0,0"
+                Background="#FF8C00"
+                CornerRadius="4"
+                Padding="10,5"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Top"
+                Visibility="{Binding XPlaneNeedsRestartVisibility}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="ℹ"
+                           FontSize="14"
+                           Foreground="White"
+                           Margin="0,0,8,0"
+                           VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding XPlaneRestartText}"
+                           ToolTip="{Binding XPlaneRemovalFailureDetails}"
+                           Grid.Column="1"
+                           TextWrapping="Wrap"
+                           FontWeight="Bold"
+                           FontSize="12"
+                            Foreground="White"
+                            VerticalAlignment="Center"/>
+                <Button Content="Retry now"
+                        Grid.Column="2"
+                        Command="{Binding RetryXPlaneRemovalSyncCommand}"
+                        Visibility="{Binding XPlaneRetryVisibility}"
+                        Margin="10,0,0,0"
+                        Padding="8,2"
+                        Background="Transparent"
+                        BorderBrush="White"
+                        BorderThickness="1"
+                        Foreground="White"
+                        Cursor="Hand"/>
+                <Button Content="Dismiss"
+                        Grid.Column="3"
+                        Command="{Binding DismissXPlaneRestartCommand}"
+                        Margin="10,0,0,0"
+                        Padding="8,2"
+                        Background="Transparent"
+                        BorderBrush="White"
+                        BorderThickness="1"
+                        Foreground="White"
+                        Cursor="Hand"/>
+            </Grid>
+        </Border>
+
         <!-- API Token and Search in vertical layout -->
         <StackPanel Grid.Row="1"
                     Margin="0,0,0,15">
@@ -629,8 +1055,9 @@
                     </Grid.ColumnDefinitions>
                     <Grid Grid.Column="0">
                         <PasswordBox x:Name="ApiTokenPasswordBox"
-                                     local:Presentation.Behaviors.PasswordBoxAssistant.BindPassword="True"
-                                     local:Presentation.Behaviors.PasswordBoxAssistant.BoundPassword="{Binding ApiToken, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                     behaviors:PasswordBoxAssistant.BindPassword="True"
+                                     behaviors:PasswordBoxAssistant.RemoveWhitespace="True"
+                                     behaviors:PasswordBoxAssistant.BoundPassword="{Binding ApiToken, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
                         <TextBlock Text="Enter BARS API Token Here"
                                    Margin="5,0,0,0"
                                    VerticalAlignment="Center"
@@ -645,6 +1072,29 @@
                             Margin="5,0,0,0"
                             Command="{Binding SaveTokenCommand}"/>
                 </Grid>
+                <TextBlock Text="{Binding ApiTokenValidationMessage}"
+                           Foreground="#F4B183"
+                           Margin="0,5,0,0"
+                           TextWrapping="Wrap">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Visibility"
+                                    Value="Visible"/>
+                            <Style.Triggers>
+                                <Trigger Property="Text"
+                                         Value="">
+                                    <Setter Property="Visibility"
+                                            Value="Collapsed"/>
+                                </Trigger>
+                                <Trigger Property="Text"
+                                         Value="{x:Null}">
+                                    <Setter Property="Visibility"
+                                            Value="Collapsed"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
             </StackPanel>
 
             <!-- Airport Search -->
@@ -652,12 +1102,7 @@
                 <TextBlock Text="Search Airports"
                            Margin="0,0,0,5"/>
                 <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
                     <TextBox x:Name="SearchAirportsTextBox"
-                             Grid.Column="0"
                              Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}">
                         <TextBox.Style>
                             <Style TargetType="TextBox"
@@ -672,7 +1117,7 @@
                                                 <Grid>
                                                     <ScrollViewer x:Name="PART_ContentHost"
                                                                   Focusable="false"/>
-                                                    <TextBlock Text="Enter ICAO or scenery package to search"
+                                                    <TextBlock Text="You can search by ICAO, Name, or Package Name"
                                                                Foreground="#858585"
                                                                Margin="5,0,0,0"
                                                                VerticalAlignment="Center"
@@ -691,9 +1136,6 @@
                                                     <Setter Property="BorderBrush"
                                                             Value="#66BCFF"
                                                             TargetName="border"/>
-                                                    <Setter Property="BorderThickness"
-                                                            Value="2"
-                                                            TargetName="border"/>
                                                 </Trigger>
                                             </ControlTemplate.Triggers>
                                         </ControlTemplate>
@@ -702,22 +1144,63 @@
                             </Style>
                         </TextBox.Style>
                     </TextBox>
-                    <Button x:Name="SearchButton"
-                            Grid.Column="1"
-                            Content="Search"
-                            Width="60"
-                            Margin="5,0,0,0"
-                            Command="{Binding SearchCommand}"/>
                 </Grid>
             </StackPanel>
         </StackPanel>
 
-        <!-- Airport List Header -->
-        <TextBlock Grid.Row="2"
-                   Text="Airport List"
-                   FontSize="16"
-                   FontWeight="SemiBold"
-                   Margin="0,0,0,5"/>
+        <!-- Simulator Toggle and Airport List Header -->
+        <Grid Grid.Row="2"
+              Margin="0,0,0,5">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Column="0"
+                       Text="Airport List"
+                       FontSize="16"
+                       FontWeight="SemiBold"
+                       VerticalAlignment="Center"/>
+
+            <!-- Simulator Toggle -->
+            <StackPanel Grid.Column="2"
+                        Orientation="Horizontal"
+                        VerticalAlignment="Center">
+                <TextBlock Text="Simulator:"
+                           Foreground="#CCCCCC"
+                           VerticalAlignment="Center"
+                           Margin="0,0,8,0"/>
+                <Border Background="#2D2D30"
+                        BorderBrush="#3E3E42"
+                        BorderThickness="1"
+                        CornerRadius="3">
+                    <StackPanel Orientation="Horizontal">
+                        <RadioButton x:Name="Sim2024Radio"
+                                     Content="2024"
+                                     Foreground="White"
+                                     Padding="10,5"
+                                     IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=0, Mode=TwoWay}"
+                                     GroupName="SimulatorToggle"
+                                     Style="{StaticResource SimulatorToggleRadioButton}"/>
+                        <RadioButton x:Name="Sim2020Radio"
+                                     Content="2020"
+                                     Foreground="White"
+                                     Padding="10,5"
+                                     IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=1, Mode=TwoWay}"
+                                     GroupName="SimulatorToggle"
+                                     Style="{StaticResource SimulatorToggleRadioButton}"/>
+                        <RadioButton x:Name="XPlaneRadio"
+                                     Content="X-Plane"
+                                     Foreground="White"
+                                     Padding="10,5"
+                                     IsChecked="{Binding SelectedSimulatorIndex, Converter={StaticResource IndexToBoolConverter}, ConverterParameter=2, Mode=TwoWay}"
+                                     GroupName="SimulatorToggle"
+                                     Style="{StaticResource SimulatorToggleRadioButton}"/>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </Grid>
 
         <!-- Custom Airports Display using ItemsControl instead of ListView -->
         <Border Grid.Row="3"
@@ -732,6 +1215,7 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="80"/>
                         <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="70"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0"
                                Text="ICAO"
@@ -743,45 +1227,96 @@
                                Foreground="White"
                                Padding="5,5"
                                FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="2"
+                               Text="Removals"
+                               Foreground="White"
+                               Padding="5,5"
+                               FontWeight="SemiBold"
+                               HorizontalAlignment="Center"/>
                 </Grid>
 
                 <!-- Items -->
-                <ScrollViewer VerticalScrollBarVisibility="Hidden"
-                              HorizontalScrollBarVisibility="Disabled">
-                    <ItemsControl x:Name="AirportsItemsControl"
-                                  Margin="0"
-                                  ItemsSource="{Binding Airports}">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <Border BorderThickness="0,0,0,1"
-                                        BorderBrush="#3E3E42"
-                                        Background="Transparent">
-                                    <Grid>
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="80"/>
-                                            <ColumnDefinition Width="*"/>
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Grid.Column="0"
-                                                   Text="{Binding ICAO}"
-                                                   Foreground="White"
-                                                   FontWeight="Bold"
-                                                   Padding="8,8,5,8"
-                                                   VerticalAlignment="Center"/>
-                                        <Border Grid.Column="1"
-                                                Padding="5,5">
-                                            <ComboBox Width="440"
-                                                      ItemsSource="{Binding SceneryPackages}"
-                                                      SelectedItem="{Binding SelectedPackage, Mode=TwoWay}"
-                                                      DisplayMemberPath="Name"
-                                                      Style="{StaticResource ListViewComboBoxStyle}"
-                                                      ItemContainerStyle="{StaticResource DarkComboBoxItem}"/>
-                                        </Border>
-                                    </Grid>
-                                </Border>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                </ScrollViewer>
+                <Grid>
+                    <ScrollViewer VerticalScrollBarVisibility="Hidden"
+                                  HorizontalScrollBarVisibility="Disabled">
+                        <ItemsControl x:Name="AirportsItemsControl"
+                                      Margin="0"
+                                      ItemsSource="{Binding Airports}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Style="{StaticResource AirportRowEntranceStyle}"
+                                            BorderThickness="0,0,0,1"
+                                            BorderBrush="#3E3E42"
+                                            Background="Transparent">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="80"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="70"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0"
+                                                       Text="{Binding ICAO}"
+                                                       Foreground="White"
+                                                       FontWeight="Bold"
+                                                       Padding="8,8,5,8"
+                                                       VerticalAlignment="Center"/>
+                                            <Border Grid.Column="1"
+                                                    Padding="5,5"
+                                                    HorizontalAlignment="Stretch">
+                                                <ComboBox HorizontalAlignment="Stretch"
+                                                          MinWidth="380"
+                                                          ItemsSource="{Binding SceneryPackages}"
+                                                          SelectedItem="{Binding SelectedPackage, Mode=TwoWay}"
+                                                          DisplayMemberPath="Name"
+                                                          Style="{StaticResource ListViewComboBoxStyle}"
+                                                          ItemContainerStyle="{StaticResource DarkComboBoxItem}"/>
+                                            </Border>
+                                            <CheckBox Grid.Column="2"
+                                                      IsChecked="{Binding SceneryRemovalEnabled, Mode=TwoWay}"
+                                                      IsEnabled="{Binding SceneryRemovalAvailable}"
+                                                      HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center"
+                                                      ToolTipService.ShowOnDisabled="True"
+                                                      Style="{StaticResource ToggleSwitchStyle}">
+                                                <CheckBox.ToolTip>
+                                                    <ToolTip MaxWidth="300">
+                                                        <TextBlock Text="{Binding SceneryRemovalToolTip}"
+                                                                   TextWrapping="Wrap"/>
+                                                    </ToolTip>
+                                                </CheckBox.ToolTip>
+                                            </CheckBox>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+
+                    <TextBlock Text="No airports or packages found"
+                               Foreground="#AAAAAA"
+                               FontStyle="Italic"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility"
+                                        Value="Collapsed"/>
+                                <Style.Triggers>
+                                    <MultiDataTrigger>
+                                        <MultiDataTrigger.Conditions>
+                                            <Condition Binding="{Binding Airports.Count}"
+                                                       Value="0"/>
+                                            <Condition Binding="{Binding IsBusy}"
+                                                       Value="False"/>
+                                        </MultiDataTrigger.Conditions>
+                                        <Setter Property="Visibility"
+                                                Value="Visible"/>
+                                    </MultiDataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </Grid>
             </DockPanel>
         </Border>
 
@@ -803,6 +1338,7 @@
             <TextBlock Grid.Column="1"
                        x:Name="PageInfoText"
                        Text="{Binding PageInfo}"
+                       VerticalAlignment="Center"
                        HorizontalAlignment="Center"/>
             <Button Grid.Column="2"
                     x:Name="NextPageButton"

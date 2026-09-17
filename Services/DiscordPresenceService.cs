@@ -7,6 +7,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using BARS_Client_V2.Application;
 using BARS_Client_V2.Infrastructure.Networking;
+using BARS_Client_V2.Infrastructure.Simulators.Msfs;
+using BARS_Client_V2.Infrastructure.Simulators.XPlane;
 
 namespace BARS_Client_V2.Services;
 
@@ -30,7 +32,10 @@ internal sealed class DiscordPresenceService : BackgroundService
     private string? _lastLargeText;
     private string _serverStatus = "Disconnected";
     private DateTime _lastSendUtc = DateTime.MinValue;
+    private DateTime _lastAttemptUtc = DateTime.MinValue;
     private bool _forceUpdate;
+    private volatile bool _isEnabled = true;
+    private bool _presenceCleared;
 
     // Rate limiting thresholds
     private static readonly TimeSpan MinUpdateInterval = TimeSpan.FromSeconds(12);
@@ -97,6 +102,11 @@ internal sealed class DiscordPresenceService : BackgroundService
     {
         var client = _client;
         if (client == null || !client.IsInitialized) return;
+        if (!_isEnabled)
+        {
+            EnsurePresenceCleared(client);
+            return;
+        }
         string airport = "";
         var latest = _simManager.LatestState;
         if (latest != null)
@@ -126,22 +136,32 @@ internal sealed class DiscordPresenceService : BackgroundService
         }
         var connector = _simManager.ActiveConnector;
         string simCode = connector?.SimulatorId ?? "None";
-        bool simConnected = connector?.IsConnected == true;
+        bool connectorConnected = connector?.IsConnected == true;
+        bool hasFlightData = latest != null;
+        bool simConnected = connectorConnected && hasFlightData;
         bool? is2024 = null;
-        if (connector is BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsSimulatorConnector msfsConn)
+        if (connector is MsfsSimulatorConnector msfsConn)
         {
             is2024 = msfsConn.IsMsfs2024;
-            if (simConnected)
+            if (connectorConnected)
             {
                 simCode = is2024 == true ? "MSFS 2024" : (is2024 == false ? "MSFS 2020" : "MSFS");
             }
         }
+        else if (connector is XPlaneSimulatorConnector && connectorConnected)
+        {
+            simCode = "X-Plane 12";
+        }
 
-        // Choose small image key for MSFS variants (prefer 2024 if ID indicates such in future; using msfs2020 for now)
         string? smallKey = null;
         if (simConnected)
         {
-            if (is2024 == true) smallKey = "msfs2024"; else if (is2024 == false) smallKey = "msfs2020"; else smallKey = "msfs2020"; // default/fallback
+            smallKey = connector switch
+            {
+                XPlaneSimulatorConnector => "xplane",
+                MsfsSimulatorConnector when is2024 == true => "msfs2024",
+                _ => "msfs2020"
+            };
         }
         string? smallText = simConnected ? simCode : null;
 
@@ -167,22 +187,13 @@ internal sealed class DiscordPresenceService : BackgroundService
         {
             force = _forceUpdate;
             changed = force || details != _lastDetails || state != _lastState || smallKey != _lastSmallKey || smallText != _lastSmallText || largeText != _lastLargeText;
-            if (changed)
-            {
-                _lastDetails = details;
-                _lastState = state;
-                _lastSmallKey = smallKey;
-                _lastSmallText = smallText;
-                _lastLargeText = largeText;
-                _forceUpdate = false;
-            }
         }
 
         var now = DateTime.UtcNow;
         if (!changed && (now - _lastSendUtc) < TimeSpan.FromMinutes(5)) return; // periodic keepalive every 5 min
-        if (!force && (now - _lastSendUtc) < MinUpdateInterval) return;
+        if (!force && (now - _lastAttemptUtc) < MinUpdateInterval) return;
 
-        _lastSendUtc = now;
+        _lastAttemptUtc = now;
 
         try
         {
@@ -205,12 +216,123 @@ internal sealed class DiscordPresenceService : BackgroundService
                 }
             };
             client.SetPresence(presence);
+            lock (_stateLock)
+            {
+                _lastDetails = details;
+                _lastState = state;
+                _lastSmallKey = smallKey;
+                _lastSmallText = smallText;
+                _lastLargeText = largeText;
+                _forceUpdate = false;
+                _lastSendUtc = now;
+            }
             _logger.LogDebug("Discord presence updated: details='{details}', state='{state}', smallKey='{smallKey}'", details, state, smallKey);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "Failed to set Discord presence");
         }
+    }
+
+    private void EnsurePresenceCleared(DiscordRpcClient client)
+    {
+        var shouldClear = false;
+        lock (_stateLock)
+        {
+            if (_presenceCleared)
+            {
+                return;
+            }
+
+            _presenceCleared = true;
+            _lastDetails = null;
+            _lastState = null;
+            _lastSmallKey = null;
+            _lastSmallText = null;
+            _lastLargeText = null;
+            _lastSendUtc = DateTime.MinValue;
+            _lastAttemptUtc = DateTime.MinValue;
+            _forceUpdate = false;
+            shouldClear = true;
+        }
+
+        if (!shouldClear)
+        {
+            return;
+        }
+
+        try
+        {
+            client.ClearPresence();
+            _logger.LogDebug("Discord presence cleared");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to clear Discord presence while disabled");
+        }
+    }
+
+    public bool IsEnabled => _isEnabled;
+
+    public void SetEnabled(bool enabled)
+    {
+        DiscordRpcClient? clientToClear = null;
+        var stateChanged = false;
+
+        lock (_stateLock)
+        {
+            if (_isEnabled == enabled)
+            {
+                return;
+            }
+
+            _isEnabled = enabled;
+            _forceUpdate = true;
+            _lastSendUtc = DateTime.MinValue;
+            _lastAttemptUtc = DateTime.MinValue;
+            stateChanged = true;
+
+            if (enabled)
+            {
+                _presenceCleared = false;
+            }
+            else
+            {
+                clientToClear = _client;
+            }
+        }
+
+        if (!stateChanged)
+        {
+            return;
+        }
+
+        if (enabled)
+        {
+            QueueImmediate();
+            _logger.LogInformation("Discord Rich Presence enabled");
+            return;
+        }
+
+        if (clientToClear != null)
+        {
+            EnsurePresenceCleared(clientToClear);
+        }
+        else
+        {
+            lock (_stateLock)
+            {
+                _presenceCleared = true;
+                _lastDetails = null;
+                _lastState = null;
+                _lastSmallKey = null;
+                _lastSmallText = null;
+                _lastLargeText = null;
+                _forceUpdate = false;
+            }
+        }
+
+        _logger.LogInformation("Discord Rich Presence disabled");
     }
 
     public override Task StopAsync(CancellationToken cancellationToken)
