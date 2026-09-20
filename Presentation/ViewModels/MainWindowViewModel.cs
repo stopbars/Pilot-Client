@@ -24,6 +24,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 {
     private readonly SimulatorManager _simManager;
     private readonly MsfsPointController? _pointController;
+    private readonly XPlanePointController? _xplanePointController;
     private readonly AirportStateHub? _stateHub;
     private readonly DispatcherTimer _uiPoll;
     private readonly DispatcherTimer _serverTimer;
@@ -59,10 +60,13 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private string _debugModeTextCache = string.Empty;
     private int _selectedSimulatorIndex; // 0 = MSFS 2024, 1 = MSFS 2020, 2 = X-Plane
     private string? _msfsNeedsRestartSim;
+    private string? _msfsRestartSession;
     private bool _xplaneNeedsRestart;
     private bool _xplaneRemovalSyncPending;
     private bool _xplaneRemovalSyncInProgress;
     private bool _xplaneRemovalSyncFailed;
+    private bool _xplaneRemovalAutoRetry = true;
+    private string? _dismissedXPlaneFailure;
     private string? _xplaneRemovalFailureDetails;
     private int _xplaneRemovalRetryAttempt;
     private DateTime _xplaneRemovalRetryNotBeforeUtc;
@@ -147,7 +151,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             _simConnected = value;
             if (!value && _debugModeActive)
             {
-                _pointController?.ToggleDebugMode();
+                StopActiveDebugMode();
             }
             if (value)
             {
@@ -258,7 +262,9 @@ public class MainWindowViewModel : INotifyPropertyChanged
             return;
         }
 
-        _debugModeTextCache = $"Debug Mode  —  State: {_debugStateId}";
+        _debugModeTextCache = _debugPointId == null
+            ? "Debug Mode: Waiting for nearby lights"
+            : $"Debug Mode  —  State: {_debugStateId}";
         OnPropertyChanged(nameof(DebugModeText));
     }
 
@@ -294,6 +300,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         if (_msfsNeedsRestartSim != simulator)
         {
             _msfsNeedsRestartSim = simulator;
+            _msfsRestartSession = MsfsProcessSession.Capture(simulator);
             OnPropertyChanged(nameof(MsfsNeedsRestartVisibility));
             OnPropertyChanged(nameof(MsfsNeedsRestartText));
         }
@@ -301,7 +308,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     public string XPlaneNeedsRestartVisibility => _xplaneNeedsRestart && _removalsUpdateError == null ? "Visible" : "Collapsed";
     public string XPlaneRestartText => _xplaneRemovalSyncFailed
-        ? "X-Plane removals failed. Retrying when X-Plane is closed."
+        ? (_xplaneRemovalAutoRetry ? "X-Plane removals failed. Retrying when closed." : "Some X-Plane removals are unavailable.")
         : "Close X-Plane. Wait for removals to finish, then restart it.";
     public string? XPlaneRemovalFailureDetails => _xplaneRemovalFailureDetails;
     public string XPlaneRetryVisibility => _xplaneRemovalSyncFailed ? "Visible" : "Collapsed";
@@ -379,11 +386,12 @@ public class MainWindowViewModel : INotifyPropertyChanged
     public ICommand DismissXPlaneRestartCommand { get; }
     public ICommand RetryXPlaneRemovalSyncCommand { get; }
 
-    public MainWindowViewModel(SimulatorManager simManager, INearestAirportService nearestService, IAirportRepository airportRepository, ISettingsStore settingsStore, MsfsPointController? pointController = null, AirportStateHub? stateHub = null)
+    public MainWindowViewModel(SimulatorManager simManager, INearestAirportService nearestService, IAirportRepository airportRepository, ISettingsStore settingsStore, MsfsPointController? pointController = null, AirportStateHub? stateHub = null, XPlanePointController? xplanePointController = null)
     {
-        StartupTrace.Write("MainWindowViewModel ctor");
+        ClientLog.Write("MainWindowViewModel ctor");
         _simManager = simManager;
         _pointController = pointController;
+        _xplanePointController = xplanePointController;
         _stateHub = stateHub;
         _nearestService = nearestService;
         _airportRepo = airportRepository;
@@ -406,19 +414,24 @@ public class MainWindowViewModel : INotifyPropertyChanged
         EndActiveModeCommand = new DelegateCommand(async _ => await EndActiveModeAsync(), _ => DebugModeActive);
         DismissXPlaneRestartCommand = new DelegateCommand(_ =>
         {
+            _dismissedXPlaneFailure = _xplaneRemovalFailureDetails;
             SetXPlaneNeedsRestart(false);
             return Task.CompletedTask;
         });
         RetryXPlaneRemovalSyncCommand = new DelegateCommand(async _ =>
         {
             _xplaneRemovalRetryNotBeforeUtc = DateTime.MinValue;
-            await ApplyPendingXPlaneRemovalChangesAsync();
+            await ApplyPendingXPlaneRemovalChangesAsync(manual: true);
         }, _ => _xplaneRemovalSyncPending && !_xplaneRemovalSyncInProgress && !IsXPlaneRunning());
 
         // Subscribe to debug mode changes
         if (_pointController != null)
         {
             _pointController.DebugModeChanged += OnDebugModeChanged;
+        }
+        if (_xplanePointController != null)
+        {
+            _xplanePointController.DebugModeChanged += OnDebugModeChanged;
         }
 
         if (stateHub != null)
@@ -487,7 +500,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             return;
         }
         _initializationStarted = true;
-        StartupTrace.Write("InitializeAsync start");
+        ClientLog.Write("InitializeAsync start");
         ClientSettings settings;
         if (_preloadedSettings is { } preloaded)
         {
@@ -517,7 +530,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         _savedRemovalToggles = settings.SceneryRemovalToggles != null
             ? new Dictionary<string, bool>(settings.SceneryRemovalToggles, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-        StartupTrace.Write($"InitializeAsync settings loaded; packages={_savedPackages.Count}");
+        ClientLog.Write($"InitializeAsync settings loaded; packages={_savedPackages.Count}");
         _ = SyncRemovalStatesOnStartupAsync();
 
         if (_removalsUpdatedSims != null && _removalsUpdatedSims.Count > 0)
@@ -532,26 +545,29 @@ public class MainWindowViewModel : INotifyPropertyChanged
         }
 
         await RefreshFromStateAsync();
-        StartupTrace.Write("InitializeAsync state refreshed");
+        ClientLog.Write("InitializeAsync state refreshed");
         await RunSearchAsync(resetPage: true);
-        StartupTrace.Write("InitializeAsync completed initial search");
+        ClientLog.Write("InitializeAsync completed initial search");
     }
 
     public void ApplyRemovalsUpdateResult(RemovalsUpdateService.RemovalsUpdateResult result)
     {
         RunOnDispatcher(() =>
         {
+            ClearExpiredMsfsRestart();
             _msfs2020RemovalsEtag = result.Settings.Msfs2020RemovalsEtag;
             _msfs2024RemovalsEtag = result.Settings.Msfs2024RemovalsEtag;
+            var runningSimulator = GetRunningMsfsSim();
             foreach (var simulator in result.UpdatedSimulators)
             {
-                if (!simulator.Equals("xplane", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(simulator, runningSimulator, StringComparison.OrdinalIgnoreCase) &&
+                    result.RestartSessions.TryGetValue(simulator, out var session) &&
+                    session == MsfsProcessSession.Capture(simulator))
                 {
                     _externalMsfsRestartSims.Add(simulator);
                 }
             }
 
-            var runningSimulator = GetRunningMsfsSim();
             if (runningSimulator != null) RefreshMsfsRestartBanner(runningSimulator);
         });
     }
@@ -562,6 +578,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async Task DiscoverXPlanePackageSelectionsAsync()
     {
+        if (XPlaneLocalRemovalsService.ResolveXPlaneRoot() == null) return;
         var airports = await _airportRepo.GetAllForSimulatorAsync("xplane");
         var changed = false;
 
@@ -587,7 +604,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         if (changed)
         {
             await PersistSettingsAsync();
-            StartupTrace.Write("Discovered new X-Plane package selections for removal synchronization");
+            ClientLog.Write("Discovered new X-Plane package selections for removal synchronization");
         }
     }
 
@@ -607,7 +624,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     private async Task RunSearchAsync(bool resetPage = false)
     {
         _searchDebounce.Stop();
-        StartupTrace.Write($"RunSearchAsync begin reset={resetPage}");
+        ClientLog.Write($"RunSearchAsync begin reset={resetPage}");
         if (IsBusy)
         {
             ScheduleSearch(resetPage);
@@ -621,7 +638,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             if (resetPage) CurrentPage = 1;
 
             var (items, total) = await _airportRepo.SearchAsync(SearchText, CurrentPage, _pageSize);
-            StartupTrace.Write($"RunSearchAsync results items={items.Count} total={total}");
+            ClientLog.Write($"RunSearchAsync results items={items.Count} total={total}");
             TotalCount = total;
 
             if (IsContentUnchanged(items))
@@ -691,19 +708,19 @@ public class MainWindowViewModel : INotifyPropertyChanged
             if (packagesChanged)
             {
                 await PersistSettingsAsync();
-                StartupTrace.Write("RunSearchAsync persisted package changes");
+                ClientLog.Write("RunSearchAsync persisted package changes");
             }
         }
         catch (System.Exception ex)
         {
             Status = "Error loading airports";
             LogLines.Add(ex.Message);
-            StartupTrace.Write($"RunSearchAsync exception: {ex.Message}");
+            ClientLog.Write($"RunSearchAsync exception: {ex.Message}");
         }
         finally
         {
             IsBusy = false;
-            StartupTrace.Write("RunSearchAsync end");
+            ClientLog.Write("RunSearchAsync end");
         }
     }
 
@@ -749,7 +766,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 if (selectionChanged)
                 {
                     try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, configuredSim, match.Name); }
-                    catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
+                    catch (Exception ex) { ClientLog.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
                 }
 
                 SyncRemovalToggle(row, airport.ICAO, configuredSim, match.Name);
@@ -781,7 +798,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             if (selectionChanged)
             {
                 try { SceneryService.Instance.SetSelectedPackage(airport.ICAO, configuredSim, defaultPackage.Name); }
-                catch (Exception ex) { StartupTrace.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
+                catch (Exception ex) { ClientLog.Write($"SceneryService.SetSelectedPackage error: {ex.Message}"); }
             }
 
             SyncRemovalToggle(row, airport.ICAO, configuredSim, defaultPackage.Name);
@@ -796,8 +813,10 @@ public class MainWindowViewModel : INotifyPropertyChanged
         row.SceneryRemovalToolTip = row.SceneryRemovalAvailable
             ? "Toggle scenery removals for this airport"
             : SceneryService.Instance.AreRemovalsUnavailable(icao, simulator, packageName)
-                ? "Removals are unavailable for this scenery. The contribution or local scenery needs updating. BARS lights still work."
-                : "Checking removals. Keep X-Plane closed until the check finishes. BARS lights are still available.";
+                ? SceneryService.Instance.RemovalUnavailableReason(icao, simulator, packageName) + " BARS lights still work."
+                : XPlaneLocalRemovalsService.ResolveXPlaneRoot() == null
+                    ? "X-Plane was not found. Configure its installation folder in the BARS Installer."
+                    : "Checking removals. Keep X-Plane closed until the check finishes. BARS lights are still available.";
         var toggleKey = $"{icao}:{simulator}:{packageName}";
         var enabled = row.SceneryRemovalAvailable &&
             (!_savedRemovalToggles.TryGetValue(toggleKey, out var saved) || saved);
@@ -831,7 +850,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async Task SaveSettingsAsync()
     {
-        StartupTrace.Write("SaveSettingsAsync begin");
+        ClientLog.Write("SaveSettingsAsync begin");
         if (_apiToken != null)
         {
             var resanitized = SanitizeToken(_apiToken);
@@ -848,7 +867,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         {
             Status = ApiTokenValidationMessage ?? "API tokens start with BARS_.";
             LogLines.Add(Status);
-            StartupTrace.Write("SaveSettingsAsync invalid token");
+            ClientLog.Write("SaveSettingsAsync invalid token");
             return;
         }
 
@@ -857,7 +876,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         // Update baseline so save button disables until another change
         _originalApiToken = _apiToken;
         (SaveTokenCommand as DelegateCommand)?.RaiseCanExecuteChanged();
-        StartupTrace.Write("SaveSettingsAsync complete");
+        ClientLog.Write("SaveSettingsAsync complete");
     }
 
     private async void AirportRowOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -933,7 +952,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 SceneryService.Instance.SetSelectedPackage(row.ICAO, configuredSim, newPackageName);
                 await PersistSettingsAsync();
                 UpdateRestartStateAfterRemovalChange(key, configuredSim, changed, baselineCreated);
-                StartupTrace.Write($"PersistSettingsAsync after selection {row.ICAO}");
+                ClientLog.Write($"PersistSettingsAsync after selection {row.ICAO}");
             }
             catch (Exception ex)
             {
@@ -1024,7 +1043,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 _savedRemovalToggles[toggleKey] = requestedEnabled;
                 await PersistSettingsAsync();
                 UpdateRestartStateAfterRemovalChange(key, configuredSim, changed, baselineCreated);
-                StartupTrace.Write($"PersistSettingsAsync after toggle {row.ICAO}");
+                ClientLog.Write($"PersistSettingsAsync after toggle {row.ICAO}");
             }
             catch (Exception ex)
             {
@@ -1078,7 +1097,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         }
         catch (Exception rollbackError)
         {
-            StartupTrace.Write($"Removal rollback failed for {icao}: {rollbackError}");
+            ClientLog.Write($"Removal rollback failed for {icao}: {rollbackError}");
         }
     }
 
@@ -1093,7 +1112,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
             // Keep the original operation error user-visible. A failed settings
             // rollback is logged as additional recovery context instead of
             // escaping this async UI event handler.
-            StartupTrace.Write($"Package selection settings rollback failed for {icao}: {rollbackError}");
+            ClientLog.Write($"Package selection settings rollback failed for {icao}: {rollbackError}");
         }
     }
 
@@ -1168,6 +1187,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private void RefreshMsfsRestartBanner(string simulator)
     {
+        ClearExpiredMsfsRestart();
         var suffix = $":{simulator}";
         var hasUiChanges = _pendingMsfsRemovalBaselines.Keys.Any(key =>
             key.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
@@ -1175,50 +1195,54 @@ public class MainWindowViewModel : INotifyPropertyChanged
         SetMsfsNeedsRestart(shouldShow ? simulator : string.Empty);
     }
 
-    private async Task SyncRemovalStatesOnStartupAsync()
+    private Task SyncRemovalStatesOnStartupAsync() => Task.WhenAll(
+        SyncMsfsRemovalStatesOnStartupAsync(), SyncXPlaneRemovalStatesOnStartupAsync());
+
+    private async Task SyncMsfsRemovalStatesOnStartupAsync()
     {
         try
         {
-            await DiscoverXPlanePackageSelectionsAsync();
-            var changedSimulators = await SceneryService.Instance
-                .SyncAllRemovalStatesAsync(_savedPackages, _savedRemovalToggles);
-            var runningSim = GetRunningMsfsSim();
-            if (runningSim != null && changedSimulators.Contains(runningSim))
+            await RemovalFileAccess.MsfsTransactionGate.WaitAsync();
+            HashSet<string> changed;
+            try { changed = await SceneryService.Instance.SyncMsfsRemovalStatesFromSettingsAsync(_settingsStore); }
+            finally { RemovalFileAccess.MsfsTransactionGate.Release(); }
+            var running = GetRunningMsfsSim();
+            if (running != null && changed.Contains(running))
             {
                 RunOnDispatcher(() =>
                 {
-                    _externalMsfsRestartSims.Add(runningSim);
-                    SetMsfsNeedsRestart(runningSim);
+                    _externalMsfsRestartSims.Add(running);
+                    SetMsfsNeedsRestart(running);
                 });
-            }
-            if (changedSimulators.Contains("xplane"))
-            {
-                RunOnDispatcher(ShowXPlaneRestartAlert);
             }
         }
         catch (Exception ex)
         {
-            StartupTrace.Write($"Removal startup sync failed: {ex}");
-            RunOnDispatcher(() =>
-            {
-                Status = $"Could not sync scenery removals: {ex.Message}";
-                LogLines.Add(Status);
-                if (_savedPackages.Keys.Any(key => key.EndsWith(":xplane", StringComparison.OrdinalIgnoreCase)))
-                {
-                    _xplaneRemovalSyncPending = true;
-                    _xplaneRemovalSyncFailed = true;
-                    _xplaneRemovalRetryAttempt = 0;
-                    _xplaneRemovalRetryNotBeforeUtc = DateTime.MinValue;
-                    SetXPlaneRemovalFailure(ex);
-                    SetXPlaneNeedsRestart(true);
-                    OnPropertyChanged(nameof(XPlaneRestartText));
-                    OnPropertyChanged(nameof(XPlaneRetryVisibility));
-                    (RetryXPlaneRemovalSyncCommand as DelegateCommand)?.RaiseCanExecuteChanged();
-                }
-            });
+            ClientLog.Write($"MSFS removal startup sync failed: {ex}");
+            RunOnDispatcher(() => { Status = $"Could not sync MSFS removals: {ex.Message}"; LogLines.Add(Status); });
         }
     }
 
+    private async Task SyncXPlaneRemovalStatesOnStartupAsync()
+    {
+        try
+        {
+            if (XPlaneLocalRemovalsService.ResolveXPlaneRoot() == null)
+            {
+                ClientLog.Write("X-Plane startup sync skipped: no installation found.");
+                return;
+            }
+            _xplaneRemovalSyncPending = true;
+            _xplaneRemovalAutoRetry = true;
+            if (IsXPlaneRunning()) ShowXPlaneRestartAlert();
+            else await ApplyPendingXPlaneRemovalChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            ClientLog.Write($"X-Plane removal startup sync failed: {ex}");
+            ReportXPlaneSyncFailure(ex);
+        }
+    }
     private void ShowXPlaneRestartAlert()
     {
         if (!IsXPlaneRunning())
@@ -1227,6 +1251,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
         }
 
         _xplaneRemovalSyncPending = true;
+        _xplaneRemovalAutoRetry = true;
+        _dismissedXPlaneFailure = null;
         _xplaneRemovalSyncFailed = false;
         _xplaneRemovalRetryAttempt = 0;
         _xplaneRemovalRetryNotBeforeUtc = DateTime.MinValue;
@@ -1235,10 +1261,11 @@ public class MainWindowViewModel : INotifyPropertyChanged
         SetXPlaneNeedsRestart(true);
     }
 
-    private async Task ApplyPendingXPlaneRemovalChangesAsync()
+    private async Task ApplyPendingXPlaneRemovalChangesAsync(bool manual = false)
     {
         if (_xplaneRemovalSyncInProgress ||
             !_xplaneRemovalSyncPending ||
+            (!manual && !_xplaneRemovalAutoRetry) ||
             IsXPlaneRunning() ||
             DateTime.UtcNow < _xplaneRemovalRetryNotBeforeUtc)
         {
@@ -1246,8 +1273,10 @@ public class MainWindowViewModel : INotifyPropertyChanged
         }
 
         _xplaneRemovalSyncInProgress = true;
+        if (manual) _dismissedXPlaneFailure = null;
         try
         {
+            await DiscoverXPlanePackageSelectionsAsync();
             var packages = new Dictionary<string, string>(
                 _savedPackages,
                 StringComparer.OrdinalIgnoreCase);
@@ -1255,8 +1284,15 @@ public class MainWindowViewModel : INotifyPropertyChanged
                 _savedRemovalToggles,
                 StringComparer.OrdinalIgnoreCase);
             await SceneryService.Instance.SyncXPlaneRemovalStatesAsync(packages, toggles);
+            if (IsXPlaneRunning())
+            {
+                ShowXPlaneRestartAlert();
+                return;
+            }
             _xplaneRemovalSyncPending = false;
             _xplaneRemovalSyncFailed = false;
+            _xplaneRemovalAutoRetry = true;
+            _dismissedXPlaneFailure = null;
             _xplaneRemovalRetryAttempt = 0;
             _xplaneRemovalRetryNotBeforeUtc = DateTime.MinValue;
             SetXPlaneNeedsRestart(false);
@@ -1266,24 +1302,31 @@ public class MainWindowViewModel : INotifyPropertyChanged
         }
         catch (Exception ex)
         {
-            _xplaneRemovalSyncPending = true;
-            _xplaneRemovalSyncFailed = true;
-            _xplaneRemovalRetryAttempt++;
-            var retryDelaySeconds = Math.Min(60, 5 * (1 << Math.Min(3, _xplaneRemovalRetryAttempt - 1)));
-            _xplaneRemovalRetryNotBeforeUtc = DateTime.UtcNow.AddSeconds(retryDelaySeconds);
-            SetXPlaneRemovalFailure(ex);
-            SetXPlaneNeedsRestart(true);
-            OnPropertyChanged(nameof(XPlaneRestartText));
-            OnPropertyChanged(nameof(XPlaneRetryVisibility));
-            Status = $"Could not apply X-Plane removal changes after exit: {ex.Message}";
+            ReportXPlaneSyncFailure(ex);
+            Status = $"Could not apply X-Plane removals: {ex.Message}";
             LogLines.Add(Status);
-            StartupTrace.Write($"Deferred X-Plane removal sync failed: {ex}");
+            ClientLog.Write($"Deferred X-Plane removal sync failed: {ex}");
         }
         finally
         {
             _xplaneRemovalSyncInProgress = false;
             (RetryXPlaneRemovalSyncCommand as DelegateCommand)?.RaiseCanExecuteChanged();
         }
+    }
+
+    private void ReportXPlaneSyncFailure(Exception error)
+    {
+        _xplaneRemovalSyncPending = true;
+        _xplaneRemovalSyncFailed = true;
+        _xplaneRemovalAutoRetry = XPlaneRemovalSyncException.IsRetryable(error);
+        _xplaneRemovalRetryAttempt++;
+        var delay = Math.Min(60, 5 * (1 << Math.Min(3, _xplaneRemovalRetryAttempt - 1)));
+        _xplaneRemovalRetryNotBeforeUtc = DateTime.UtcNow.AddSeconds(delay);
+        SetXPlaneRemovalFailure(error);
+        SetXPlaneNeedsRestart(!string.Equals(_dismissedXPlaneFailure, error.Message, StringComparison.Ordinal));
+        OnPropertyChanged(nameof(XPlaneRestartText));
+        OnPropertyChanged(nameof(XPlaneRetryVisibility));
+        (RetryXPlaneRemovalSyncCommand as DelegateCommand)?.RaiseCanExecuteChanged();
     }
 
     private void SetXPlaneRemovalFailure(Exception error)
@@ -1296,7 +1339,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
     {
         Status = $"Could not update {icao} scenery removals: {error.Message}";
         LogLines.Add(Status);
-        StartupTrace.Write($"Scenery removal update failed for {icao}: {error}");
+        ClientLog.Write($"Scenery removal update failed for {icao}: {error}");
     }
 
     private async Task RefreshFromStateAsync()
@@ -1517,7 +1560,18 @@ public class MainWindowViewModel : INotifyPropertyChanged
     {
         if (_testingModeActive) return;
         if (!SimulatorConnected) return;
-        _pointController?.ToggleDebugMode();
+        if (_pointController?.IsDebugMode == true || _xplanePointController?.IsDebugMode == true)
+            StopActiveDebugMode();
+        else if (_simManager.ActiveConnector is XPlaneSimulatorConnector)
+            _xplanePointController?.ToggleDebugMode();
+        else
+            _pointController?.ToggleDebugMode();
+    }
+
+    private void StopActiveDebugMode()
+    {
+        if (_pointController?.IsDebugMode == true) _pointController.ToggleDebugMode();
+        if (_xplanePointController?.IsDebugMode == true) _xplanePointController.ToggleDebugMode();
     }
 
     private async Task EndActiveModeAsync()
@@ -1554,8 +1608,8 @@ public class MainWindowViewModel : INotifyPropertyChanged
                     }
                     catch (Exception ex)
                     {
-                        _xplaneRemovalSyncPending = true;
-                        _xplaneRemovalSyncFailed = true;
+                        ReportXPlaneSyncFailure(ex);
+                        ClientLog.Write($"Could not restore X-Plane removals after testing: {ex}");
                         LogLines.Add($"Could not restore X-Plane removals after testing: {ex.Message}");
                     }
                 }
@@ -1565,7 +1619,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
         if (_debugModeActive)
         {
-            _pointController?.ToggleDebugMode();
+            StopActiveDebugMode();
         }
     }
 
@@ -1573,9 +1627,10 @@ public class MainWindowViewModel : INotifyPropertyChanged
     {
         RunOnDispatcher(() =>
         {
+            _debugPointId = e.ClosestPointId;
             DebugModeActive = e.IsDebugMode;
             DebugStateId = e.CurrentStateId;
-            _debugPointId = e.ClosestPointId;
+            UpdateDebugModeText();
             if (e.IsDebugMode)
             {
                 Status = $"Debug Mode: Testing point {e.ClosestPointId ?? "(none)"}";
@@ -1674,19 +1729,24 @@ public class MainWindowViewModel : INotifyPropertyChanged
         return string.IsNullOrWhiteSpace(current) || IsValidToken(current);
     }
 
+    private void ClearExpiredMsfsRestart()
+    {
+        if (string.IsNullOrEmpty(_msfsNeedsRestartSim)) return;
+        var current = MsfsProcessSession.Capture(_msfsNeedsRestartSim);
+        if (current != null && current == _msfsRestartSession) return;
+        _externalMsfsRestartSims.Clear();
+        _pendingMsfsRemovalBaselines.Clear();
+        SetMsfsNeedsRestart(string.Empty);
+    }
+
     private async void UiPollOnTick(object? sender, EventArgs e)
     {
         try { await RefreshFromStateAsync(); }
         catch (Exception ex) { LogLines.Add(ex.Message); }
 
-        if (!string.IsNullOrEmpty(_msfsNeedsRestartSim) && !IsMsfsRunning())
-        {
-            _externalMsfsRestartSims.Clear();
-            _pendingMsfsRemovalBaselines.Clear();
-            SetMsfsNeedsRestart(string.Empty);
-        }
+        ClearExpiredMsfsRestart();
 
-        if (_xplaneRemovalSyncPending && !IsXPlaneRunning())
+        if (_xplaneRemovalSyncPending && _xplaneRemovalAutoRetry && !IsXPlaneRunning())
         {
             await ApplyPendingXPlaneRemovalChangesAsync();
         }
@@ -1700,7 +1760,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
         }
         else if (_debugModeActive)
         {
-            _pointController?.ToggleDebugMode();
+            StopActiveDebugMode();
         }
     }
 
@@ -1741,7 +1801,7 @@ public class MainWindowViewModel : INotifyPropertyChanged
 
     private async Task PersistSettingsAsync()
     {
-        StartupTrace.Write("PersistSettingsAsync begin");
+        ClientLog.Write("PersistSettingsAsync begin");
         await _settingsSaveGate.WaitAsync();
         try
         {
@@ -1756,12 +1816,12 @@ public class MainWindowViewModel : INotifyPropertyChanged
             });
             _msfs2020RemovalsEtag = updated.Msfs2020RemovalsEtag;
             _msfs2024RemovalsEtag = updated.Msfs2024RemovalsEtag;
-            StartupTrace.Write("PersistSettingsAsync save complete");
+            ClientLog.Write("PersistSettingsAsync save complete");
         }
         finally
         {
             _settingsSaveGate.Release();
-            StartupTrace.Write("PersistSettingsAsync end");
+            ClientLog.Write("PersistSettingsAsync end");
         }
     }
 

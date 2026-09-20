@@ -72,39 +72,39 @@ internal sealed class JsonSettingsStore : ISettingsStore
 
     public async Task<ClientSettings> LoadAsync()
     {
-        StartupTrace.Write("JsonSettingsStore.LoadAsync enter");
+        ClientLog.Write("JsonSettingsStore.LoadAsync enter");
         await SettingsFileAccess.Gate.WaitAsync().ConfigureAwait(false);
         try
         {
             var settings = await LoadCoreAsync().ConfigureAwait(false);
-            StartupTrace.Write("JsonSettingsStore.LoadAsync success");
+            ClientLog.Write("JsonSettingsStore.LoadAsync success");
             return settings;
         }
         catch (Exception ex)
         {
-            StartupTrace.Write($"JsonSettingsStore.LoadAsync exception: {ex.Message}");
+            ClientLog.Write($"JsonSettingsStore.LoadAsync exception: {ex.Message}");
             PreserveUnreadableSettings();
             return ClientSettings.Empty;
         }
         finally
         {
-            StartupTrace.Write("JsonSettingsStore.LoadAsync exit");
+            ClientLog.Write("JsonSettingsStore.LoadAsync exit");
             SettingsFileAccess.Gate.Release();
         }
     }
 
     public async Task SaveAsync(ClientSettings settings)
     {
-        StartupTrace.Write("JsonSettingsStore.SaveAsync enter");
+        ClientLog.Write("JsonSettingsStore.SaveAsync enter");
         await SettingsFileAccess.Gate.WaitAsync().ConfigureAwait(false);
         try
         {
             await SaveCoreAsync(settings).ConfigureAwait(false);
-            StartupTrace.Write("JsonSettingsStore.SaveAsync success");
+            ClientLog.Write("JsonSettingsStore.SaveAsync success");
         }
         finally
         {
-            StartupTrace.Write("JsonSettingsStore.SaveAsync exit");
+            ClientLog.Write("JsonSettingsStore.SaveAsync exit");
             SettingsFileAccess.Gate.Release();
         }
     }
@@ -130,7 +130,7 @@ internal sealed class JsonSettingsStore : ISettingsStore
     private async Task<ClientSettings> LoadCoreAsync()
     {
         if (!File.Exists(_path)) return ClientSettings.Empty;
-        StartupTrace.Write("JsonSettingsStore.LoadAsync reading file");
+        ClientLog.Write("JsonSettingsStore.LoadAsync reading file");
         var json = await File.ReadAllTextAsync(_path).ConfigureAwait(false);
         var persisted = JsonSerializer.Deserialize<Persisted>(json, Options)
             ?? throw new InvalidDataException("The settings file was empty.");

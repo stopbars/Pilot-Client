@@ -62,7 +62,7 @@ public partial class SettingsWindow : Window
         }
         catch (Exception ex)
         {
-            StartupTrace.Write($"Save preferences failed: {ex.Message}");
+            ClientLog.Write($"Save preferences failed: {ex.Message}");
             SaveError.Text = "Couldn't save your settings. Please try again.";
             SaveError.Visibility = Visibility.Visible;
         }

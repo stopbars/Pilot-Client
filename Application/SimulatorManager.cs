@@ -114,9 +114,16 @@ public sealed class SimulatorManager : BackgroundService
             }
             try
             {
+                bool? lastOnGround = null;
                 await foreach (var raw in active.StreamRawAsync(stoppingToken))
                 {
                     lock (_lock) _latest = new FlightState(raw.Latitude, raw.Longitude, raw.OnGround, raw.HeadingDeg);
+                    if (lastOnGround != raw.OnGround)
+                    {
+                        _logger.LogInformation("Simulator telemetry available: {sim}; onGround={onGround}; lat={lat}; lon={lon}",
+                            active.DisplayName, raw.OnGround, raw.Latitude, raw.Longitude);
+                        lastOnGround = raw.OnGround;
+                    }
                 }
             }
             catch (OperationCanceledException) { }

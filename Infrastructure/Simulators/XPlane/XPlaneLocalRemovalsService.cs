@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using BARS_Client_V2.Infrastructure.Diagnostics;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
@@ -282,6 +283,8 @@ internal sealed class XPlaneLocalRemovalsService
         var activeSource = await FindActiveAirportSourceAsync(root, icao, cancellationToken).ConfigureAwait(false)
             ?? throw new XPlaneRemovalMismatchException($"{icao} was not found in active X-Plane scenery.");
         var sourcePath = activeSource.Path;
+        if (!XPlaneSceneryPaths.CanPatch(root, sourcePath))
+            throw new XPlaneRemovalMismatchException($"The active {icao} scenery is outside the X-Plane folder or uses a filesystem link: {sourcePath}. BARS left it unchanged.");
         var previousSourcePath = existing == null
             ? null
             : ResolveStateSourcePath(root, existing.SourceRelativePath);
@@ -309,6 +312,31 @@ internal sealed class XPlaneLocalRemovalsService
                 $"{icao}'s full-file backup does not match its saved removal state.");
         }
 
+        var current = await ReadAirportBlockAsync(sourcePath, icao, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException($"{icao} disappeared from its active apt.dat.");
+        if (existingForSource == null && !BlockHash(current).Equals(originalHash, StringComparison.OrdinalIgnoreCase))
+        {
+            // Another airport can keep a shared full-file backup alive after this
+            // unpatched airport is updated. Require exact selectors on its new source.
+            _ = PatchAirportBlock(current, artifact);
+            var refreshedFile = $"source-refresh-{Guid.NewGuid():N}.apt.dat";
+            var refreshedPath = ResolveBackupPath(root, refreshedFile);
+            await CopyFileAsync(fullBackupPath, refreshedPath, cancellationToken).ConfigureAwait(false);
+            await ReplaceAirportBlockAtomicallyAsync(refreshedPath, icao, current, cancellationToken).ConfigureAwait(false);
+            state.SourceBackups.Remove(sourceBackup);
+            sourceBackup = new SourceFileBackup
+            {
+                SourceRelativePath = sourceBackup.SourceRelativePath,
+                BackupFile = refreshedFile,
+                OriginalSha256 = await FileSha256Async(refreshedPath, cancellationToken).ConfigureAwait(false)
+            };
+            state.SourceBackups.Add(sourceBackup);
+            fullBackupPath = refreshedPath;
+            original = current;
+            originalHash = BlockHash(original);
+            Infrastructure.Diagnostics.ClientLog.Write($"Refreshed unpatched {icao} in shared scenery backup after verifying current removal selectors; source={sourcePath}");
+        }
+
         var backupFile = existingForSource?.BackupFile ??
                          $"{icao}-{originalHash[..16]}.apt";
         await WriteAtomicallyIfChangedAsync(
@@ -317,8 +345,6 @@ internal sealed class XPlaneLocalRemovalsService
                 cancellationToken)
             .ConfigureAwait(false);
 
-        var current = await ReadAirportBlockAsync(sourcePath, icao, cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidOperationException($"{icao} disappeared from its active apt.dat.");
         if (existingForSource != null &&
             !MatchesPatchedBlock(current, existingForSource) &&
             !RampIndependentHash(current).Equals(RampIndependentHash(original), StringComparison.OrdinalIgnoreCase))
@@ -364,7 +390,15 @@ internal sealed class XPlaneLocalRemovalsService
                 NormalizeBlock(original), cancellationToken).ConfigureAwait(false);
         }
 
-        var patched = PreserveRampMetadata(PatchAirportBlock(original, artifact), current);
+        string patched;
+        try { patched = PreserveRampMetadata(PatchAirportBlock(original, artifact), current); }
+        catch (XPlaneRemovalMismatchException ex)
+        {
+            Infrastructure.Diagnostics.ClientLog.Write(
+                $"X-Plane removal mismatch: airport={icao}; package={packageName}; source={sourcePath}; " +
+                $"backup={fullBackupPath}; generation={artifactGenerationId}; original={BlockHash(original)}; current={BlockHash(current)}; {ex.Message}");
+            throw;
+        }
         var patchedHash = BlockHash(patched);
         var targetChanged = !BlockHash(current).Equals(patchedHash, StringComparison.OrdinalIgnoreCase);
 
@@ -558,6 +592,8 @@ internal sealed class XPlaneLocalRemovalsService
             var end = index + 1;
             while (end < lines.Length && (string.IsNullOrWhiteSpace(lines[end]) || IsNodeRecord(lines[end]))) end++;
             result.Add(FeatureId(lines[index..end]));
+            var geometry = XPlaneRemovalGeometry.AptFingerprint(lines[index..end]);
+            if (geometry != null) result.Add("geometry:" + geometry);
             index = end - 1;
         }
         return result;
@@ -663,9 +699,7 @@ internal sealed class XPlaneLocalRemovalsService
     private static string PatchAirportBlock(string airportBlock, RemovalArtifact artifact)
     {
         var lines = airportBlock.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n').ToList();
-        var selectorsByFeature = artifact.Selectors
-            .GroupBy(selector => selector.Feature, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.OrdinalIgnoreCase);
+        var features = new List<(int Start, int Count, List<string> Lines, string Id, string? Geometry)>();
         var matchedSelectors = new HashSet<RemovalSelector>();
 
         for (var index = 0; index < lines.Count;)
@@ -684,15 +718,89 @@ internal sealed class XPlaneLocalRemovalsService
             }
 
             var featureLines = lines.GetRange(index, end - index);
-            var featureId = FeatureId(featureLines);
-            if (selectorsByFeature.TryGetValue(featureId, out var selectors))
-            {
-                PatchFeature(featureLines, selectors, matchedSelectors);
-                lines.RemoveRange(index, end - index);
-                lines.InsertRange(index, featureLines);
-                end = index + featureLines.Count;
-            }
+            features.Add((index, end - index, featureLines, FeatureId(featureLines), XPlaneRemovalGeometry.AptFingerprint(featureLines)));
             index = end;
+        }
+
+        var byId = features.ToLookup(feature => feature.Id, StringComparer.OrdinalIgnoreCase);
+        var byGeometry = features.Where(feature => feature.Geometry != null).ToLookup(feature => feature.Geometry!);
+        var selected = new Dictionary<int, List<(RemovalSelector Requested, RemovalSelector Resolved)>>();
+        var owners = new HashSet<(int Start, int Code, int Run)>();
+        ILookup<(int Code, string Geometry), (int Start, XPlaneAptRangePatcher.RunGeometry Run)>? installedRuns = null;
+        List<(int Start, XPlaneAptRangePatcher.RunGeometry Run)>? installedPaths = null;
+        var pathMatcher = new XPlaneAptGeometryMatcher();
+        var toleranceMatches = 0;
+        void Select(int start, RemovalSelector requested, RemovalSelector resolved)
+        {
+            if (!owners.Add((start, resolved.Code, resolved.Run)))
+                throw new XPlaneRemovalMismatchException("Multiple removals matched the same installed lighting run.");
+            if (!selected.TryGetValue(start, out var selections)) selected[start] = selections = [];
+            selections.Add((requested, resolved));
+        }
+        foreach (var group in artifact.Selectors.GroupBy(selector => selector.Feature, StringComparer.OrdinalIgnoreCase))
+        {
+            var geometries = group.Select(selector => selector.Geometry).Where(geometry => geometry != null).Distinct().ToArray();
+            if (geometries.Length > 1 || geometries.Any(geometry => !XPlaneRemovalGeometry.IsValid(geometry)))
+                throw new XPlaneRemovalMismatchException("Conflicting X-Plane geometry fingerprints.");
+            var geometry = geometries.FirstOrDefault() ?? XPlaneRemovalReferences.Apt(artifact.Icao, group.Key);
+            var candidates = byId[group.Key].ToArray();
+            if (candidates.Length == 0 && geometry != null) candidates = byGeometry[geometry].ToArray();
+            if (candidates.Length == 0)
+            {
+                foreach (var selector in group)
+                {
+                    var reference = XPlaneRemovalReferences.AptRun(artifact.Icao, selector.Feature, selector.Code, selector.Run);
+                    if (reference == null) continue;
+                    if (installedRuns == null)
+                    {
+                        var runs = new List<(int Start, XPlaneAptRangePatcher.RunGeometry Run)>();
+                        foreach (var feature in features)
+                        {
+                            try { runs.AddRange(XPlaneAptRangePatcher.DescribeRuns(feature.Lines).Select(run => (feature.Start, run))); }
+                            catch (InvalidDataException) { /* Malformed paths cannot be exact candidates. */ }
+                        }
+                        installedRuns = runs.ToLookup(item => (item.Run.Code, item.Run.Geometry));
+                        installedPaths = runs;
+                    }
+                    var matches = installedRuns[(selector.Code, reference)].ToArray();
+                    if (matches.Length == 0)
+                    {
+                        var path = XPlaneRemovalReferences.AptPath(artifact.Icao, selector.Feature, selector.Code, selector.Run);
+                        if (path == null) continue;
+                        var nearby = installedPaths!.Where(candidate => candidate.Run.Code == selector.Code)
+                            .Select(candidate => (candidate.Start, candidate.Run.Run, Ranges: pathMatcher.Match(path, candidate.Run.Path, selector.Ranges)))
+                            .Where(candidate => candidate.Ranges != null).Take(2).ToArray();
+                        if (nearby.Length == 0) continue;
+                        if (nearby.Length != 1) throw new XPlaneRemovalMismatchException("X-Plane lighting geometry matches more than one installed run within 10 cm.");
+                        Select(nearby[0].Start, selector, new RemovalSelector
+                        {
+                            Feature = selector.Feature, Code = selector.Code, Run = nearby[0].Run, Ranges = nearby[0].Ranges!.ToList()
+                        });
+                        toleranceMatches++;
+                        continue;
+                    }
+                    if (matches.Length != 1) throw new XPlaneRemovalMismatchException("X-Plane lighting geometry matches more than one installed run.");
+                    Select(matches[0].Start, selector, new RemovalSelector
+                    {
+                        Feature = selector.Feature, Code = selector.Code, Run = matches[0].Run.Run, Ranges = selector.Ranges
+                    });
+                }
+                continue;
+            }
+            if (candidates.Length != 1 || (geometry != null && candidates[0].Geometry != geometry))
+                throw new XPlaneRemovalMismatchException("X-Plane removal geometry is ambiguous or its properties changed. Scenery was left unchanged.");
+            foreach (var selector in group) Select(candidates[0].Start, selector, selector);
+        }
+        if (toleranceMatches > 0)
+            ClientLog.Write($"X-Plane {artifact.Icao} removal matching: {toleranceMatches} lighting runs resolved within 10 cm.");
+        // Resolve against the pristine airport before splitting any removal ranges.
+        foreach (var feature in features.AsEnumerable().Reverse())
+        {
+            if (!selected.TryGetValue(feature.Start, out var selectors)) continue;
+            PatchFeature(feature.Lines, selectors.Select(selection => selection.Resolved).ToArray());
+            foreach (var selection in selectors) matchedSelectors.Add(selection.Requested);
+            lines.RemoveRange(feature.Start, feature.Count);
+            lines.InsertRange(feature.Start, feature.Lines);
         }
 
         if (matchedSelectors.Count != artifact.Selectors.Count)
@@ -711,14 +819,12 @@ internal sealed class XPlaneLocalRemovalsService
 
     private static void PatchFeature(
         List<string> featureLines,
-        IReadOnlyCollection<RemovalSelector> selectors,
-        ISet<RemovalSelector> matchedSelectors)
+        IReadOnlyCollection<RemovalSelector> selectors)
     {
         var patched = XPlaneAptRangePatcher.Patch(featureLines,
             selectors.Select(selector => new XPlaneAptRangePatcher.Selection(selector.Code, selector.Run, selector.Ranges)).ToArray());
         featureLines.Clear();
         featureLines.AddRange(patched);
-        foreach (var selector in selectors) matchedSelectors.Add(selector);
     }
 
     private static async Task<SourceAirport?> FindActiveAirportSourceAsync(
@@ -739,38 +845,14 @@ internal sealed class XPlaneLocalRemovalsService
 
     private static IEnumerable<string> EnumerateAptDatByPriority(string root)
     {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var iniPath = Path.Combine(root, "Custom Scenery", "scenery_packs.ini");
-        if (File.Exists(iniPath))
+        foreach (var package in XPlaneSceneryPaths.Packages(root))
         {
-            foreach (var line in File.ReadLines(iniPath))
-            {
-                var trimmed = line.Trim();
-                const string prefix = "SCENERY_PACK ";
-                if (!trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-                var relative = trimmed[prefix.Length..].Trim().Replace('/', Path.DirectorySeparatorChar);
-                if (relative.Contains(PackageName, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-                var candidate = Path.Combine(root, relative, "Earth nav data", "apt.dat");
-                if (File.Exists(candidate) && seen.Add(candidate))
-                {
-                    yield return candidate;
-                }
-            }
-        }
-
-        var global = Path.Combine(root, "Global Scenery", "Global Airports", "Earth nav data", "apt.dat");
-        if (File.Exists(global) && seen.Add(global))
-        {
-            yield return global;
+            if (Path.GetFileName(Path.TrimEndingDirectorySeparator(package))
+                .Equals(PackageName, StringComparison.OrdinalIgnoreCase)) continue;
+            var candidate = Path.Combine(package, "Earth nav data", "apt.dat");
+            if (File.Exists(candidate)) yield return candidate;
         }
     }
-
     private static Task<string?> ReadAirportBlockAsync(
         string path,
         string icao,
@@ -1312,14 +1394,7 @@ internal sealed class XPlaneLocalRemovalsService
         }
     }
 
-    private static string GetStateRoot(string root)
-    {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var rootHash = Convert.ToHexString(
-                SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(root).ToUpperInvariant())))
-            .ToLowerInvariant()[..16];
-        return Path.Combine(localAppData, "BARS", "Client", "XPlaneRemovals", rootHash);
-    }
+    private static string GetStateRoot(string root) => XPlaneRemovalStorage.GetStateRoot(root);
 
     private static string GetStatePath(string root) =>
         Path.Combine(GetStateRoot(root), "state.json");
@@ -1664,6 +1739,7 @@ internal sealed class XPlaneLocalRemovalsService
         foreach (var selector in artifact.Selectors)
         {
             if (selector == null ||
+                !XPlaneRemovalGeometry.IsValid(selector.Geometry) ||
                 selector.Feature.Length != 16 ||
                 selector.Feature.Any(character => !Uri.IsHexDigit(character)) ||
                 selector.Code is < 101 or > 108 ||
@@ -1684,60 +1760,7 @@ internal sealed class XPlaneLocalRemovalsService
         }
     }
 
-    private static string? ResolveXPlaneRoot()
-    {
-        try
-        {
-            var running = Process.GetProcessesByName("X-Plane")
-                .Select(process =>
-                {
-                    try { return Path.GetDirectoryName(process.MainModule?.FileName); }
-                    catch { return null; }
-                    finally { process.Dispose(); }
-                })
-                .FirstOrDefault(path => !string.IsNullOrWhiteSpace(path));
-            if (IsXPlaneRoot(running))
-            {
-                return running;
-            }
-        }
-        catch { }
-
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var installerSettings = Path.Combine(localAppData, "BARS", "Installer", "settings.json");
-        if (File.Exists(installerSettings))
-        {
-            try
-            {
-                using var document = JsonDocument.Parse(File.ReadAllText(installerSettings));
-                if (document.RootElement.TryGetProperty("Pilot-Client", out var client))
-                {
-                    foreach (var property in client.EnumerateObject())
-                    {
-                        if (property.Name.Contains("xplane", StringComparison.OrdinalIgnoreCase) &&
-                            property.Value.ValueKind == JsonValueKind.String &&
-                            IsXPlaneRoot(property.Value.GetString()))
-                        {
-                            return property.Value.GetString();
-                        }
-                    }
-                }
-            }
-            catch { }
-        }
-
-        var candidates = new[]
-        {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                "Steam", "steamapps", "common", "X-Plane 12"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                "Steam", "steamapps", "common", "X-Plane 12"),
-        };
-        return candidates.FirstOrDefault(IsXPlaneRoot);
-    }
-
-    private static bool IsXPlaneRoot(string? path) =>
-        !string.IsNullOrWhiteSpace(path) && Directory.Exists(Path.Combine(path, "Custom Scenery"));
+    internal static string? ResolveXPlaneRoot() => XPlaneInstallation.FindRoot();
 
     internal static bool IsXPlaneProcessRunning()
     {
@@ -1775,6 +1798,7 @@ internal sealed class XPlaneLocalRemovalsService
     private sealed class RemovalSelector
     {
         public string Feature { get; set; } = string.Empty;
+        public string? Geometry { get; set; }
         public int Code { get; set; }
         public int Run { get; set; }
         public List<double[]> Ranges { get; set; } = [];

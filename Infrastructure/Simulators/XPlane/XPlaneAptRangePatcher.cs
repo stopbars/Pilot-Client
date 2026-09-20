@@ -6,13 +6,16 @@ namespace BARS_Client_V2.Infrastructure.Simulators.XPlane;
 internal static class XPlaneAptRangePatcher
 {
     internal sealed record Selection(int Code, int Run, IReadOnlyList<double[]> Ranges);
-    private readonly record struct Point(double Lat, double Lon)
+    internal sealed record RunGeometry(int Code, int Run, string Geometry, RunPath Path);
+    internal sealed record RunPath(int Code, bool Closed, RunSegment[] Segments);
+    internal sealed record RunSegment(Curve Curve, string[] Styles);
+    internal readonly record struct Point(double Lat, double Lon)
     {
         public static Point Lerp(Point a, Point b, double t) => new(a.Lat + (b.Lat - a.Lat) * t, a.Lon + (b.Lon - a.Lon) * t);
         public static Point Mirror(Point p, Point c) => new(2 * p.Lat - c.Lat, 2 * p.Lon - c.Lon);
     }
     private sealed record Node(int Code, Point Position, Point? Incoming, Point? Outgoing, string[] Styles);
-    private sealed record Curve(Point A, Point B, Point C, Point D, bool Curved)
+    internal sealed record Curve(Point A, Point B, Point C, Point D, bool Curved)
     {
         public Point At(double t)
         {
@@ -34,7 +37,7 @@ internal static class XPlaneAptRangePatcher
             return from == 0 ? prefix : prefix.Split(from / to).Right;
         }
     }
-    private sealed class Segment(Curve curve, string[] styles)
+    internal sealed class Segment(Curve curve, string[] styles)
     {
         public Curve Curve { get; } = curve;
         public string[] Styles { get; } = styles;
@@ -50,7 +53,7 @@ internal static class XPlaneAptRangePatcher
         }
     }
 
-    public static List<string> Patch(IReadOnlyList<string> lines, IReadOnlyList<Selection> selections)
+    private static (bool Closed, List<Segment> Segments) ReadGeometry(IReadOnlyList<string> lines)
     {
         var raw = lines.Where(line => IsNode(line)).Select(Parse).ToArray();
         if (raw.Length < 2) throw new InvalidDataException("Invalid apt.dat linear feature.");
@@ -69,17 +72,55 @@ internal static class XPlaneAptRangePatcher
             var a = nodes[index]; var d = nodes[(index + 1) % nodes.Count];
             segments.Add(new Segment(new Curve(a.Position, a.Outgoing ?? a.Position, d.Incoming ?? d.Position, d.Position, a.Outgoing.HasValue || d.Incoming.HasValue), a.Styles));
         }
+        return (closed, segments);
+    }
+
+    private static List<List<Segment>> LightingRuns(List<Segment> segments, int code)
+    {
+        List<List<Segment>> runs = []; List<Segment>? run = null;
+        foreach (var segment in segments)
+        {
+            if (!segment.Styles.Contains(code.ToString(CultureInfo.InvariantCulture))) { run = null; continue; }
+            if (run == null) { run = []; runs.Add(run); }
+            run.Add(segment);
+        }
+        runs.RemoveAll(candidate => candidate.Sum(segment => segment.Length) <= 0);
+        return runs;
+    }
+
+    internal static IReadOnlyList<RunGeometry> DescribeRuns(IReadOnlyList<string> lines)
+    {
+        var (closed, segments) = ReadGeometry(lines);
+        var result = new List<RunGeometry>();
+        for (var code = 101; code <= 108; code++)
+        {
+            var runs = LightingRuns(segments, code);
+            for (var index = 0; index < runs.Count; index++)
+            {
+                var run = runs[index];
+                var path = new RunPath(code, closed && run.Count == segments.Count,
+                    run.Select(segment => new RunSegment(segment.Curve, segment.Styles)).ToArray());
+                result.Add(new(code, index, RunFingerprint(path), path));
+            }
+        }
+        return result;
+    }
+
+    internal static string RunFingerprint(RunPath path)
+    {
+        string Position(Point p) => p.Lat.ToString("R", CultureInfo.InvariantCulture) + "," + p.Lon.ToString("R", CultureInfo.InvariantCulture);
+        return XPlaneRemovalGeometry.Digest("bars-apt-light-run-v1\n" + (path.Closed ? "closed" : "open") + "\n" +
+            string.Join('\n', path.Segments.Select(segment => string.Join('|', segment.Curve.Curved ? "curve" : "line",
+                Position(segment.Curve.A), Position(segment.Curve.B), Position(segment.Curve.C), Position(segment.Curve.D),
+                string.Join(',', segment.Styles.Order(StringComparer.Ordinal))))));
+    }
+
+    public static List<string> Patch(IReadOnlyList<string> lines, IReadOnlyList<Selection> selections)
+    {
+        var (closed, segments) = ReadGeometry(lines);
         foreach (var selection in selections)
         {
-            List<List<Segment>> runs = []; List<Segment>? run = null;
-            foreach (var segment in segments)
-            {
-                if (!segment.Styles.Contains(selection.Code.ToString(CultureInfo.InvariantCulture))) { run = null; continue; }
-                if (run == null) { run = []; runs.Add(run); }
-                run.Add(segment);
-            }
-            // The Website does not emit zero-length runs.
-            runs.RemoveAll(candidate => candidate.Sum(segment => segment.Length) <= 0);
+            var runs = LightingRuns(segments, selection.Code);
             if (selection.Run < 0 || selection.Run >= runs.Count || selection.Ranges.Count == 0) throw new InvalidDataException("apt.dat lighting run was not found.");
             var selected = runs[selection.Run]; var total = selected.Sum(segment => segment.Length); var cursor = 0d;
             foreach (var segment in selected)
@@ -152,7 +193,7 @@ internal static class XPlaneAptRangePatcher
         for (var i = 1; i <= steps; i++) distances[i] = distances[i - 1] + Distance(curve.At((double)(i - 1) / steps), curve.At((double)i / steps));
         return distances;
     }
-    private static double Distance(Point a, Point b)
+    internal static double Distance(Point a, Point b)
     {
         var lat = (b.Lat - a.Lat) * Math.PI / 180; var lon = (b.Lon - a.Lon) * Math.PI / 180;
         var value = Math.Pow(Math.Sin(lat / 2), 2) + Math.Cos(a.Lat * Math.PI / 180) * Math.Cos(b.Lat * Math.PI / 180) * Math.Pow(Math.Sin(lon / 2), 2);

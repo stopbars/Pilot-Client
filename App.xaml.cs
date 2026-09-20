@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -59,14 +59,18 @@ namespace BARS_Client_V2
                 return;
             }
             StartSingleInstancePipeServer();
-            StartupTrace.Reset();
-            StartupTrace.Write("OnStartup begin");
+            ClientLog.StartSession();
+            DispatcherUnhandledException += (_, args) => ClientLog.Write($"Unhandled UI exception: {args.Exception}");
+            AppDomain.CurrentDomain.UnhandledException += (_, args) => ClientLog.Write($"Unhandled exception: {args.ExceptionObject}");
+            TaskScheduler.UnobservedTaskException += (_, args) => ClientLog.Write($"Unobserved task exception: {args.Exception}");
+            ClientLog.Write("OnStartup begin");
             _host = Host.CreateDefaultBuilder()
                 .ConfigureLogging(lb =>
                 {
                     lb.ClearProviders();
                     lb.AddConsole();          // Console (visible if app started from console / debug output window)
                     lb.AddDebug();            // VS Debug Output window
+                    lb.AddProvider(new ClientLogProvider());
                     lb.AddEventSourceLogger(); // ETW / PerfView if needed
                     lb.SetMinimumLevel(LogLevel.Trace);
                 })
@@ -111,7 +115,8 @@ namespace BARS_Client_V2
                         var settingsStore = sp.GetRequiredService<ISettingsStore>();
                         var pointController = sp.GetRequiredService<BARS_Client_V2.Infrastructure.Simulators.Msfs.MsfsPointController>();
                         var hub = sp.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
-                        return new MainWindowViewModel(simManager, nearestService, airportRepo, settingsStore, pointController, hub);
+                        var xplanePointController = sp.GetRequiredService<Infrastructure.Simulators.XPlane.XPlanePointController>();
+                        return new MainWindowViewModel(simManager, nearestService, airportRepo, settingsStore, pointController, hub, xplanePointController);
                     });
                     services.AddTransient<MainWindow>();
                 })
@@ -121,24 +126,24 @@ namespace BARS_Client_V2
             _applicationStoppingRegistration = lifetime.ApplicationStopping.Register(OnHostApplicationStopping);
 
 
-            StartupTrace.Write("Host built");
-            StartupTrace.Write("Resolving MainWindow");
+            ClientLog.Write("Host built");
+            ClientLog.Write("Resolving MainWindow");
             var mainWindow = _host.Services.GetRequiredService<MainWindow>();
-            StartupTrace.Write("MainWindow resolved");
-            StartupTrace.Write("Resolving MainWindowViewModel");
+            ClientLog.Write("MainWindow resolved");
+            ClientLog.Write("Resolving MainWindowViewModel");
             var vm = _host.Services.GetRequiredService<MainWindowViewModel>();
-            StartupTrace.Write("MainWindowViewModel resolved");
+            ClientLog.Write("MainWindowViewModel resolved");
             _discordPresenceService = _host.Services.GetRequiredService<DiscordPresenceService>();
             ClientSettings startupSettings;
             try
             {
-                StartupTrace.Write("Preloading client settings");
+                ClientLog.Write("Preloading client settings");
                 var settingsStore = _host.Services.GetRequiredService<ISettingsStore>();
                 startupSettings = settingsStore.LoadAsync().ConfigureAwait(false).GetAwaiter().GetResult();
             }
             catch (Exception ex)
             {
-                StartupTrace.Write($"Preloading client settings failed: {ex.Message}");
+                ClientLog.Write($"Preloading client settings failed: {ex.Message}");
                 startupSettings = ClientSettings.Empty;
             }
             _discordPresenceService.SetEnabled(startupSettings.DiscordPresenceEnabled);
@@ -147,12 +152,12 @@ namespace BARS_Client_V2
             _mainWindowViewModel = vm;
             _startupAutoMinimizeRequested = startupSettings.AutoMinimizeOnStart;
             mainWindow.DataContext = vm;
-            StartupTrace.Write("Resolving AirportWebSocketManager");
+            ClientLog.Write("Resolving AirportWebSocketManager");
             var wsMgr = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportWebSocketManager>();
-            StartupTrace.Write("AirportWebSocketManager resolved");
-            StartupTrace.Write("Resolving AirportStateHub");
+            ClientLog.Write("AirportWebSocketManager resolved");
+            ClientLog.Write("Resolving AirportStateHub");
             var hub = _host.Services.GetRequiredService<BARS_Client_V2.Infrastructure.Networking.AirportStateHub>();
-            StartupTrace.Write("Airport services resolved");
+            ClientLog.Write("Airport services resolved");
             wsMgr.AttachHub(hub);
             wsMgr.Connected += () => vm.NotifyServerConnected();
             wsMgr.ConnectionError += code => vm.NotifyServerError(code);
@@ -207,7 +212,7 @@ namespace BARS_Client_V2
                     pointController.Suspend();
                 }
             };
-            StartupTrace.Write("Event wiring complete");
+            ClientLog.Write("Event wiring complete");
 
             ConfigureTaskbarIcon(mainWindow);
 
@@ -227,12 +232,12 @@ namespace BARS_Client_V2
             {
                 if (t.IsFaulted && t.Exception != null)
                 {
-                    StartupTrace.Write($"MainWindowViewModel.InitializeAsync error: {t.Exception.GetBaseException().Message}");
+                    ClientLog.Write($"MainWindowViewModel.InitializeAsync error: {t.Exception.GetBaseException().Message}");
                 }
             }, TaskScheduler.Default);
 
             mainWindow.Show();
-            StartupTrace.Write("MainWindow shown");
+            ClientLog.Write("MainWindow shown");
             _removalsUpdateCts = new CancellationTokenSource();
             _removalsUpdateTask = CheckRemovalsInBackgroundAsync(
                 startupSettings,
@@ -251,18 +256,18 @@ namespace BARS_Client_V2
             if (_host != null)
             {
                 var host = _host;
-                StartupTrace.Write("Starting host background task");
+                ClientLog.Write("Starting host background task");
                 _ = Task.Run(async () =>
                 {
                     try
                     {
-                        StartupTrace.Write("Host StartAsync begin");
+                        ClientLog.Write("Host StartAsync begin");
                         await host.StartAsync().ConfigureAwait(false);
-                        StartupTrace.Write("Host StartAsync complete");
+                        ClientLog.Write("Host StartAsync complete");
                     }
                     catch (Exception ex)
                     {
-                        StartupTrace.Write($"Host StartAsync error: {ex.Message}");
+                        ClientLog.Write($"Host StartAsync error: {ex.Message}");
                     }
                 });
             }
@@ -282,7 +287,7 @@ namespace BARS_Client_V2
             {
                 try
                 {
-                    StartupTrace.Write("Checking for removals updates in background");
+                    ClientLog.Write("Checking for removals updates in background");
                     var service = _host?.Services.GetRequiredService<RemovalsUpdateService>();
                     if (service == null) return;
                     RemovalsUpdateService.RemovalsUpdateResult result;
@@ -313,7 +318,7 @@ namespace BARS_Client_V2
                             }
                             catch (Exception syncError)
                             {
-                                StartupTrace.Write($"Post-update removals reconciliation failed: {syncError.Message}");
+                                ClientLog.Write($"Post-update removals reconciliation failed: {syncError.Message}");
                                 throw;
                             }
                         }
@@ -327,44 +332,44 @@ namespace BARS_Client_V2
                         viewModel.SetRemovalsUpdateError(result.FailedSimulators.Count == 0 ? null :
                             $"Could not update removals for {string.Join(", ", result.FailedSimulators.Select(sim => sim == "msfs2024" ? "MSFS 2024" : "MSFS 2020"))}. Leave BARS open to retry automatically.");
                     }
-                    StartupTrace.Write($"Removals update check complete, updated sims: {string.Join(", ", result.UpdatedSimulators)}");
+                    ClientLog.Write($"Removals update check complete, updated sims: {string.Join(", ", result.UpdatedSimulators)}");
                     if (result.FailedSimulators.Count == 0) return;
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    StartupTrace.Write("Removals update check cancelled");
+                    ClientLog.Write("Removals update check cancelled");
                     return;
                 }
                 catch (RemovalPackageInstaller.RecoveryException ex)
                 {
-                    StartupTrace.Write(ex.ToString());
-                    viewModel.SetRemovalsUpdateError("Removal update recovery failed. Close the simulator and contact BARS support with startup.log.");
+                    ClientLog.Write(ex.ToString());
+                    viewModel.SetRemovalsUpdateError("Removal recovery failed. Close the simulator and share the latest client log with BARS support.");
                     return;
                 }
                 catch (Exception ex)
                 {
-                    StartupTrace.Write($"Removals update check failed: {ex.Message}");
+                    ClientLog.Write($"Removals update check failed: {ex.Message}");
                     viewModel.SetRemovalsUpdateError("Could not update removals. Leave BARS open to retry automatically.");
                 }
-                StartupTrace.Write("Retrying removals update in 30 seconds");
+                ClientLog.Write("Retrying removals update in 30 seconds");
                 await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken).ConfigureAwait(false);
             }
         }
 
         protected override async void OnExit(ExitEventArgs e)
         {
-            StartupTrace.Write("OnExit begin");
+            ClientLog.Write("OnExit begin");
             if (_mainWindowViewModel != null)
             {
                 try { await _mainWindowViewModel.PrepareForShutdownAsync(); }
-                catch (Exception ex) { StartupTrace.Write($"Active-mode shutdown cleanup failed: {ex.Message}"); }
+                catch (Exception ex) { ClientLog.Write($"Active-mode shutdown cleanup failed: {ex.Message}"); }
             }
             _removalsUpdateCts?.Cancel();
             if (_removalsUpdateTask != null)
             {
                 try { await _removalsUpdateTask; }
                 catch (OperationCanceledException) { }
-                catch (Exception ex) { StartupTrace.Write($"Removals update shutdown error: {ex.Message}"); }
+                catch (Exception ex) { ClientLog.Write($"Removals update shutdown error: {ex.Message}"); }
             }
             _removalsUpdateCts?.Dispose();
             _removalsUpdateCts = null;
@@ -383,24 +388,24 @@ namespace BARS_Client_V2
                 try
                 {
                     await _host.StopAsync();
-                    StartupTrace.Write("Host StopAsync complete");
+                    ClientLog.Write("Host StopAsync complete");
                 }
                 catch (Exception ex)
                 {
-                    StartupTrace.Write($"Host StopAsync error: {ex.Message}");
+                    ClientLog.Write($"Host StopAsync error: {ex.Message}");
                 }
                 finally
                 {
                     _applicationStoppingRegistration.Dispose();
                 }
                 _host.Dispose();
-                StartupTrace.Write("Host disposed");
+                ClientLog.Write("Host disposed");
             }
             DisposeTaskbarIcon();
             StopSingleInstancePipeServer();
             ReleaseSingleInstanceMutex();
             base.OnExit(e);
-            StartupTrace.Write("OnExit complete");
+            ClientLog.Write("OnExit complete");
         }
 
         private bool TryAcquireSingleInstanceMutex()
@@ -504,7 +509,7 @@ namespace BARS_Client_V2
                 }
                 catch (Exception ex)
                 {
-                    StartupTrace.Write($"Single-instance pipe server error: {ex.Message}");
+                    ClientLog.Write($"Single-instance pipe server error: {ex.Message}");
                     try
                     {
                         await Task.Delay(500, token).ConfigureAwait(false);
@@ -585,7 +590,7 @@ namespace BARS_Client_V2
                 }
                 catch (Exception ex)
                 {
-                    StartupTrace.Write($"Testing protocol error: {ex.Message}");
+                    ClientLog.Write($"Testing protocol error: {ex.Message}");
                     Dispatcher?.BeginInvoke(new Action(() =>
                     {
                         MessageBox.Show(
@@ -701,11 +706,11 @@ namespace BARS_Client_V2
                 _taskbarIcon.ToolTipText = string.IsNullOrWhiteSpace(mainWindow.Title)
                     ? "BARS Client"
                     : mainWindow.Title;
-                StartupTrace.Write("Taskbar icon prepared");
+                ClientLog.Write("Taskbar icon prepared");
             }
             else
             {
-                StartupTrace.Write("TaskbarIcon resource not found");
+                ClientLog.Write("TaskbarIcon resource not found");
             }
         }
 
@@ -731,7 +736,7 @@ namespace BARS_Client_V2
         {
             if (_taskbarIcon == null)
             {
-                StartupTrace.Write("Tray icon unavailable; skipping tray minimize");
+                ClientLog.Write("Tray icon unavailable; skipping tray minimize");
                 return;
             }
 
@@ -836,7 +841,7 @@ namespace BARS_Client_V2
             }
             catch (Exception ex)
             {
-                StartupTrace.Write($"Taskbar icon ForceCreate failed: {ex.Message}");
+                ClientLog.Write($"Taskbar icon ForceCreate failed: {ex.Message}");
             }
         }
 
