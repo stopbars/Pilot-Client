@@ -3,6 +3,7 @@ using System.Threading.Channels;
 using BARS_Client_V2.Application;
 using BARS_Client_V2.Domain;
 using BARS_Client_V2.Infrastructure.Networking;
+using BARS_Client_V2.Infrastructure.Simulators.Msfs;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -35,6 +36,16 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
     private int _lastConnectionGeneration;
     private long _sceneGeneration;
     private long _mapGeneration;
+    private static readonly int[] DebugStates = [0, 1, 2, 3, 4, 5, 6, 7, 20, 21, 22, 23, 24, 25, 26, 27];
+    private readonly object _debugGate = new();
+    private readonly Dictionary<string, PointState> _frozenStates = new(StringComparer.Ordinal);
+    private volatile bool _debugMode;
+    private string? _debugPointId;
+    private int _debugStateIndex;
+    private DateTime _debugNextCycleUtc;
+
+    public bool IsDebugMode => _debugMode;
+    public event EventHandler<DebugModeChangedEventArgs>? DebugModeChanged;
 
     public XPlanePointController(
         XPlaneSimulatorConnector connector,
@@ -50,18 +61,132 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
         _drawDistance = drawDistance ?? new LightDrawDistanceSettings();
         _hub.PointStateChanged += OnPointStateChanged;
         _hub.MapLoaded += OnMapLoaded;
+        _hub.TestingModeChanged += OnTestingModeChanged;
     }
 
     public void OnPointStateChanged(PointState state)
     {
-        _states[state.Metadata.Id] = state;
-        _layouts.TryRemove(state.Metadata.Id, out _);
+        lock (_debugGate)
+        {
+            if (_debugMode)
+            {
+                _frozenStates[state.Metadata.Id] = state;
+                return;
+            }
+            _states[state.Metadata.Id] = state;
+            _layouts.TryRemove(state.Metadata.Id, out _);
+        }
         if (_simulatorManager.ActiveConnector != _connector)
         {
             _snapshotRequired = true;
             return;
         }
         QueuePoint(state.Metadata.Id);
+    }
+
+    public void ToggleDebugMode()
+    {
+        DebugModeChangedEventArgs change;
+        lock (_debugGate)
+        {
+            if (_debugMode)
+            {
+                ResetDebugMode();
+            }
+            else
+            {
+                if (_hub.IsTestingMode || _simulatorManager.ActiveConnector != _connector || !_connector.IsConnected) return;
+                _debugMode = true;
+                _debugStateIndex = 0;
+                _debugPointId = FindDebugPoint();
+                _debugNextCycleUtc = DateTime.UtcNow.AddSeconds(1);
+                Interlocked.Increment(ref _mapGeneration);
+                _snapshotRequired = true;
+                _logger.LogInformation("[XPlaneDebug] Enabled; point={point}; state=0", _debugPointId ?? "(waiting for nearby lights)");
+            }
+            change = DebugChange();
+        }
+        RaiseDebugModeChanged(change);
+    }
+
+    private string? FindDebugPoint()
+    {
+        var flight = _simulatorManager.LatestState;
+        if (flight == null) return null;
+        return _states.Values.Select(state => new
+            {
+                state.Metadata.Id,
+                Distance = DistanceMeters(flight.Latitude, flight.Longitude, state.Metadata.Latitude, state.Metadata.Longitude)
+            })
+            .Where(point => point.Distance <= _drawDistance.Meters)
+            .OrderBy(point => point.Distance).Select(point => point.Id).FirstOrDefault();
+    }
+
+    private void ProcessDebugCycle(DateTime now)
+    {
+        DebugModeChangedEventArgs change;
+        lock (_debugGate)
+        {
+            if (!_debugMode) return;
+            if (_debugPointId == null)
+            {
+                ApplyFrozenStates();
+                _debugPointId = FindDebugPoint();
+                if (_debugPointId == null) return;
+                _debugNextCycleUtc = now.AddSeconds(1);
+                Interlocked.Increment(ref _mapGeneration);
+                _snapshotRequired = true;
+            }
+            else
+            {
+                if (now < _debugNextCycleUtc) return;
+                _debugStateIndex = (_debugStateIndex + 1) % DebugStates.Length;
+                _debugNextCycleUtc = now.AddSeconds(1);
+                QueuePoint(_debugPointId);
+                _logger.LogInformation("[XPlaneDebug] Cycling point={point}; state={state}", _debugPointId, DebugStates[_debugStateIndex]);
+            }
+            change = DebugChange();
+        }
+        RaiseDebugModeChanged(change);
+    }
+
+    private void StopDebugMode()
+    {
+        lock (_debugGate)
+        {
+            if (!_debugMode) return;
+            ResetDebugMode();
+        }
+        RaiseDebugModeChanged(new(false, 0, null));
+    }
+
+    private void ResetDebugMode()
+    {
+        _debugMode = false;
+        _debugPointId = null;
+        ApplyFrozenStates();
+        Interlocked.Increment(ref _mapGeneration);
+        _snapshotRequired = true;
+        _logger.LogInformation("[XPlaneDebug] Disabled; restoring latest network states");
+    }
+
+    private void ApplyFrozenStates()
+    {
+        foreach (var pair in _frozenStates)
+        {
+            _states[pair.Key] = pair.Value;
+            _layouts.TryRemove(pair.Key, out _);
+        }
+        _frozenStates.Clear();
+    }
+
+    private DebugModeChangedEventArgs DebugChange() =>
+        new(_debugMode, _debugMode ? DebugStates[_debugStateIndex] : 0, _debugPointId);
+
+    private void RaiseDebugModeChanged(DebugModeChangedEventArgs change)
+    {
+        try { DebugModeChanged?.Invoke(this, change); }
+        catch (Exception ex) { _logger.LogDebug(ex, "X-Plane debug event handler failed"); }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -77,6 +202,7 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
             {
                 if (_simulatorManager.ActiveConnector != _connector || !_connector.IsConnected)
                 {
+                    StopDebugMode();
                     _snapshotRequired = true;
                     await Task.Delay(250, stoppingToken).ConfigureAwait(false);
                     continue;
@@ -88,6 +214,8 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
                     await Task.Delay(100, stoppingToken).ConfigureAwait(false);
                     continue;
                 }
+
+                ProcessDebugCycle(DateTime.UtcNow);
 
                 if (_lastConnectionGeneration != _connector.ConnectionGeneration)
                 {
@@ -202,7 +330,7 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
             }
             for (var slot = 0; slot < active.Count; slot++)
             {
-                var stateId = ResolveStateId(layouts[slot], state.IsOn);
+                var stateId = ResolveDisplayedStateId(pointId, layouts[slot], state.IsOn);
                 if (active[slot].StateId == stateId) continue;
                 patches.Add(new XPlaneBridgeLightPatch(active[slot].Id, stateId));
                 active[slot] = active[slot] with { StateId = stateId };
@@ -226,7 +354,7 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
                 layout.Latitude,
                 layout.Longitude,
                 layout.Heading ?? 0.0,
-                ResolveStateId(layout, state.IsOn)));
+                ResolveDisplayedStateId(pointId, layout, state.IsOn)));
         }
         return result;
     }
@@ -259,16 +387,34 @@ public sealed class XPlanePointController : BackgroundService, IPointStateListen
         return layout.OffStateId ?? (layout.StateId is 6 or 7 ? 7 : 0);
     }
 
+    private int ResolveDisplayedStateId(string pointId, AirportStateHub.LightLayout layout, bool isOn)
+    {
+        lock (_debugGate)
+            return _debugMode && pointId == _debugPointId ? DebugStates[_debugStateIndex] : ResolveStateId(layout, isOn);
+    }
+
+    private void OnTestingModeChanged(AirportStateHub.TestingModeChangedEventArgs mode)
+    {
+        if (mode.IsTestingMode) StopDebugMode();
+    }
+
     private void OnMapLoaded(string airport)
     {
-        Interlocked.Increment(ref _mapGeneration);
-        _airport = airport?.Trim().ToUpperInvariant() ?? string.Empty;
-        _states.Clear();
-        _layouts.Clear();
-        _activeByPoint.Clear();
-        _lastCenter = null;
-        _snapshotRequired = true;
-        DrainPendingPoints();
+        bool stopped;
+        lock (_debugGate)
+        {
+            stopped = _debugMode;
+            if (stopped) ResetDebugMode();
+            Interlocked.Increment(ref _mapGeneration);
+            _airport = airport?.Trim().ToUpperInvariant() ?? string.Empty;
+            _states.Clear();
+            _layouts.Clear();
+            _activeByPoint.Clear();
+            _lastCenter = null;
+            _snapshotRequired = true;
+            DrainPendingPoints();
+        }
+        if (stopped) RaiseDebugModeChanged(new(false, 0, null));
     }
 
     private void DrainPendingPoints()

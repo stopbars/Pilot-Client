@@ -48,6 +48,7 @@ internal static class XPlaneDsfRemovals
 
     public static Plan Prepare(string root, string stateRoot, string icao, string packageName, IReadOnlyCollection<XPlaneDsfSelector> selectors)
     {
+        selectors = selectors.Select(XPlaneDsfPatcher.WithReferenceGeometry).ToArray();
         var state = Load(stateRoot);
         var previous = state.Airports.FirstOrDefault(a => a.Icao == icao);
         if (previous == null && selectors.Count == 0) return new Plan(false, () => { });
@@ -56,21 +57,42 @@ internal static class XPlaneDsfRemovals
         {
             foreach (var member in group) member.Validate();
             var selector = group.First();
-            var candidates = Packages(root).Select(package => Path.Combine(package, selector.Source.Replace('/', Path.DirectorySeparatorChar))).Distinct(StringComparer.OrdinalIgnoreCase);
+            var candidates = XPlaneSceneryPaths.Packages(root)
+                .Select(package => Path.Combine(package, selector.Source.Replace('/', Path.DirectorySeparatorChar)))
+                .Distinct(StringComparer.OrdinalIgnoreCase).Where(File.Exists).ToArray();
             var matches = candidates.Where(File.Exists).Where(path =>
             {
                 var relative = Path.GetRelativePath(root, path);
                 var saved = state.Files.FirstOrDefault(f => f.SourcePath.Equals(relative, StringComparison.OrdinalIgnoreCase));
                 return (saved?.OriginalSha256 ?? XPlaneDsfPatcher.Hash(File.ReadAllBytes(path))) == selector.Sha256;
             }).ToArray();
+            XPlaneDsfSelector[]? resolved = null;
+            if (matches.Length == 0 && group.All(member => member.Geometry != null))
+            {
+                var geometryMatches = new List<(string Path, XPlaneDsfSelector[] Selectors)>();
+                foreach (var path in candidates)
+                {
+                    if (!XPlaneSceneryPaths.CanPatch(root, path)) continue;
+                    var relative = Path.GetRelativePath(root, path);
+                    var saved = state.Files.SingleOrDefault(file => file.SourcePath.Equals(relative, StringComparison.OrdinalIgnoreCase));
+                    var current = File.ReadAllBytes(Resolve(root, relative));
+                    var original = ReadOriginal(stateRoot, relative, current, saved);
+                    try { geometryMatches.Add((path, XPlaneDsfPatcher.ResolveSelectors(original, group.ToArray()))); }
+                    catch (XPlaneRemovalMismatchException) { }
+                }
+                matches = geometryMatches.Select(match => match.Path).ToArray();
+                if (geometryMatches.Count == 1) resolved = geometryMatches[0].Selectors;
+            }
             if (matches.Length != 1) throw new XPlaneRemovalMismatchException($"Expected one active scenery source for {selector.Source}; found {matches.Length}. Regenerate removals for the installed package.");
             var target = matches[0];
+            if (!XPlaneSceneryPaths.CanPatch(root, target))
+                throw new XPlaneRemovalMismatchException($"The matching scenery file is outside the X-Plane folder or uses a filesystem link: {target}. BARS left it unchanged.");
             Resolve(root, Path.GetRelativePath(root, target));
-            selections.AddRange(group.Select(member => new Selection { SourcePath = Path.GetRelativePath(root, target), Selector = member }));
+            selections.AddRange((resolved ?? group.ToArray()).Select(member => new Selection { SourcePath = Path.GetRelativePath(root, target), Selector = member }));
         }
         if (previous != null) state.Airports.Remove(previous);
         if (selections.Count > 0) state.Airports.Add(new Airport { Icao = icao, PackageName = packageName, Selections = selections });
-        var groups = state.Airports.SelectMany(a => a.Selections).GroupBy(s => s.SourcePath, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.Select(s => s.Selector).ToArray(), StringComparer.OrdinalIgnoreCase);
+        var groups = state.Airports.SelectMany(a => a.Selections).GroupBy(s => s.SourcePath, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.ToArray(), StringComparer.OrdinalIgnoreCase);
         var affected = selections.Select(s => s.SourcePath).Concat(previous?.Selections.Select(s => s.SourcePath) ?? []).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         List<(string Path, byte[] Bytes, string ExpectedHash)> writes = [];
         var changed = false;
@@ -80,20 +102,26 @@ internal static class XPlaneDsfRemovals
             var saved = state.Files.SingleOrDefault(f => f.SourcePath.Equals(relative, StringComparison.OrdinalIgnoreCase));
             var current = File.ReadAllBytes(target);
             var currentHash = XPlaneDsfPatcher.Hash(current);
-            byte[] original;
+            var original = ReadOriginal(stateRoot, relative, current, saved);
+            var activeSelections = groups.GetValueOrDefault(relative) ?? [];
             if (saved == null)
             {
-                original = current;
                 saved = new SourceFile { SourcePath = relative, OriginalSha256 = currentHash, PatchedSha256 = currentHash };
                 state.Files.Add(saved);
             }
-            else
+            else if (XPlaneDsfPatcher.Hash(original) != saved.OriginalSha256)
             {
-                if (currentHash != saved.PatchedSha256) throw new XPlaneRemovalMismatchException($"{relative} changed outside BARS. Its original backup has been retained.");
-                original = File.ReadAllBytes(Backup(stateRoot, saved.OriginalSha256));
-                if (XPlaneDsfPatcher.Hash(original) != saved.OriginalSha256) throw new InvalidDataException("DSF backup checksum mismatch.");
+                var legacy = activeSelections.Where(s => s.Selector.Sha256 == saved.OriginalSha256 && s.Selector.Geometry == null).ToArray();
+                if (legacy.Length > 0)
+                {
+                    var captured = XPlaneDsfPatcher.ResolveSelectors(ReadBackup(stateRoot, saved.OriginalSha256), legacy.Select(s => s.Selector).ToArray(), captureGeometry: true);
+                    for (var index = 0; index < legacy.Length; index++) legacy[index].Selector = captured[index];
+                }
+                // Keep the old backup and restore this installed version when removals are disabled.
+                saved.OriginalSha256 = currentHash;
             }
-            var activeSelectors = groups.GetValueOrDefault(relative) ?? [];
+            var activeSelectors = XPlaneDsfPatcher.ResolveSelectors(original, activeSelections.Select(s => s.Selector).ToArray());
+            for (var index = 0; index < activeSelections.Length; index++) activeSelections[index].Selector = activeSelectors[index];
             var patched = XPlaneDsfPatcher.Patch(original, activeSelectors);
             var backup = Backup(stateRoot, saved.OriginalSha256);
             if (File.Exists(backup))
@@ -121,6 +149,22 @@ internal static class XPlaneDsfRemovals
         });
     }
 
+    private static byte[] ReadOriginal(string stateRoot, string relative, byte[] current, SourceFile? saved)
+    {
+        if (saved == null) return current;
+        var original = ReadBackup(stateRoot, saved.OriginalSha256);
+        if (XPlaneDsfPatcher.Hash(current) == saved.PatchedSha256) return original;
+        if (XPlaneDsfPatcher.HasSameSceneryContent(original, current)) return current;
+        throw new XPlaneRemovalMismatchException($"{relative} changed outside BARS. Its original backup has been retained.");
+    }
+
+    private static byte[] ReadBackup(string stateRoot, string hash)
+    {
+        var bytes = File.ReadAllBytes(Backup(stateRoot, hash));
+        if (XPlaneDsfPatcher.Hash(bytes) != hash) throw new InvalidDataException("DSF backup checksum mismatch.");
+        return bytes;
+    }
+
     private static string Backup(string stateRoot, string hash)
     {
         if (!System.Text.RegularExpressions.Regex.IsMatch(hash, "^[a-f0-9]{64}$")) throw new InvalidDataException("Invalid DSF backup identity.");
@@ -136,15 +180,6 @@ internal static class XPlaneDsfRemovals
             if ((File.Exists(path) || Directory.Exists(path)) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
                 throw new IOException("DSF patches do not follow filesystem links.");
         return full;
-    }
-    private static IEnumerable<string> Packages(string root)
-    {
-        var ini = Path.Combine(root, "Custom Scenery", "scenery_packs.ini");
-        if (File.Exists(ini))
-            foreach (var line in File.ReadLines(ini))
-                if (line.StartsWith("SCENERY_PACK ", StringComparison.Ordinal))
-                    yield return Resolve(root, line[13..].Trim().Replace('/', Path.DirectorySeparatorChar));
-        yield return Path.Combine(root, "Global Scenery", "Global Airports");
     }
     private sealed class State
     {

@@ -31,6 +31,7 @@ internal sealed class AirportWebSocketManager : BackgroundService
     private Task? _heartbeatTask;
     private string? _tokenUsedForConnection;
     private string? _desiredAirport;
+    private string? _lastDisconnectReason;
     private int _consecutiveForbiddenFailures;
     private long _connectionVersion;
     private bool _offlineMode;
@@ -538,6 +539,11 @@ internal sealed class AirportWebSocketManager : BackgroundService
                 Interlocked.Increment(ref _connectionVersion);
 
                 ws = _ws;
+                if (_lastDisconnectReason != reason)
+                {
+                    _logger.LogInformation("Airport connection state: {reason}", reason);
+                    _lastDisconnectReason = reason;
+                }
                 rcts = _receiveCts;
                 hadConnection = ws != null || _connectedAirport != null;
                 _ws = null;

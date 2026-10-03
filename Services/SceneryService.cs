@@ -31,11 +31,14 @@ namespace BARS_Client_V2.Services
 
         public bool AreRemovalsCompatible(string icao, string simulator, string packageName) =>
             !simulator.Equals("xplane", StringComparison.OrdinalIgnoreCase) ||
-            (_checkedRemovals.ContainsKey($"{icao}:{simulator}:{packageName}") &&
+            (XPlaneLocalRemovalsService.ResolveXPlaneRoot() != null &&
+             _checkedRemovals.ContainsKey($"{icao}:{simulator}:{packageName}") &&
              !_unavailableRemovals.ContainsKey($"{icao}:{simulator}:{packageName}"));
 
         public bool AreRemovalsUnavailable(string icao, string simulator, string packageName) =>
             _unavailableRemovals.ContainsKey($"{icao}:{simulator}:{packageName}");
+        public string? RemovalUnavailableReason(string icao, string simulator, string packageName) =>
+            _unavailableRemovals.GetValueOrDefault($"{icao}:{simulator}:{packageName}");
         // Key format: "ICAO:simulator" (e.g., "YSCB:msfs2020" or "YSCB:msfs2024")
         private Dictionary<string, string> _selectedPackages;
         private readonly object _selectionLock = new();
@@ -154,7 +157,7 @@ namespace BARS_Client_V2.Services
                         _verifiedGenerations[entry.Key] = entry.Value.Generation;
                     }
                 }
-                Infrastructure.Diagnostics.StartupTrace.Write($"Restored {_checkedRemovals.Count} verified removal toggle states");
+                Infrastructure.Diagnostics.ClientLog.Write($"Restored {_checkedRemovals.Count} verified removal toggle states");
             }
             catch { /* A missing or invalid UI cache falls back to normal validation. */ }
         }
@@ -506,11 +509,17 @@ namespace BARS_Client_V2.Services
             IDictionary<string, string> savedPackages,
             IDictionary<string, bool> savedToggles)
         {
-            Infrastructure.Diagnostics.StartupTrace.Write("X-Plane removal synchronization started");
+            if (XPlaneLocalRemovalsService.ResolveXPlaneRoot() == null)
+            {
+                Infrastructure.Diagnostics.ClientLog.Write("X-Plane removals skipped: no installation found.");
+                return false;
+            }
+            Infrastructure.Diagnostics.ClientLog.Write("X-Plane removal synchronization started");
             using var readSession = XPlaneLocalRemovalsService.BeginReadSession(
                 savedPackages.Keys.Where(key => key.EndsWith(":xplane", StringComparison.OrdinalIgnoreCase))
                     .Select(key => key.Split(':')[0]));
             var changed = false;
+            var failures = new List<XPlaneRemovalFailure>();
             var refreshMetadata = true;
             foreach (var selection in savedPackages.Where(item =>
                          item.Key.EndsWith(":xplane", StringComparison.OrdinalIgnoreCase)))
@@ -519,40 +528,63 @@ namespace BARS_Client_V2.Services
                 if (separator <= 0 || string.IsNullOrWhiteSpace(selection.Value)) continue;
                 var icao = selection.Key[..separator];
                 var toggleKey = $"{icao}:xplane:{selection.Value}";
-                var enabled = !savedToggles.TryGetValue(toggleKey, out var toggled) || toggled;
-                var artifact = await FindXPlaneContributionAsync(
-                        icao,
-                        selection.Value,
-                        refreshMetadata)
-                    .ConfigureAwait(false);
-                refreshMetadata = false;
-                if (_verifiedGenerations.TryGetValue(toggleKey, out var previousGeneration) &&
-                    previousGeneration != (artifact?.ArtifactGenerationId ?? ""))
+                try
                 {
+                    var enabled = !savedToggles.TryGetValue(toggleKey, out var toggled) || toggled;
+                    var artifact = await FindXPlaneContributionAsync(
+                            icao,
+                            selection.Value,
+                            refreshMetadata)
+                        .ConfigureAwait(false);
+                    refreshMetadata = false;
+                    if (_verifiedGenerations.TryGetValue(toggleKey, out var previousGeneration) &&
+                        previousGeneration != (artifact?.ArtifactGenerationId ?? ""))
+                    {
+                        _checkedRemovals.TryRemove(toggleKey, out _);
+                        _verifiedThisSession.TryRemove(toggleKey, out _);
+                        RemovalAvailabilityChanged?.Invoke();
+                    }
+                    // Enabled removals are refreshed once per launch so a newly
+                    // published artifact cannot be hidden by an older local patch.
+                    if (!enabled && _xplaneRemovals.IsStateApplied(icao, enabled))
+                    {
+                        _unavailableRemovals.TryRemove(toggleKey, out _);
+                        _checkedRemovals[toggleKey] = true;
+                        RemovalAvailabilityChanged?.Invoke();
+                        continue;
+                    }
+                    changed |= await ApplyXPlaneRemovalAsync(
+                            icao,
+                            selection.Value,
+                            enabled,
+                            artifact?.RemovalArtifactKey,
+                            artifact?.ArtifactIdentity,
+                            artifact?.ArtifactGenerationId)
+                        .ConfigureAwait(false);
+                    if (!XPlaneLocalRemovalsService.IsXPlaneProcessRunning() && _unavailableRemovals.TryGetValue(toggleKey, out var reason))
+                        failures.Add(new(icao, reason, false));
+                }
+                catch (Exception error)
+                {
+                    var retryable = XPlaneRemovalSyncException.IsRetryable(error);
+                    failures.Add(new(icao, error.Message, retryable));
                     _checkedRemovals.TryRemove(toggleKey, out _);
                     _verifiedThisSession.TryRemove(toggleKey, out _);
+                    _unavailableRemovals[toggleKey] = error.Message;
+                    Infrastructure.Diagnostics.ClientLog.Write($"X-Plane removal sync failed for {toggleKey}; retryable={retryable}: {error}");
                     RemovalAvailabilityChanged?.Invoke();
                 }
-                // Enabled removals are refreshed once per launch so a newly
-                // published artifact cannot be hidden by an older local patch.
-                if (!enabled && _xplaneRemovals.IsStateApplied(icao, enabled))
-                {
-                    _checkedRemovals[toggleKey] = true;
-                    RemovalAvailabilityChanged?.Invoke();
-                    continue;
-                }
-                changed |= await ApplyXPlaneRemovalAsync(
-                        icao,
-                        selection.Value,
-                        enabled,
-                        artifact?.RemovalArtifactKey,
-                        artifact?.ArtifactIdentity,
-                        artifact?.ArtifactGenerationId)
-                    .ConfigureAwait(false);
             }
-            changed |= await _xplaneRemovals.RestoreTestingArtifactsAsync().ConfigureAwait(false);
+            try { changed |= await _xplaneRemovals.RestoreTestingArtifactsAsync().ConfigureAwait(false); }
+            catch (Exception error)
+            {
+                failures.Add(new("Testing scenery", error.Message, XPlaneRemovalSyncException.IsRetryable(error)));
+            }
             SaveRemovalAvailability();
-            Infrastructure.Diagnostics.StartupTrace.Write("X-Plane removal synchronization completed");
+            if (failures.Count > 0 && XPlaneLocalRemovalsService.IsXPlaneProcessRunning())
+                failures.Add(new("X-Plane", "Close X-Plane to finish pending removal changes.", true));
+            if (failures.Count > 0) throw new XPlaneRemovalSyncException(failures, changed);
+            Infrastructure.Diagnostics.ClientLog.Write("X-Plane removal synchronization completed");
             return changed;
         }
 
@@ -582,7 +614,7 @@ namespace BARS_Client_V2.Services
             {
                 _unavailableRemovals[key] = error.Message;
                 SaveRemovalAvailability();
-                Infrastructure.Diagnostics.StartupTrace.Write($"Removals unavailable for {key}: {error.Message}");
+                Infrastructure.Diagnostics.ClientLog.Write($"Removals unavailable for {key}: {error.Message}");
                 RemovalAvailabilityChanged?.Invoke();
                 return false;
             }

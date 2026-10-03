@@ -7,7 +7,7 @@
         xmlns:behaviors="clr-namespace:BARS_Client_V2.Presentation.Behaviors"
         mc:Ignorable="d"
         Title="BARS Client"
-        Height="674"
+        Height="684"
         Width="600"
         Background="#1E1E1E"
         FontFamily="Segoe UI"

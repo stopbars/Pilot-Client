@@ -1,8 +1,10 @@
 using System;
+using System.Globalization;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using BARS_Client_V2.Infrastructure.Diagnostics;
 
 namespace BARS_Client_V2.Services;
 
@@ -51,6 +53,10 @@ internal sealed class NearestAirportService : INearestAirportService
 
     public Task<string?> ResolveAndCacheAsync(double lat, double lon, CancellationToken ct = default)
     {
+        if (!double.IsFinite(lat) || !double.IsFinite(lon) || lat is < -90 or > 90 || lon is < -180 or > 180)
+        {
+            return Task.FromResult<string?>(null);
+        }
         Task<string?>? toAwait = null;
         lock (_lock)
         {
@@ -82,14 +88,18 @@ internal sealed class NearestAirportService : INearestAirportService
     {
         try
         {
-            var url = $"https://v2.stopbars.com/airports/nearest?lat={lat:F6}&lon={lon:F6}";
-            using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
+            var url = string.Create(CultureInfo.InvariantCulture,
+                $"https://v2.stopbars.com/airports/nearest?lat={lat:F6}&lon={lon:F6}");
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            using var resp = await _http.GetAsync(url, timeout.Token).ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode)
             {
+                ClientLog.Write($"Airport lookup failed: HTTP {(int)resp.StatusCode}; {url}");
                 ApplyFailureBackoff();
                 return null;
             }
-            var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var json = await resp.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
             using var doc = JsonDocument.Parse(json);
             string? icao = null;
             if (doc.RootElement.ValueKind == JsonValueKind.Object)
@@ -97,10 +107,12 @@ internal sealed class NearestAirportService : INearestAirportService
                 if (doc.RootElement.TryGetProperty("icao", out var p)) icao = p.GetString();
                 else if (doc.RootElement.TryGetProperty("ICAO", out var p2)) icao = p2.GetString();
             }
-            if (!string.IsNullOrWhiteSpace(icao))
+            if (icao is { Length: 4 } && icao.All(char.IsAsciiLetterOrDigit))
             {
                 lock (_lock)
                 {
+                    if (_lastIcao != icao || _consecutiveFailures > 0)
+                        ClientLog.Write($"Airport lookup resolved {icao}; {url}");
                     _lastIcao = icao;
                     _lastLat = lat;
                     _lastLon = lon;
@@ -111,12 +123,19 @@ internal sealed class NearestAirportService : INearestAirportService
             }
             else
             {
+                ClientLog.Write($"Airport lookup returned no valid ICAO; {url}");
                 ApplyFailureBackoff();
+                return null;
             }
             return icao;
         }
-        catch
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            return null;
+        }
+        catch (Exception ex)
+        {
+            ClientLog.Write($"Airport lookup failed: {ex.GetType().Name}: {ex.Message}");
             ApplyFailureBackoff();
             return null;
         }
